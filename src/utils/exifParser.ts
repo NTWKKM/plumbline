@@ -234,15 +234,15 @@ export interface ExportDimensions {
 /**
  * Losslessly injects an original JPEG APP1 EXIF segment into a freshly encoded JPEG Blob,
  * resetting Orientation (tag 0x0112) to 1 (normal) to prevent double-rotation in viewers.
- * Updates PixelXDimension / PixelYDimension to match export canvas and removes IFD1 thumbnail
- * when output dimensions differ from the source.
+ * Updates PixelXDimension / PixelYDimension to match export canvas, clears embedded IFD1
+ * thumbnail byte ranges, and zeros the IFD1 thumbnail pointer on rendered exports.
  */
 export async function injectApp1ExifIntoJpegBlob(
   jpegBlob: Blob,
   rawApp1Segment: Uint8Array | null,
   exportDimensions?: ExportDimensions
 ): Promise<InjectExifResult> {
-  if (!rawApp1Segment || rawApp1Segment.length < 14) {
+  if (!rawApp1Segment || rawApp1Segment.length < 18) {
     return { blob: jpegBlob, exifPreserved: false };
   }
   const buf = await jpegBlob.arrayBuffer();
@@ -308,9 +308,50 @@ export async function injectApp1ExifIntoJpegBlob(
         }
       }
 
-      // On exported images, remove the stale IFD1 thumbnail pointer (set 4-byte offset to 0)
+      // On exported images, clear the embedded IFD1 thumbnail bytes and zero the IFD1 pointer
       const nextIfdOffsetPos = ifd0Offset + 2 + entries * 12;
       if (exportDimensions && nextIfdOffsetPos + 4 <= segment.length) {
+        const ifd1Rel = view.getUint32(nextIfdOffsetPos, littleEndian);
+        if (ifd1Rel > 0) {
+          const ifd1Offset = tiffStart + ifd1Rel;
+          if (ifd1Offset + 2 <= segment.length) {
+            const ifd1Entries = view.getUint16(ifd1Offset, littleEndian);
+            let thumbOffset = -1;
+            let thumbLength = 0;
+
+            for (let k = 0; k < ifd1Entries; k++) {
+              const ifd1EntryPos = ifd1Offset + 2 + k * 12;
+              if (ifd1EntryPos + 12 > segment.length) break;
+              const tag = view.getUint16(ifd1EntryPos, littleEndian);
+              const type = view.getUint16(ifd1EntryPos + 2, littleEndian);
+              const count = view.getUint32(ifd1EntryPos + 4, littleEndian);
+
+              if (count === 1 && (type === 3 || type === 4)) {
+                const val = type === 4
+                  ? view.getUint32(ifd1EntryPos + 8, littleEndian)
+                  : view.getUint16(ifd1EntryPos + 8, littleEndian);
+
+                // 0x0201 = JPEGInterchangeFormat, 0x0111 = StripOffsets
+                if (tag === 0x0201 || tag === 0x0111) {
+                  thumbOffset = tiffStart + val;
+                }
+                // 0x0202 = JPEGInterchangeFormatLength, 0x0117 = StripByteCounts
+                if (tag === 0x0202 || tag === 0x0117) {
+                  thumbLength = val;
+                }
+              }
+            }
+
+            // Zero out embedded thumbnail byte range if valid within segment bounds
+            if (
+              thumbOffset >= tiffStart &&
+              thumbLength > 0 &&
+              thumbOffset + thumbLength <= segment.length
+            ) {
+              segment.fill(0, thumbOffset, thumbOffset + thumbLength);
+            }
+          }
+        }
         view.setUint32(nextIfdOffsetPos, 0, littleEndian);
       }
 

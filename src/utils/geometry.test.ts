@@ -6,6 +6,8 @@ import {
   computeFrameLayout,
   formatExifSummaryLine,
   computeSplitDividerX,
+  computePixelAreaScale,
+  getScaledDimensionsWithinBudget,
 } from './geometry';
 
 test('computeInscribedCrop returns full image dimensions when rotation angle is 0', () => {
@@ -133,5 +135,49 @@ test('computeSplitDividerX clamps split percentage to [5, 95] and computes exact
   const high = computeSplitDividerX(1000, 99);
   assert.equal(high.clampedPercent, 95);
   assert.equal(high.splitX, 950);
+});
+
+test('computePixelAreaScale validates positive finite budget and returns full scale for valid budgets', () => {
+  // Invalid budgets return 1.0
+  assert.equal(computePixelAreaScale(4000, 3000, undefined), 1.0);
+  assert.equal(computePixelAreaScale(4000, 3000, -100), 1.0);
+  assert.equal(computePixelAreaScale(4000, 3000, 0), 1.0);
+  assert.equal(computePixelAreaScale(4000, 3000, NaN), 1.0);
+  assert.equal(computePixelAreaScale(4000, 3000, Infinity), 1.0);
+
+  // When area <= budget, return 1.0
+  assert.equal(computePixelAreaScale(1000, 1000, 2000000), 1.0);
+
+  // When area > budget, return Math.sqrt(budget / area)
+  const scale = computePixelAreaScale(2000, 2000, 1000000);
+  assert.ok(Math.abs(scale - 0.5) < 1e-6);
+});
+
+test('getScaledDimensionsWithinBudget uniformly scales and bounds dimensions within budget', () => {
+  const unscaled = getScaledDimensionsWithinBudget(4000, 3000);
+  assert.equal(unscaled.width, 4000);
+  assert.equal(unscaled.height, 3000);
+  assert.equal(unscaled.scale, 1.0);
+
+  // Scaling 4000x3000 (12M px) down to 3M px budget
+  const scaled = getScaledDimensionsWithinBudget(4000, 3000, 3000000);
+  assert.ok(scaled.width * scaled.height <= 3000000);
+  assert.ok(Math.abs(scaled.width / scaled.height - 4000 / 3000) < 0.01);
+  assert.ok(scaled.scale <= 0.501);
+
+  // Scaling with odd dimensions and tight budget guarantees resulting area <= budget
+  const tight = getScaledDimensionsWithinBudget(1920, 1080, 500000);
+  assert.ok(tight.width * tight.height <= 500000);
+});
+
+test('computeFrameLayout respects opt-in pixelAreaBudget while preserving MAX_CANVAS_AREA by default', () => {
+  // Budget smaller than MAX_CANVAS_AREA caps canvas size within budget
+  const budgeted = computeFrameLayout(4000, 3000, '1:1', 10, false, 1000000);
+  assert.ok(budgeted.canvasWidth * budgeted.canvasHeight <= 1000000);
+
+  // When budget is omitted or invalid, MAX_CANVAS_AREA is preserved
+  const defaultLayout = computeFrameLayout(20000, 15000, '1:1', 10, false, undefined);
+  assert.equal(defaultLayout.canvasWidth, 8192);
+  assert.equal(defaultLayout.canvasHeight, 8192);
 });
 

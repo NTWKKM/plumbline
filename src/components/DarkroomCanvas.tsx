@@ -9,6 +9,7 @@ import {
   computeSplitDividerX,
   detectHorizonTiltFromGrayscale,
   formatExifSummaryLine,
+  getScaledDimensionsWithinBudget,
 } from '../utils/geometry';
 import { StudioPhotoItem } from '../utils/samplePhotos';
 
@@ -62,6 +63,12 @@ export const DarkroomCanvas: React.FC<DarkroomCanvasProps> = ({
     let cancelled = false;
     setSensorCanvas(null);
     setLoadError(null);
+    if (exportCanvasRef) exportCanvasRef.current = null;
+    const initialCanvas = canvasRef.current;
+    if (initialCanvas) {
+      const initCtx = initialCanvas.getContext('2d');
+      initCtx?.clearRect(0, 0, initialCanvas.width, initialCanvas.height);
+    }
     onImageLoaded?.(false);
 
     const img = new Image();
@@ -74,9 +81,16 @@ export const DarkroomCanvas: React.FC<DarkroomCanvasProps> = ({
       const rawW = img.naturalWidth || 1600;
       const rawH = img.naturalHeight || 1200;
 
+      // Uniformly scale within optional pixel-area budget
+      const { width: scaledW, height: scaledH } = getScaledDimensionsWithinBudget(
+        rawW,
+        rawH,
+        config.pixelAreaBudget
+      );
+
       // Create the tilted sensor frame if simulatedSensorTiltDeg != 0
       const tiltDeg = photo.simulatedSensorTiltDeg || 0;
-      const baseCrop = computeInscribedCrop(rawW, rawH, tiltDeg, true);
+      const baseCrop = computeInscribedCrop(scaledW, scaledH, tiltDeg, true);
 
       const offscreen = document.createElement('canvas');
       offscreen.width = baseCrop.width;
@@ -87,7 +101,7 @@ export const DarkroomCanvas: React.FC<DarkroomCanvasProps> = ({
       ctx.save();
       ctx.translate(offscreen.width / 2, offscreen.height / 2);
       ctx.rotate((tiltDeg * Math.PI) / 180);
-      ctx.drawImage(img, -rawW / 2, -rawH / 2, rawW, rawH);
+      ctx.drawImage(img, -scaledW / 2, -scaledH / 2, scaledW, scaledH);
       ctx.restore();
 
       // Downscale to <= 480px on longest side for fast, deterministic horizon detection
@@ -134,14 +148,31 @@ export const DarkroomCanvas: React.FC<DarkroomCanvasProps> = ({
 
     return () => {
       cancelled = true;
+      if (exportCanvasRef) exportCanvasRef.current = null;
+      if (canvasRef.current) {
+        const c = canvasRef.current;
+        const cCtx = c.getContext('2d');
+        cCtx?.clearRect(0, 0, c.width, c.height);
+      }
     };
-  }, [photo.id, photo.src, photo.simulatedSensorTiltDeg, config.maxAutoAngleDeg, onImageLoaded]);
+  }, [
+    photo.id,
+    photo.src,
+    photo.simulatedSensorTiltDeg,
+    config.maxAutoAngleDeg,
+    config.pixelAreaBudget,
+    onImageLoaded,
+  ]);
 
   // Step 2: Render the active pipeline stage onto the visible darkroom canvas
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas || !sensorCanvas) {
       if (exportCanvasRef) exportCanvasRef.current = null;
+      if (canvas) {
+        const ctx = canvas.getContext('2d');
+        ctx?.clearRect(0, 0, canvas.width, canvas.height);
+      }
       onImageLoaded?.(false);
       return;
     }
@@ -168,7 +199,8 @@ export const DarkroomCanvas: React.FC<DarkroomCanvasProps> = ({
       crop.height,
       config.aspectPreset,
       config.paddingPercent,
-      config.renderExifCaption
+      config.renderExifCaption,
+      config.pixelAreaBudget
     );
 
     callbackRef.current(analysis, crop, layout, { width: srcW, height: srcH });

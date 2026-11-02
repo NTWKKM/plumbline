@@ -179,11 +179,123 @@ test('injectApp1ExifIntoJpegBlob zeroes out IFD1 thumbnail pointer on exported i
   assert.equal(viewNoDims.getUint32(2 + 32, true), 0x0100);
 });
 
-test('injectApp1ExifIntoJpegBlob returns exifPreserved false when rawApp1Segment is null or missing', async () => {
+test('injectApp1ExifIntoJpegBlob returns exifPreserved false when rawApp1Segment is null or shorter than 18 bytes', async () => {
   const dummyJpegBytes = new Uint8Array([0xff, 0xd8, 0xff, 0xd9]);
   const dummyBlob = new Blob([dummyJpegBytes], { type: 'image/jpeg' });
 
-  const result = await injectApp1ExifIntoJpegBlob(dummyBlob, null);
-  assert.equal(result.exifPreserved, false);
-  assert.equal(result.blob, dummyBlob);
+  // Null input
+  const resultNull = await injectApp1ExifIntoJpegBlob(dummyBlob, null);
+  assert.equal(resultNull.exifPreserved, false);
+  assert.equal(resultNull.blob, dummyBlob);
+
+  // Short input (< 18 bytes)
+  const shortSegment = new Uint8Array([0xff, 0xe1, 0x00, 0x10, 0x45, 0x78, 0x69, 0x66, 0x00, 0x00]);
+  const resultShort = await injectApp1ExifIntoJpegBlob(dummyBlob, shortSegment);
+  assert.equal(resultShort.exifPreserved, false);
+  assert.equal(resultShort.blob, dummyBlob);
+});
+
+test('injectApp1ExifIntoJpegBlob clears embedded IFD1 thumbnail byte range when exportDimensions is provided', async () => {
+  // Construct a buffer with APP1 header (10 bytes), TIFF header (8 bytes), IFD0 (18 bytes), IFD1 (26 bytes), and Thumbnail data (16 bytes)
+  const totalLen = 100;
+  const app1 = new Uint8Array(totalLen);
+  app1[0] = 0xff;
+  app1[1] = 0xe1;
+  app1[2] = 0x00;
+  app1[3] = totalLen;
+  // 'Exif\0\0'
+  app1[4] = 0x45;
+  app1[5] = 0x78;
+  app1[6] = 0x69;
+  app1[7] = 0x66;
+  app1[8] = 0x00;
+  app1[9] = 0x00;
+
+  // TIFF Header at byte 10
+  const tiffStart = 10;
+  app1[tiffStart] = 0x49; // 'II'
+  app1[tiffStart + 1] = 0x49;
+  app1[tiffStart + 2] = 0x2a; // 42
+  app1[tiffStart + 3] = 0x00;
+  // IFD0 offset = 8 (relative to TIFF header -> byte 18)
+  app1[tiffStart + 4] = 0x08;
+  app1[tiffStart + 5] = 0x00;
+  app1[tiffStart + 6] = 0x00;
+  app1[tiffStart + 7] = 0x00;
+
+  // IFD0 at byte 18: 0 entries
+  const ifd0Pos = tiffStart + 8; // byte 18
+  app1[ifd0Pos] = 0x00;
+  app1[ifd0Pos + 1] = 0x00;
+  // Next IFD (IFD1 pointer) at ifd0Pos + 2: offset relative to TIFF header
+  // Let IFD1 start at relative offset 20 (byte 30)
+  const ifd1Rel = 20;
+  const nextIfdPos = ifd0Pos + 2;
+  app1[nextIfdPos] = ifd1Rel;
+  app1[nextIfdPos + 1] = 0x00;
+  app1[nextIfdPos + 2] = 0x00;
+  app1[nextIfdPos + 3] = 0x00;
+
+  // IFD1 at byte 30 (tiffStart + 20): 2 entries (JPEGInterchangeFormat and JPEGInterchangeFormatLength)
+  const ifd1Pos = tiffStart + ifd1Rel; // byte 30
+  app1[ifd1Pos] = 0x02; // 2 entries
+  app1[ifd1Pos + 1] = 0x00;
+
+  // Entry 0: tag 0x0201 (JPEGInterchangeFormat), type 4 (LONG), count 1, offset relative to TIFF = 60 (byte 70)
+  const entry0Pos = ifd1Pos + 2; // byte 32
+  app1[entry0Pos] = 0x01;
+  app1[entry0Pos + 1] = 0x02;
+  app1[entry0Pos + 2] = 0x04;
+  app1[entry0Pos + 3] = 0x00;
+  app1[entry0Pos + 4] = 0x01;
+  app1[entry0Pos + 5] = 0x00;
+  app1[entry0Pos + 6] = 0x00;
+  app1[entry0Pos + 7] = 0x00;
+  const thumbRel = 60; // byte 70
+  app1[entry0Pos + 8] = thumbRel;
+  app1[entry0Pos + 9] = 0x00;
+  app1[entry0Pos + 10] = 0x00;
+  app1[entry0Pos + 11] = 0x00;
+
+  // Entry 1: tag 0x0202 (JPEGInterchangeFormatLength), type 4 (LONG), count 1, length = 16
+  const entry1Pos = entry0Pos + 12; // byte 44
+  app1[entry1Pos] = 0x02;
+  app1[entry1Pos + 1] = 0x02;
+  app1[entry1Pos + 2] = 0x04;
+  app1[entry1Pos + 3] = 0x00;
+  app1[entry1Pos + 4] = 0x01;
+  app1[entry1Pos + 5] = 0x00;
+  app1[entry1Pos + 6] = 0x00;
+  app1[entry1Pos + 7] = 0x00;
+  const thumbLen = 16;
+  app1[entry1Pos + 8] = thumbLen;
+  app1[entry1Pos + 9] = 0x00;
+  app1[entry1Pos + 10] = 0x00;
+  app1[entry1Pos + 11] = 0x00;
+
+  // Fill thumbnail byte range (byte 70 to 86) with dummy pattern (0xAA)
+  const thumbAbsPos = tiffStart + thumbRel; // byte 70
+  app1.fill(0xaa, thumbAbsPos, thumbAbsPos + thumbLen);
+
+  const dummyJpegBytes = new Uint8Array([0xff, 0xd8, 0xff, 0xd9]);
+  const dummyBlob = new Blob([dummyJpegBytes], { type: 'image/jpeg' });
+
+  const result = await injectApp1ExifIntoJpegBlob(dummyBlob, app1, {
+    width: 2400,
+    height: 1600,
+    sourceWidth: 2400,
+    sourceHeight: 1600,
+  });
+
+  const injectedBytes = new Uint8Array(await result.blob.arrayBuffer());
+  // The APP1 segment starts at byte 2 of the JPEG (after SOI)
+  const injectedThumbPos = 2 + thumbAbsPos;
+  for (let i = injectedThumbPos; i < injectedThumbPos + thumbLen; i++) {
+    assert.equal(injectedBytes[i], 0x00, `Expected byte at ${i} to be cleared to 0x00`);
+  }
+
+  // Pointer at nextIfdPos should also be zeroed
+  const injectedNextIfdPos = 2 + nextIfdPos;
+  const view = new DataView(injectedBytes.buffer);
+  assert.equal(view.getUint32(injectedNextIfdPos, true), 0);
 });

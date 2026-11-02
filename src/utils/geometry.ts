@@ -51,6 +51,7 @@ export interface PipelineConfig {
   preserveExifMetadata: boolean;
   renderExifCaption: boolean;
   jpegQuality: number; // 70 to 100
+  pixelAreaBudget?: number; // Optional reduced-resolution budget in square pixels
 }
 
 export interface LevelingAnalysis {
@@ -387,7 +388,8 @@ export function computeFrameLayout(
   sourceHeight: number,
   aspectPreset: AspectRatioPreset,
   paddingPercent: number,
-  renderExifCaption = false
+  renderExifCaption = false,
+  pixelAreaBudget?: number
 ): FrameLayout {
   const safeW = Math.max(1, Math.round(sourceWidth));
   const safeH = Math.max(1, Math.round(sourceHeight));
@@ -436,12 +438,17 @@ export function computeFrameLayout(
     wasCapped = true;
   }
 
-  // Cap computed frame area at maximum supported browser canvas area limit (e.g. WebKit / iOS Safari)
-  if (canvasWidth * canvasHeight > MAX_CANVAS_AREA) {
-    const areaScale = Math.sqrt(MAX_CANVAS_AREA / (canvasWidth * canvasHeight));
+  // Cap computed frame area at maximum supported browser canvas area limit (e.g. WebKit / iOS Safari) or opt-in budget
+  const effectiveMaxArea =
+    typeof pixelAreaBudget === 'number' && Number.isFinite(pixelAreaBudget) && pixelAreaBudget > 0
+      ? Math.min(MAX_CANVAS_AREA, pixelAreaBudget)
+      : MAX_CANVAS_AREA;
+
+  if (canvasWidth * canvasHeight > effectiveMaxArea) {
+    const areaScale = Math.sqrt(effectiveMaxArea / (canvasWidth * canvasHeight));
     canvasWidth = Math.max(1, Math.floor(canvasWidth * areaScale));
     canvasHeight = Math.max(1, Math.floor(canvasWidth / targetRatio));
-    while (canvasWidth * canvasHeight > MAX_CANVAS_AREA && canvasWidth > 1 && canvasHeight > 1) {
+    while (canvasWidth * canvasHeight > effectiveMaxArea && canvasWidth > 1 && canvasHeight > 1) {
       if (canvasWidth / targetRatio >= canvasHeight) {
         canvasWidth--;
       } else {
@@ -525,5 +532,76 @@ export function computeSplitDividerX(
   const clampedPercent = Number(clamp(splitPercent, 5, 95).toFixed(1));
   const splitX = Math.round((safeWidth * clampedPercent) / 100);
   return { splitX, clampedPercent };
+}
+
+/**
+ * Computes a uniform scale factor to fit an image of dimensions (width x height)
+ * within an opt-in pixel area budget (width * height <= pixelAreaBudget).
+ * Validates any supplied pixel-area budget as positive and finite.
+ * Returns 1.0 (full resolution) when budget is omitted, non-positive, or non-finite.
+ */
+export function computePixelAreaScale(
+  width: number,
+  height: number,
+  pixelAreaBudget?: number
+): number {
+  if (width <= 0 || height <= 0) return 1.0;
+  if (
+    typeof pixelAreaBudget !== 'number' ||
+    !Number.isFinite(pixelAreaBudget) ||
+    pixelAreaBudget <= 0
+  ) {
+    return 1.0;
+  }
+  const currentArea = width * height;
+  if (currentArea <= pixelAreaBudget) {
+    return 1.0;
+  }
+  return Math.sqrt(pixelAreaBudget / currentArea);
+}
+
+/**
+ * Applies a uniform scale to fit dimensions within the pixel-area budget.
+ * Validates any supplied pixel-area budget as positive and finite.
+ * Rounds scaled dimensions and ensures their resulting area stays strictly within the budget.
+ * Full resolution is preserved when budget is omitted or invalid.
+ */
+export function getScaledDimensionsWithinBudget(
+  width: number,
+  height: number,
+  pixelAreaBudget?: number
+): { width: number; height: number; scale: number } {
+  const safeW = Math.max(1, Math.round(width));
+  const safeH = Math.max(1, Math.round(height));
+
+  if (
+    typeof pixelAreaBudget !== 'number' ||
+    !Number.isFinite(pixelAreaBudget) ||
+    pixelAreaBudget <= 0
+  ) {
+    return { width: safeW, height: safeH, scale: 1.0 };
+  }
+
+  const currentArea = safeW * safeH;
+  if (currentArea <= pixelAreaBudget) {
+    return { width: safeW, height: safeH, scale: 1.0 };
+  }
+
+  let scale = Math.sqrt(pixelAreaBudget / currentArea);
+  let scaledW = Math.max(1, Math.round(safeW * scale));
+  let scaledH = Math.max(1, Math.round(safeH * scale));
+
+  while (scaledW * scaledH > pixelAreaBudget && (scaledW > 1 || scaledH > 1)) {
+    if (scaledW / safeW >= scaledH / safeH && scaledW > 1) {
+      scaledW--;
+    } else if (scaledH > 1) {
+      scaledH--;
+    } else {
+      break;
+    }
+  }
+  scale = Math.min(scaledW / safeW, scaledH / safeH);
+
+  return { width: scaledW, height: scaledH, scale };
 }
 
