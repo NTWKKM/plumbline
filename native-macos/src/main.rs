@@ -680,6 +680,104 @@ fn clear_disjoint_portions(
     }
 }
 
+fn merge_ranges(ranges: &mut Vec<(usize, usize)>) {
+    if ranges.len() <= 1 {
+        return;
+    }
+    ranges.sort_by_key(|&(s, _)| s);
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+    merged.push(ranges[0]);
+    for &(s, e) in &ranges[1..] {
+        let last = merged.last_mut().unwrap();
+        if s <= last.1 {
+            last.1 = last.1.max(e);
+        } else {
+            merged.push((s, e));
+        }
+    }
+    *ranges = merged;
+}
+
+fn retain_sub_ifd_tree(
+    bytes: &[u8],
+    tiff_start: usize,
+    sub_rel: usize,
+    is_le: bool,
+    visited: &mut std::collections::HashSet<usize>,
+    retained_ranges: &mut Vec<(usize, usize)>,
+    depth: usize,
+) {
+    if depth > 4 || sub_rel < 8 || !visited.insert(sub_rel) {
+        return;
+    }
+    let sub_offset = tiff_start + sub_rel;
+    if sub_offset < tiff_start + 8 || sub_offset + 2 > bytes.len() {
+        return;
+    }
+    let read_u16 = |buf: &[u8], offset: usize| -> u16 {
+        if is_le {
+            u16::from_le_bytes([buf[offset], buf[offset + 1]])
+        } else {
+            u16::from_be_bytes([buf[offset], buf[offset + 1]])
+        }
+    };
+    let read_u32 = |buf: &[u8], offset: usize| -> u32 {
+        if is_le {
+            u32::from_le_bytes([buf[offset], buf[offset + 1], buf[offset + 2], buf[offset + 3]])
+        } else {
+            u32::from_be_bytes([buf[offset], buf[offset + 1], buf[offset + 2], buf[offset + 3]])
+        }
+    };
+
+    let sub_entries = read_u16(bytes, sub_offset) as usize;
+    let sub_end = (sub_offset + 2 + sub_entries * 12 + 4).min(bytes.len());
+    retained_ranges.push((sub_offset, sub_end));
+
+    for s in 0..sub_entries {
+        let s_pos = sub_offset + 2 + s * 12;
+        if s_pos + 12 > bytes.len() {
+            break;
+        }
+        let s_tag = read_u16(bytes, s_pos);
+        let s_type = read_u16(bytes, s_pos + 2);
+        let s_count = read_u32(bytes, s_pos + 4) as usize;
+        let s_bytes = s_count.saturating_mul(get_tiff_type_size(s_type));
+        if s_bytes > 4 {
+            let s_val_rel = read_u32(bytes, s_pos + 8) as usize;
+            if s_val_rel >= 8 {
+                let s_val_start = tiff_start + s_val_rel;
+                let s_val_end = s_val_start + s_bytes;
+                if s_val_start >= tiff_start + 8 && s_val_end <= bytes.len() {
+                    retained_ranges.push((s_val_start, s_val_end));
+                }
+            }
+        }
+
+        // Detect nested SubIFD directories (tag 0x014a or IFD pointer type 13)
+        if (s_tag == 0x014a || s_type == 13) && s_count >= 1 {
+            let nested_offsets = read_uint_array(
+                bytes,
+                tiff_start,
+                s_pos,
+                if s_type == 13 { 4 } else { s_type },
+                s_count,
+                is_le,
+            );
+            for n_rel in nested_offsets {
+                retain_sub_ifd_tree(
+                    bytes,
+                    tiff_start,
+                    n_rel,
+                    is_le,
+                    visited,
+                    retained_ranges,
+                    depth + 1,
+                );
+            }
+        }
+    }
+}
+
 /// Updates EXIF APP1 metadata block for export:
 /// - Resets Orientation (0x0112) to 1 (normal) if the source was rotated (orientation > 1).
 /// - Updates ImageWidth (0x0100), ImageLength (0x0101) in IFD0, and PixelXDimension (0xA002),
@@ -736,6 +834,7 @@ fn update_app1_exif_for_export(bytes: &mut [u8], width: u32, height: u32, orient
     }
     let entries = read_u16(bytes, ifd0_offset) as usize;
     let mut exif_sub_ifd_offset = 0;
+    let mut visited_sub_ifds: std::collections::HashSet<usize> = std::collections::HashSet::new();
 
     let mut retained_ranges: Vec<(usize, usize)> = Vec::new();
     retained_ranges.push((0, tiff_start + 8));
@@ -843,33 +942,15 @@ fn update_app1_exif_for_export(bytes: &mut [u8], width: u32, height: u32, orient
                 is_le,
             );
             for sub_rel in sub_ifd_offsets {
-                if sub_rel >= 8 {
-                    let sub_offset = tiff_start + sub_rel;
-                    if sub_offset >= tiff_start + 8 && sub_offset + 2 <= bytes.len() {
-                        let sub_entries = read_u16(bytes, sub_offset) as usize;
-                        let sub_end = (sub_offset + 2 + sub_entries * 12 + 4).min(bytes.len());
-                        retained_ranges.push((sub_offset, sub_end));
-                        for s in 0..sub_entries {
-                            let s_pos = sub_offset + 2 + s * 12;
-                            if s_pos + 12 > bytes.len() {
-                                break;
-                            }
-                            let s_type = read_u16(bytes, s_pos + 2);
-                            let s_count = read_u32(bytes, s_pos + 4) as usize;
-                            let s_bytes = s_count.saturating_mul(get_tiff_type_size(s_type));
-                            if s_bytes > 4 {
-                                let s_val_rel = read_u32(bytes, s_pos + 8) as usize;
-                                if s_val_rel >= 8 {
-                                    let s_val_start = tiff_start + s_val_rel;
-                                    let s_val_end = s_val_start + s_bytes;
-                                    if s_val_start >= tiff_start + 8 && s_val_end <= bytes.len() {
-                                        retained_ranges.push((s_val_start, s_val_end));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+                retain_sub_ifd_tree(
+                    bytes,
+                    tiff_start,
+                    sub_rel,
+                    is_le,
+                    &mut visited_sub_ifds,
+                    &mut retained_ranges,
+                    0,
+                );
             }
         }
     }
@@ -1010,6 +1091,7 @@ fn update_app1_exif_for_export(bytes: &mut [u8], width: u32, height: u32, orient
                     }
                 }
 
+                merge_ranges(&mut retained_ranges);
                 for (cand_start, cand_end) in candidate_ranges {
                     let clamped_end = cand_end.min(bytes.len());
                     if cand_start >= tiff_start + 8 && cand_start < clamped_end {
@@ -1542,6 +1624,83 @@ mod tests {
     }
 
     #[test]
+    fn test_update_app1_exif_preserves_sub_ifd_overlap() {
+        let mut app1 = vec![0u8; 180];
+        app1[0] = 0xff;
+        app1[1] = 0xe1;
+        app1[2] = 0x00;
+        app1[3] = 178;
+        app1[4..10].copy_from_slice(b"Exif\0\0");
+
+        let tiff_start = 10;
+        app1[tiff_start..tiff_start + 2].copy_from_slice(b"II");
+        app1[tiff_start + 2..tiff_start + 4].copy_from_slice(&42u16.to_le_bytes());
+        app1[tiff_start + 4..tiff_start + 8].copy_from_slice(&8u32.to_le_bytes());
+
+        // IFD0 at rel 8 (len 2 + 1*12 + 4 = 18 -> rel 8..26):
+        // 1 entry: 0x014a (SubIFDs) pointing to rel 36
+        let ifd0 = tiff_start + 8;
+        app1[ifd0..ifd0 + 2].copy_from_slice(&1u16.to_le_bytes());
+        let e0 = ifd0 + 2;
+        app1[e0..e0 + 2].copy_from_slice(&0x014au16.to_le_bytes()); // SubIFDs
+        app1[e0 + 2..e0 + 4].copy_from_slice(&4u16.to_le_bytes()); // LONG
+        app1[e0 + 4..e0 + 8].copy_from_slice(&1u32.to_le_bytes()); // count 1
+        app1[e0 + 8..e0 + 12].copy_from_slice(&36u32.to_le_bytes()); // rel 36
+
+        // IFD0 next pointer: IFD1 at rel 80
+        app1[e0 + 12..e0 + 16].copy_from_slice(&80u32.to_le_bytes());
+
+        // SubIFD at rel 36 (len 2 + 1*12 + 4 = 18 -> rel 36..54):
+        // 1 entry: 0x0100 (ImageWidth) SHORT value 1920
+        let sub_ifd = tiff_start + 36;
+        app1[sub_ifd..sub_ifd + 2].copy_from_slice(&1u16.to_le_bytes());
+        let sub_e0 = sub_ifd + 2;
+        app1[sub_e0..sub_e0 + 2].copy_from_slice(&0x0100u16.to_le_bytes());
+        app1[sub_e0 + 2..sub_e0 + 4].copy_from_slice(&3u16.to_le_bytes()); // SHORT
+        app1[sub_e0 + 4..sub_e0 + 8].copy_from_slice(&1u32.to_le_bytes());
+        app1[sub_e0 + 8..sub_e0 + 10].copy_from_slice(&1920u16.to_le_bytes());
+        app1[sub_e0 + 12..sub_e0 + 16].copy_from_slice(&0u32.to_le_bytes());
+
+        // IFD1 at rel 80 with thumbnail candidate covering rel 30..60 (overlaps SubIFD at rel 36..54)
+        let ifd1 = tiff_start + 80;
+        app1[ifd1..ifd1 + 2].copy_from_slice(&2u16.to_le_bytes());
+        let ifd1_e0 = ifd1 + 2;
+        app1[ifd1_e0..ifd1_e0 + 2].copy_from_slice(&0x0201u16.to_le_bytes());
+        app1[ifd1_e0 + 2..ifd1_e0 + 4].copy_from_slice(&4u16.to_le_bytes());
+        app1[ifd1_e0 + 4..ifd1_e0 + 8].copy_from_slice(&1u32.to_le_bytes());
+        app1[ifd1_e0 + 8..ifd1_e0 + 12].copy_from_slice(&30u32.to_le_bytes()); // rel 30
+
+        let ifd1_e1 = ifd1_e0 + 12;
+        app1[ifd1_e1..ifd1_e1 + 2].copy_from_slice(&0x0202u16.to_le_bytes());
+        app1[ifd1_e1 + 2..ifd1_e1 + 4].copy_from_slice(&4u16.to_le_bytes());
+        app1[ifd1_e1 + 4..ifd1_e1 + 8].copy_from_slice(&1u32.to_le_bytes());
+        app1[ifd1_e1 + 8..ifd1_e1 + 12].copy_from_slice(&30u32.to_le_bytes()); // len 30 -> rel 30..60
+        app1[ifd1_e1 + 12..ifd1_e1 + 16].copy_from_slice(&0u32.to_le_bytes());
+
+        // Fill gap rel 30..36 with 0xAA
+        app1[tiff_start + 30..tiff_start + 36].fill(0xaa);
+        // Fill gap rel 54..60 with 0xBB
+        app1[tiff_start + 54..tiff_start + 60].fill(0xbb);
+
+        update_app1_exif_for_export(&mut app1, 1000, 1000, 1);
+
+        // SubIFD directory and entry must remain intact
+        assert_eq!(&app1[sub_e0..sub_e0 + 2], &0x0100u16.to_le_bytes());
+        assert_eq!(&app1[sub_e0 + 8..sub_e0 + 10], &1920u16.to_le_bytes());
+
+        // Disjoint gaps must be zeroed
+        for b in &app1[tiff_start + 30..tiff_start + 36] {
+            assert_eq!(*b, 0x00);
+        }
+        for b in &app1[tiff_start + 54..tiff_start + 60] {
+            assert_eq!(*b, 0x00);
+        }
+
+        // IFD1 pointer zeroed
+        assert_eq!(&app1[e0 + 12..e0 + 16], &[0, 0, 0, 0]);
+    }
+
+    #[test]
     fn test_compute_raw_crop_margins() {
         // Sensor width 100, right margin 1 -> expects crop of 1
         let (top, right, bottom, left) =
@@ -1559,6 +1718,14 @@ mod tests {
         let (_, right, _, left) = compute_raw_crop_margins(100, 100, [0, 4, 0, 4], 50, 50).unwrap();
         assert_eq!(left, 2);
         assert_eq!(right, 2);
+
+        // Odd top margin 1 -> rounds up to 1
+        let (top, _, _, _) = compute_raw_crop_margins(100, 100, [1, 0, 0, 0], 50, 50).unwrap();
+        assert_eq!(top, 1);
+
+        // Odd left margin 1 -> rounds up to 1
+        let (_, _, _, left) = compute_raw_crop_margins(100, 100, [0, 0, 0, 1], 50, 50).unwrap();
+        assert_eq!(left, 1);
 
         // Sensor height 100, bottom margin 1 -> expects bottom crop of 1
         let (top, _, bottom, _) = compute_raw_crop_margins(100, 100, [0, 0, 1, 0], 50, 50).unwrap();

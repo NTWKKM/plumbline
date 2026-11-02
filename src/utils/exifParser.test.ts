@@ -202,7 +202,7 @@ test('injectApp1ExifIntoJpegBlob clears embedded IFD1 thumbnail byte range when 
   app1[0] = 0xff;
   app1[1] = 0xe1;
   app1[2] = 0x00;
-  app1[3] = totalLen;
+  app1[3] = totalLen - 2;
   // 'Exif\0\0'
   app1[4] = 0x45;
   app1[5] = 0x78;
@@ -306,7 +306,7 @@ test('injectApp1ExifIntoJpegBlob clears multiple strip thumbnail ranges from Str
   app1[0] = 0xff;
   app1[1] = 0xe1;
   app1[2] = 0x00;
-  app1[3] = totalLen;
+  app1[3] = totalLen - 2;
   // 'Exif\0\0'
   app1[4] = 0x45;
   app1[5] = 0x78;
@@ -388,7 +388,7 @@ test('injectApp1ExifIntoJpegBlob preserves retained data if candidate thumbnail 
   app1[0] = 0xff;
   app1[1] = 0xe1;
   app1[2] = 0x00;
-  app1[3] = totalLen;
+  app1[3] = totalLen - 2;
   app1[4] = 0x45;
   app1[5] = 0x78;
   app1[6] = 0x69;
@@ -473,7 +473,7 @@ test('injectApp1ExifIntoJpegBlob rejects mismatched strip count', async () => {
   app1[0] = 0xff;
   app1[1] = 0xe1;
   app1[2] = 0x00;
-  app1[3] = totalLen;
+  app1[3] = totalLen - 2;
   app1[4] = 0x45;
   app1[5] = 0x78;
   app1[6] = 0x69;
@@ -523,7 +523,7 @@ test('injectApp1ExifIntoJpegBlob preserves 0xA005 InteroperabilityIFD directory 
   app1[0] = 0xff;
   app1[1] = 0xe1;
   app1[2] = 0x00;
-  app1[3] = totalLen;
+  app1[3] = totalLen - 2;
   app1[4] = 0x45;
   app1[5] = 0x78;
   app1[6] = 0x69;
@@ -627,6 +627,8 @@ test('injectApp1ExifIntoJpegBlob preserves 0xA005 InteroperabilityIFD directory 
 
   // Second entry preserved
   assert.equal(viewInj.getUint16(2 + interopEntry1, true), 0x1000);
+  assert.equal(viewInj.getUint16(2 + interopEntry1 + 2, true), 2);
+  assert.equal(viewInj.getUint32(2 + interopEntry1 + 4, true), 6);
   assert.equal(viewInj.getUint32(2 + interopEntry1 + 8, true), 90);
 
   // The gap at rel 80..90 should be cleared to 0
@@ -652,7 +654,7 @@ test('injectApp1ExifIntoJpegBlob rejects truncated GPS directory extent', async 
   app1[0] = 0xff;
   app1[1] = 0xe1;
   app1[2] = 0x00;
-  app1[3] = totalLen;
+  app1[3] = totalLen - 2;
   app1[4] = 0x45;
   app1[5] = 0x78;
   app1[6] = 0x69;
@@ -697,7 +699,7 @@ test('injectApp1ExifIntoJpegBlob preserves valid in-bounds GPS directory and ent
   app1[0] = 0xff;
   app1[1] = 0xe1;
   app1[2] = 0x00;
-  app1[3] = totalLen;
+  app1[3] = totalLen - 2;
   app1[4] = 0x45;
   app1[5] = 0x78;
   app1[6] = 0x69;
@@ -731,23 +733,24 @@ test('injectApp1ExifIntoJpegBlob preserves valid in-bounds GPS directory and ent
   view1.setUint8(gpsEntry0 + 9, 0x00);
   view1.setUint32(gpsPos + 14, 0, true); // next IFD offset 0
 
-  // IFD1 at rel 70 with thumbnail covering rel 50..60
+  // IFD1 at rel 70 with thumbnail covering rel 30..60 (overlapping GPS directory at rel 26..44)
   const ifd1Pos = tiffStart + 70;
   view1.setUint16(ifd1Pos, 2, true);
   const ifd1Entry0 = ifd1Pos + 2;
   view1.setUint16(ifd1Entry0, 0x0201, true);
   view1.setUint16(ifd1Entry0 + 2, 4, true);
   view1.setUint32(ifd1Entry0 + 4, 1, true);
-  view1.setUint32(ifd1Entry0 + 8, 50, true);
+  view1.setUint32(ifd1Entry0 + 8, 30, true); // thumbnail starts at rel 30
 
   const ifd1Entry1 = ifd1Entry0 + 12;
   view1.setUint16(ifd1Entry1, 0x0202, true);
   view1.setUint16(ifd1Entry1 + 2, 4, true);
   view1.setUint32(ifd1Entry1 + 4, 1, true);
-  view1.setUint32(ifd1Entry1 + 8, 10, true);
+  view1.setUint32(ifd1Entry1 + 8, 30, true); // len 30 -> covers rel 30..60
   view1.setUint32(ifd1Entry1 + 12, 0, true);
 
-  app1.fill(0xee, tiffStart + 50, tiffStart + 60);
+  // Pre-fill gap outside GPS directory at rel 44..60 with 0xEE
+  app1.fill(0xee, tiffStart + 44, tiffStart + 60);
 
   const dummyJpegBytes = new Uint8Array([0xff, 0xd8, 0xff, 0xd9]);
   const dummyBlob = new Blob([dummyJpegBytes], { type: 'image/jpeg' });
@@ -760,12 +763,12 @@ test('injectApp1ExifIntoJpegBlob preserves valid in-bounds GPS directory and ent
   assert.equal(result.exifPreserved, true);
   const injected = new Uint8Array(await result.blob.arrayBuffer());
   const viewInj = new DataView(injected.buffer, injected.byteOffset, injected.byteLength);
-  // Verify GPS directory preserved
+  // Verify GPS directory preserved despite thumbnail overlap
   assert.equal(viewInj.getUint16(2 + gpsPos, true), 1);
   assert.equal(viewInj.getUint16(2 + gpsEntry0, true), 0x0001);
   assert.equal(injected[2 + gpsEntry0 + 8], 0x4e); // 'N'
-  // Verify thumbnail gap was cleared
-  assert.equal(injected[2 + tiffStart + 50], 0x00);
+  // Verify thumbnail gap outside GPS directory was cleared
+  assert.equal(injected[2 + tiffStart + 44], 0x00);
   assert.equal(injected[2 + tiffStart + 59], 0x00);
 });
 
@@ -775,7 +778,7 @@ test('injectApp1ExifIntoJpegBlob rejects out-of-segment GPS pointer', async () =
   app1[0] = 0xff;
   app1[1] = 0xe1;
   app1[2] = 0x00;
-  app1[3] = totalLen;
+  app1[3] = totalLen - 2;
   app1[4] = 0x45;
   app1[5] = 0x78;
   app1[6] = 0x69;
@@ -816,7 +819,7 @@ test('injectApp1ExifIntoJpegBlob clamps thumbnail range ending past segment', as
   app1[0] = 0xff;
   app1[1] = 0xe1;
   app1[2] = 0x00;
-  app1[3] = totalLen;
+  app1[3] = totalLen - 2;
   app1[4] = 0x45;
   app1[5] = 0x78;
   app1[6] = 0x69;
