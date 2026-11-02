@@ -86,6 +86,20 @@ test('computeFrameLayout retains full source width for 4000x3000 landscape in 4:
   assert.equal(layout.imageHeight, 3000);
 });
 
+test('computeFrameLayout caps dimensions at MAX_CANVAS_DIMENSION (16384 px)', () => {
+  const layout = computeFrameLayout(20000, 15000, '1:1', 10, false);
+  assert.ok(layout.canvasWidth <= 16384);
+  assert.ok(layout.canvasHeight <= 16384);
+  assert.equal(layout.canvasWidth, 16384);
+  assert.equal(layout.canvasHeight, 16384);
+});
+
+test('computeFrameLayout does not downscale source for odd dimensions with padding', () => {
+  const layout = computeFrameLayout(1337, 889, '3:2', 12, true);
+  assert.equal(layout.imageWidth, 1337);
+  assert.equal(layout.imageHeight, 889);
+});
+
 test('formatExifSummaryLine joins non-empty EXIF fields cleanly', () => {
   const line = formatExifSummaryLine({
     cameraModel: 'Leica M11',

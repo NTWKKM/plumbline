@@ -120,7 +120,6 @@ export const DarkroomCanvas: React.FC<DarkroomCanvasProps> = ({
 
       setSensorCanvas(offscreen);
       setAnalysis(detected);
-      onImageLoaded?.(true);
     };
 
     img.onerror = () => {
@@ -140,7 +139,11 @@ export const DarkroomCanvas: React.FC<DarkroomCanvasProps> = ({
   // Step 2: Render the active pipeline stage onto the visible darkroom canvas
   useEffect(() => {
     const canvas = canvasRef.current;
-    if (!canvas || !sensorCanvas) return;
+    if (!canvas || !sensorCanvas) {
+      if (exportCanvasRef) exportCanvasRef.current = null;
+      onImageLoaded?.(false);
+      return;
+    }
 
     const srcW = sensorCanvas.width;
     const srcH = sensorCanvas.height;
@@ -174,7 +177,11 @@ export const DarkroomCanvas: React.FC<DarkroomCanvasProps> = ({
     rotCanvas.width = srcW;
     rotCanvas.height = srcH;
     const rCtx = rotCanvas.getContext('2d');
-    if (!rCtx) return;
+    if (!rCtx) {
+      if (exportCanvasRef) exportCanvasRef.current = null;
+      onImageLoaded?.(false);
+      return;
+    }
 
     rCtx.fillStyle = config.backgroundColor;
     rCtx.fillRect(0, 0, srcW, srcH);
@@ -208,45 +215,47 @@ export const DarkroomCanvas: React.FC<DarkroomCanvasProps> = ({
       if (config.renderExifCaption) {
         const captionText = formatExifSummaryLine(photo.exif);
         if (captionText) {
-          const isDarkBg = isHexColorDark(config.backgroundColor);
-          targetCtx.fillStyle = isDarkBg ? '#a1a1aa' : '#3f3f46';
           let fontSize = Math.max(12, Math.round(layout.canvasHeight * 0.0145));
-          targetCtx.font = `500 ${fontSize}px "JetBrains Mono", monospace`;
-          targetCtx.textAlign = 'center';
-          targetCtx.textBaseline = 'middle';
+          if (layout.borderBottom >= fontSize) {
+            const isDarkBg = isHexColorDark(config.backgroundColor);
+            targetCtx.fillStyle = isDarkBg ? '#a1a1aa' : '#3f3f46';
+            targetCtx.font = `500 ${fontSize}px "JetBrains Mono", monospace`;
+            targetCtx.textAlign = 'center';
+            targetCtx.textBaseline = 'middle';
 
-          // Measure caption and ensure rendered width fits within canvas boundaries
-          const maxCaptionWidth = Math.max(
-            10,
-            layout.canvasWidth - Math.max(32, Math.round(layout.canvasWidth * 0.08))
-          );
-          let textWidth = targetCtx.measureText(captionText).width;
-
-          if (textWidth > maxCaptionWidth) {
-            const scaledFontSize = Math.max(
-              9,
-              Math.floor(fontSize * (maxCaptionWidth / textWidth))
+            // Measure caption and ensure rendered width fits within canvas boundaries
+            const maxCaptionWidth = Math.max(
+              10,
+              layout.canvasWidth - Math.max(32, Math.round(layout.canvasWidth * 0.08))
             );
-            if (scaledFontSize < fontSize) {
-              fontSize = scaledFontSize;
-              targetCtx.font = `500 ${fontSize}px "JetBrains Mono", monospace`;
-              textWidth = targetCtx.measureText(captionText).width;
-            }
-          }
+            let textWidth = targetCtx.measureText(captionText).width;
 
-          let finalCaption = captionText;
-          if (textWidth > maxCaptionWidth) {
-            while (
-              finalCaption.length > 3 &&
-              targetCtx.measureText(finalCaption + '…').width > maxCaptionWidth
-            ) {
-              finalCaption = finalCaption.slice(0, -1);
+            if (textWidth > maxCaptionWidth) {
+              const scaledFontSize = Math.max(
+                9,
+                Math.floor(fontSize * (maxCaptionWidth / textWidth))
+              );
+              if (scaledFontSize < fontSize) {
+                fontSize = scaledFontSize;
+                targetCtx.font = `500 ${fontSize}px "JetBrains Mono", monospace`;
+                textWidth = targetCtx.measureText(captionText).width;
+              }
             }
-            finalCaption += '…';
-          }
 
-          const captionY = layout.imageY + layout.imageHeight + layout.borderBottom * 0.52;
-          targetCtx.fillText(finalCaption, layout.canvasWidth / 2, captionY);
+            let finalCaption = captionText;
+            if (textWidth > maxCaptionWidth) {
+              while (
+                finalCaption.length > 3 &&
+                targetCtx.measureText(finalCaption + '…').width > maxCaptionWidth
+              ) {
+                finalCaption = finalCaption.slice(0, -1);
+              }
+              finalCaption += '…';
+            }
+
+            const captionY = layout.imageY + layout.imageHeight + layout.borderBottom * 0.52;
+            targetCtx.fillText(finalCaption, layout.canvasWidth / 2, captionY);
+          }
         }
       }
     };
@@ -265,7 +274,11 @@ export const DarkroomCanvas: React.FC<DarkroomCanvasProps> = ({
     }
 
     const ctx = canvas.getContext('2d');
-    if (!ctx) return;
+    if (!ctx) {
+      if (exportCanvasRef) exportCanvasRef.current = null;
+      onImageLoaded?.(false);
+      return;
+    }
 
     if (viewMode === 'original') {
       canvas.width = srcW;
@@ -445,6 +458,13 @@ export const DarkroomCanvas: React.FC<DarkroomCanvasProps> = ({
       ctx.stroke();
       ctx.restore();
     }
+
+    onImageLoaded?.(true);
+
+    return () => {
+      if (exportCanvasRef) exportCanvasRef.current = null;
+      onImageLoaded?.(false);
+    };
   }, [
     sensorCanvas,
     analysis,
@@ -454,6 +474,8 @@ export const DarkroomCanvas: React.FC<DarkroomCanvasProps> = ({
     showHorizonGrid,
     photo.exif,
     canvasRef,
+    exportCanvasRef,
+    onImageLoaded,
   ]);
 
   const updateSplitFromClientX = (clientX: number) => {

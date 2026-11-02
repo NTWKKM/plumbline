@@ -169,7 +169,16 @@ export default function App() {
       let exifPreserved = false;
 
       if (config.preserveExifMetadata) {
-        const injectResult = await injectApp1ExifIntoJpegBlob(blob, activePhoto.rawApp1Segment);
+        const injectResult = await injectApp1ExifIntoJpegBlob(
+          blob,
+          activePhoto.rawApp1Segment,
+          {
+            width: frameLayout.canvasWidth,
+            height: frameLayout.canvasHeight,
+            sourceWidth: sourceSize.width,
+            sourceHeight: sourceSize.height,
+          }
+        );
         finalBlob = injectResult.blob;
         exifPreserved = injectResult.exifPreserved;
       }
@@ -294,7 +303,7 @@ export default function App() {
             className="flex items-center gap-1.5 rounded-lg bg-blue-600 px-3.5 py-2 text-xs font-semibold text-white transition-colors hover:bg-blue-500 whitespace-nowrap shrink-0"
           >
             <ImagePlus className="h-3.5 w-3.5" />
-            Import JPEG / RAW
+            Import Photo (JPEG, PNG, WebP)
           </button>
         </div>
       </header>

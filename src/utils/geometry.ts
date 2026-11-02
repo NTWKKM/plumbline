@@ -375,6 +375,8 @@ export function detectHorizonTiltFromGrayscale(
   };
 }
 
+export const MAX_CANVAS_DIMENSION = 16384;
+
 /**
  * Computes the White Border frame canvas dimensions and centered inner photo coordinates
  * following the `com.vector123.whiteborder` no-crop framing model.
@@ -412,22 +414,50 @@ export function computeFrameLayout(
   let canvasHeight: number;
 
   if (reqCanvasW_from_W >= reqCanvasW_from_H) {
-    canvasWidth = Math.round(reqCanvasW_from_W);
-    canvasHeight = Math.round(canvasWidth / targetRatio);
+    canvasWidth = Math.ceil(reqCanvasW_from_W);
+    canvasHeight = Math.ceil(canvasWidth / targetRatio);
   } else {
-    canvasHeight = Math.round(reqCanvasH_from_H);
-    canvasWidth = Math.round(canvasHeight * targetRatio);
+    canvasHeight = Math.ceil(reqCanvasH_from_H);
+    canvasWidth = Math.ceil(canvasHeight * targetRatio);
+  }
+
+  // Cap computed frame dimensions at maximum supported canvas limit before allocation
+  if (canvasWidth > MAX_CANVAS_DIMENSION) {
+    canvasWidth = MAX_CANVAS_DIMENSION;
+    canvasHeight = Math.max(1, Math.round(canvasWidth / targetRatio));
+  }
+  if (canvasHeight > MAX_CANVAS_DIMENSION) {
+    canvasHeight = MAX_CANVAS_DIMENSION;
+    canvasWidth = Math.max(1, Math.round(canvasHeight * targetRatio));
   }
 
   // Reserve extra bottom margin if EXIF caption stamp is enabled
-  const exifFooterReserve = renderExifCaption ? Math.round(canvasHeight * 0.045) : 0;
-  const minMarginX = Math.round(canvasWidth * padRatio);
-  const minMarginY = Math.round(canvasHeight * padRatio);
+  const exifFooterReserve = renderExifCaption ? Math.floor(canvasHeight * 0.045) : 0;
+
+  // Round margins down so available drawing area is at least as large as the source image
+  let minMarginX = Math.floor(canvasWidth * padRatio);
+  let minMarginY = Math.floor(canvasHeight * padRatio);
+
+  // If not capped at maximum canvas dimension, ensure available area does not fall below source size due to rounding
+  if (canvasWidth < MAX_CANVAS_DIMENSION && canvasHeight < MAX_CANVAS_DIMENSION) {
+    if (canvasWidth - minMarginX * 2 < safeW) {
+      canvasWidth = safeW + minMarginX * 2;
+      canvasHeight = Math.max(canvasHeight, Math.ceil(canvasWidth / targetRatio));
+      minMarginX = Math.floor(canvasWidth * padRatio);
+      minMarginY = Math.floor(canvasHeight * padRatio);
+    }
+    if (canvasHeight - minMarginY * 2 - exifFooterReserve < safeH) {
+      canvasHeight = safeH + minMarginY * 2 + exifFooterReserve;
+      canvasWidth = Math.max(canvasWidth, Math.ceil(canvasHeight * targetRatio));
+      minMarginX = Math.floor(canvasWidth * padRatio);
+      minMarginY = Math.floor(canvasHeight * padRatio);
+    }
+  }
 
   const availW = Math.max(1, canvasWidth - minMarginX * 2);
   const availH = Math.max(1, canvasHeight - minMarginY * 2 - exifFooterReserve);
 
-  const scale = Math.min(availW / safeW, availH / safeH);
+  const scale = Math.min(1.0, availW / safeW, availH / safeH);
   const imageWidth = Math.max(1, Math.round(safeW * scale));
   const imageHeight = Math.max(1, Math.round(safeH * scale));
 

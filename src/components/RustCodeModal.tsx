@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import { Check, Copy, Download, Terminal, X } from 'lucide-react';
 import { RUST_CARGO_TOML, RUST_MAIN_RS } from '../utils/rustMacosSource';
 
@@ -12,20 +12,67 @@ export const RustCodeModal: React.FC<RustCodeModalProps> = ({ isOpen, onClose })
   const [copied, setCopied] = useState(false);
   const [copyError, setCopyError] = useState<string | null>(null);
 
+  const copyRequestIdRef = useRef(0);
+  const copyTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const errorTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (copyTimeoutRef.current) clearTimeout(copyTimeoutRef.current);
+      if (errorTimeoutRef.current) clearTimeout(errorTimeoutRef.current);
+    };
+  }, []);
+
   if (!isOpen) return null;
 
   const activeCode = activeFile === 'main.rs' ? RUST_MAIN_RS : RUST_CARGO_TOML;
 
   const handleCopy = async () => {
+    const currentRequestId = ++copyRequestIdRef.current;
+    if (copyTimeoutRef.current) {
+      clearTimeout(copyTimeoutRef.current);
+      copyTimeoutRef.current = null;
+    }
+    if (errorTimeoutRef.current) {
+      clearTimeout(errorTimeoutRef.current);
+      errorTimeoutRef.current = null;
+    }
     setCopyError(null);
     try {
       await navigator.clipboard.writeText(activeCode);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 1800);
+      if (copyRequestIdRef.current === currentRequestId) {
+        setCopied(true);
+        copyTimeoutRef.current = setTimeout(() => {
+          if (copyRequestIdRef.current === currentRequestId) {
+            setCopied(false);
+          }
+        }, 1800);
+      }
     } catch {
-      setCopyError('Failed to copy');
-      setTimeout(() => setCopyError(null), 3000);
+      if (copyRequestIdRef.current === currentRequestId) {
+        setCopyError('Failed to copy');
+        errorTimeoutRef.current = setTimeout(() => {
+          if (copyRequestIdRef.current === currentRequestId) {
+            setCopyError(null);
+          }
+        }, 3000);
+      }
     }
+  };
+
+  const handleSelectFile = (file: 'main.rs' | 'Cargo.toml') => {
+    copyRequestIdRef.current++;
+    if (copyTimeoutRef.current) {
+      clearTimeout(copyTimeoutRef.current);
+      copyTimeoutRef.current = null;
+    }
+    if (errorTimeoutRef.current) {
+      clearTimeout(errorTimeoutRef.current);
+      errorTimeoutRef.current = null;
+    }
+    setActiveFile(file);
+    setCopied(false);
+    setCopyError(null);
   };
 
   const handleDownloadFile = (filename: string, content: string) => {
@@ -72,9 +119,17 @@ export const RustCodeModal: React.FC<RustCodeModalProps> = ({ isOpen, onClose })
         <div className="flex flex-wrap items-center justify-between gap-4 border-b border-zinc-800 bg-[#16161a] px-6 py-3">
           <div className="flex items-center gap-3 text-xs text-zinc-300">
             <Terminal className="h-4 w-4 text-blue-400 shrink-0" />
-            <span className="font-mono">
-              mkdir -p whiteborder-macos/src && cd whiteborder-macos; save Cargo.toml here and src/main.rs in src/, then cargo run --release
-            </span>
+            <div className="flex flex-wrap items-center gap-1.5">
+              <code className="rounded bg-zinc-800/80 px-1.5 py-0.5 font-mono text-zinc-200">
+                mkdir -p whiteborder-macos/src &amp;&amp; cd whiteborder-macos
+              </code>
+              <span className="text-zinc-400">
+                (save Cargo.toml here, src/main.rs in src/), then run:
+              </span>
+              <code className="rounded bg-zinc-800/80 px-1.5 py-0.5 font-mono text-zinc-200">
+                cargo run --release
+              </code>
+            </div>
           </div>
 
           <div className="flex items-center gap-2">
@@ -82,11 +137,7 @@ export const RustCodeModal: React.FC<RustCodeModalProps> = ({ isOpen, onClose })
             <div className="flex items-center rounded-lg bg-zinc-900 p-1 border border-zinc-800">
               <button
                 type="button"
-                onClick={() => {
-                  setActiveFile('main.rs');
-                  setCopied(false);
-                  setCopyError(null);
-                }}
+                onClick={() => handleSelectFile('main.rs')}
                 className={`rounded-md px-3 py-1 text-xs font-mono font-medium transition-colors whitespace-nowrap shrink-0 ${
                   activeFile === 'main.rs'
                     ? 'bg-zinc-800 text-white'
@@ -97,11 +148,7 @@ export const RustCodeModal: React.FC<RustCodeModalProps> = ({ isOpen, onClose })
               </button>
               <button
                 type="button"
-                onClick={() => {
-                  setActiveFile('Cargo.toml');
-                  setCopied(false);
-                  setCopyError(null);
-                }}
+                onClick={() => handleSelectFile('Cargo.toml')}
                 className={`rounded-md px-3 py-1 text-xs font-mono font-medium transition-colors whitespace-nowrap shrink-0 ${
                   activeFile === 'Cargo.toml'
                     ? 'bg-zinc-800 text-white'

@@ -88,15 +88,89 @@ test('injectApp1ExifIntoJpegBlob resets Orientation tag 0x0112 to 1 and returns 
   assert.equal(result.exifPreserved, true);
 
   const injectedBytes = new Uint8Array(await result.blob.arrayBuffer());
+  assert.equal(injectedBytes.byteLength, dummyBlob.size + app1.length);
   assert.equal(injectedBytes[0], 0xff);
   assert.equal(injectedBytes[1], 0xd8);
   // Spliced segment starts at byte 2
   assert.equal(injectedBytes[2], 0xff);
   assert.equal(injectedBytes[3], 0xe1);
+  // APP1 segment length bytes at offsets 4 and 5
+  assert.equal(injectedBytes[4], app1[2]);
+  assert.equal(injectedBytes[5], app1[3]);
 
   // Check that Orientation tag value at byte 2 + 28 was reset to 1
   assert.equal(injectedBytes[2 + 28], 0x01);
   assert.equal(injectedBytes[2 + 29], 0x00);
+});
+
+test('injectApp1ExifIntoJpegBlob zeroes out IFD1 thumbnail pointer when export dimensions differ from source', async () => {
+  const app1 = new Uint8Array(40);
+  app1[0] = 0xff;
+  app1[1] = 0xe1;
+  app1[2] = 0x00;
+  app1[3] = 40;
+  // 'Exif\0\0'
+  app1[4] = 0x45;
+  app1[5] = 0x78;
+  app1[6] = 0x69;
+  app1[7] = 0x66;
+  app1[8] = 0x00;
+  app1[9] = 0x00;
+  // TIFF 'II' + 42 + IFD0 offset = 8
+  app1[10] = 0x49;
+  app1[11] = 0x49;
+  app1[12] = 0x2a;
+  app1[13] = 0x00;
+  app1[14] = 0x08;
+  app1[15] = 0x00;
+  app1[16] = 0x00;
+  app1[17] = 0x00;
+  // Entries = 1
+  app1[18] = 0x01;
+  app1[19] = 0x00;
+  // Entry 0: tag 0x0112 (Orientation), type 3 (SHORT), count 1, value 6
+  app1[20] = 0x12;
+  app1[21] = 0x01;
+  app1[22] = 0x03;
+  app1[23] = 0x00;
+  app1[24] = 0x01;
+  app1[25] = 0x00;
+  app1[26] = 0x00;
+  app1[27] = 0x00;
+  app1[28] = 0x06;
+  app1[29] = 0x00;
+  app1[30] = 0x00;
+  app1[31] = 0x00;
+  // Next IFD (IFD1 thumbnail pointer at offset 32: 0x00000100)
+  app1[32] = 0x00;
+  app1[33] = 0x01;
+  app1[34] = 0x00;
+  app1[35] = 0x00;
+
+  const dummyJpegBytes = new Uint8Array([0xff, 0xd8, 0xff, 0xd9]);
+  const dummyBlob = new Blob([dummyJpegBytes], { type: 'image/jpeg' });
+
+  // When dimensions differ, thumbnail offset at 2 + 32 should be zeroed
+  const resultDiff = await injectApp1ExifIntoJpegBlob(dummyBlob, app1, {
+    width: 3000,
+    height: 3000,
+    sourceWidth: 2000,
+    sourceHeight: 1500,
+  });
+  const bytesDiff = new Uint8Array(await resultDiff.blob.arrayBuffer());
+  const viewDiff = new DataView(bytesDiff.buffer);
+  assert.equal(viewDiff.getUint32(2 + 32, true), 0);
+
+  // When dimensions match, thumbnail offset should be preserved
+  const resultSame = await injectApp1ExifIntoJpegBlob(dummyBlob, app1, {
+    width: 2000,
+    height: 1500,
+    sourceWidth: 2000,
+    sourceHeight: 1500,
+  });
+  const bytesSame = new Uint8Array(await resultSame.blob.arrayBuffer());
+  const viewSame = new DataView(bytesSame.buffer);
+  assert.equal(viewSame.getUint32(2 + 32, true), 0x0100);
 });
 
 test('injectApp1ExifIntoJpegBlob returns exifPreserved false when rawApp1Segment is null or missing', async () => {

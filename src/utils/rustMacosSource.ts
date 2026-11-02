@@ -165,6 +165,13 @@ fn develop_raw_bilinear(raw: &rawloader::RawImage) -> Result<RgbaImage, String> 
         _ => return Err("Unsupported floating-point RAW sensor data".into()),
     };
 
+    // Ensure dimensions contain at least a complete 2x2 Bayer block to prevent indexing panic
+    if w < 2 || h < 2 {
+        return Err(format!(
+            "Incomplete 2x2 block: decoded RAW image dimensions ({w}x{h}) must be at least 2x2 for Bayer demosaicing"
+        ));
+    }
+
     // Validate CFA pattern: reject unsupported layouts (e.g. 6x6 X-Trans pattern in certain .raf files)
     if raw.cfa.width != 2 || raw.cfa.height != 2 {
         return Err(format!(
@@ -178,23 +185,40 @@ fn develop_raw_bilinear(raw: &rawloader::RawImage) -> Result<RgbaImage, String> 
     let mut b_pos = (1, 1);
     let mut g1_pos = (1, 0);
     let mut g2_pos = (0, 1);
+    let mut r_count = 0;
+    let mut b_count = 0;
     let mut g_count = 0;
 
     for dy in 0..2 {
         for dx in 0..2 {
             match raw.cfa.color_at(dy, dx) {
-                0 => r_pos = (dx, dy), // Red
-                2 => b_pos = (dx, dy), // Blue
-                _ => {                 // Green
+                0 => {
+                    r_pos = (dx, dy); // Red
+                    r_count += 1;
+                }
+                2 => {
+                    b_pos = (dx, dy); // Blue
+                    b_count += 1;
+                }
+                1 => {
                     if g_count == 0 {
-                        g1_pos = (dx, dy);
-                        g_count += 1;
+                        g1_pos = (dx, dy); // Green 1
                     } else {
-                        g2_pos = (dx, dy);
+                        g2_pos = (dx, dy); // Green 2
                     }
+                    g_count += 1;
+                }
+                other => {
+                    return Err(format!("Unsupported CFA color value: {other} at ({dx}, {dy})"));
                 }
             }
         }
+    }
+
+    if r_count != 1 || b_count != 1 || g_count != 2 {
+        return Err(format!(
+            "Invalid 2x2 Bayer layout: expected exactly 1 Red, 1 Blue, and 2 Green sites, found {r_count} Red, {b_count} Blue, {g_count} Green"
+        ));
     }
 
     let black = raw.blacklevels[0] as f32;

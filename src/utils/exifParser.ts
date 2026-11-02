@@ -33,6 +33,7 @@ export function parseExifFromArrayBuffer(
 
   let rawApp1Segment: Uint8Array | null = null;
   let tiffOffset = -1;
+  let maxTiffOffset = bytes.length;
 
   // Check JPEG SOI marker 0xFFD8
   if (bytes.length > 4 && bytes[0] === 0xff && bytes[1] === 0xd8) {
@@ -55,6 +56,7 @@ export function parseExifFromArrayBuffer(
       ) {
         rawApp1Segment = bytes.slice(offset, offset + 2 + segLength);
         tiffOffset = offset + 10;
+        maxTiffOffset = offset + 2 + segLength;
         break;
       }
       offset += 2 + segLength;
@@ -65,9 +67,10 @@ export function parseExifFromArrayBuffer(
   ) {
     // TIFF-based RAW header (II or MM)
     tiffOffset = 0;
+    maxTiffOffset = view.byteLength;
   }
 
-  const parsedTags = tiffOffset >= 0 ? readTiffIfdTags(view, tiffOffset) : {};
+  const parsedTags = tiffOffset >= 0 ? readTiffIfdTags(view, tiffOffset, maxTiffOffset) : {};
 
   const exif: ExifData = {
     cameraModel: parsedTags.model || (isRawContainer ? `RAW Sensor (${ext.toUpperCase()})` : DEFAULT_FALLBACK_EXIF.cameraModel),
@@ -86,7 +89,8 @@ export function parseExifFromArrayBuffer(
 
 function readTiffIfdTags(
   view: DataView,
-  tiffStart: number
+  tiffStart: number,
+  maxOffset: number = view.byteLength
 ): Partial<{
   model: string;
   lens: string;
@@ -107,16 +111,17 @@ function readTiffIfdTags(
   }> = {};
 
   try {
-    if (tiffStart + 8 > view.byteLength) return result;
+    const validMax = Math.min(view.byteLength, maxOffset);
+    if (tiffStart + 8 > validMax) return result;
     const littleEndian = view.getUint16(tiffStart, false) === 0x4949;
     const firstIfdRel = view.getUint32(tiffStart + 4, littleEndian);
     const ifd0Offset = tiffStart + firstIfdRel;
-    if (ifd0Offset + 2 > view.byteLength) return result;
+    if (ifd0Offset + 2 > validMax) return result;
 
     let exifSubIfdOffset = -1;
 
     const readAscii = (valOffset: number, count: number): string => {
-      if (valOffset < 0 || valOffset + count > view.byteLength) return '';
+      if (valOffset < 0 || valOffset + count > validMax) return '';
       let str = '';
       for (let i = 0; i < count; i++) {
         const ch = view.getUint8(valOffset + i);
@@ -127,18 +132,18 @@ function readTiffIfdTags(
     };
 
     const readRational = (valOffset: number): number | null => {
-      if (valOffset < 0 || valOffset + 8 > view.byteLength) return null;
+      if (valOffset < 0 || valOffset + 8 > validMax) return null;
       const num = view.getUint32(valOffset, littleEndian);
       const den = view.getUint32(valOffset + 4, littleEndian);
       return den === 0 ? null : num / den;
     };
 
     const parseIfd = (ifdPos: number) => {
-      if (ifdPos + 2 > view.byteLength) return;
+      if (ifdPos + 2 > validMax) return;
       const entries = view.getUint16(ifdPos, littleEndian);
       for (let i = 0; i < entries; i++) {
         const entryPos = ifdPos + 2 + i * 12;
-        if (entryPos + 12 > view.byteLength) break;
+        if (entryPos + 12 > validMax) break;
         const tag = view.getUint16(entryPos, littleEndian);
         const type = view.getUint16(entryPos + 2, littleEndian);
         const count = view.getUint32(entryPos + 4, littleEndian);
@@ -155,7 +160,7 @@ function readTiffIfdTags(
         }
         // 0x829A = ExposureTime
         if (tag === 0x829a && type === 5) {
-          if (valOffset + 8 <= view.byteLength) {
+          if (valOffset + 8 <= validMax) {
             const num = view.getUint32(valOffset, littleEndian);
             const den = view.getUint32(valOffset + 4, littleEndian);
             if (num > 0 && den > 0) {
@@ -176,7 +181,7 @@ function readTiffIfdTags(
             if (count === 1 || count === 2) {
               isoVal = view.getUint16(entryPos + 8, littleEndian);
             } else if (count > 2) {
-              if (valOffset >= 0 && valOffset + 2 <= view.byteLength) {
+              if (valOffset >= 0 && valOffset + 2 <= validMax) {
                 isoVal = view.getUint16(valOffset, littleEndian);
               }
             }
@@ -217,13 +222,23 @@ export interface InjectExifResult {
   exifPreserved: boolean;
 }
 
+export interface ExportDimensions {
+  width: number;
+  height: number;
+  sourceWidth?: number;
+  sourceHeight?: number;
+}
+
 /**
  * Losslessly injects an original JPEG APP1 EXIF segment into a freshly encoded JPEG Blob,
  * resetting Orientation (tag 0x0112) to 1 (normal) to prevent double-rotation in viewers.
+ * Updates PixelXDimension / PixelYDimension to match export canvas and removes IFD1 thumbnail
+ * when output dimensions differ from the source.
  */
 export async function injectApp1ExifIntoJpegBlob(
   jpegBlob: Blob,
-  rawApp1Segment: Uint8Array | null
+  rawApp1Segment: Uint8Array | null,
+  exportDimensions?: ExportDimensions
 ): Promise<InjectExifResult> {
   if (!rawApp1Segment || rawApp1Segment.length < 14) {
     return { blob: jpegBlob, exifPreserved: false };
@@ -257,15 +272,71 @@ export async function injectApp1ExifIntoJpegBlob(
 
     if (ifd0Offset >= 0 && ifd0Offset + 2 <= segment.length) {
       const entries = view.getUint16(ifd0Offset, littleEndian);
+      let exifSubIfdOffset = -1;
+
       for (let i = 0; i < entries; i++) {
         const entryPos = ifd0Offset + 2 + i * 12;
         if (entryPos + 12 > segment.length) break;
         const tag = view.getUint16(entryPos, littleEndian);
-        // 0x0112 = Orientation tag
-        if (tag === 0x0112) {
-          // Reset orientation to 1 (Normal / Top-Left) since canvas has already applied sensor rotation
+        const type = view.getUint16(entryPos + 2, littleEndian);
+        const count = view.getUint32(entryPos + 4, littleEndian);
+
+        // 0x0112 = Orientation tag: only modify if inline SHORT with count 1
+        if (tag === 0x0112 && type === 3 && count === 1) {
           view.setUint16(entryPos + 8, 1, littleEndian);
-          break;
+        }
+
+        // 0x8769 = ExifSubIFD pointer
+        if (tag === 0x8769 && (type === 3 || type === 4) && count === 1) {
+          const subRel = type === 4
+            ? view.getUint32(entryPos + 8, littleEndian)
+            : view.getUint16(entryPos + 8, littleEndian);
+          exifSubIfdOffset = tiffStart + subRel;
+        }
+
+        // 0x0100 / 0x0101 = ImageWidth / ImageLength in IFD0 if present
+        if (exportDimensions && count === 1) {
+          if (tag === 0x0100) {
+            if (type === 4) view.setUint32(entryPos + 8, exportDimensions.width, littleEndian);
+            else if (type === 3) view.setUint16(entryPos + 8, Math.min(exportDimensions.width, 0xffff), littleEndian);
+          } else if (tag === 0x0101) {
+            if (type === 4) view.setUint32(entryPos + 8, exportDimensions.height, littleEndian);
+            else if (type === 3) view.setUint16(entryPos + 8, Math.min(exportDimensions.height, 0xffff), littleEndian);
+          }
+        }
+      }
+
+      // If output dimensions differ from source, remove IFD1 thumbnail pointer (set 4-byte offset to 0)
+      const nextIfdOffsetPos = ifd0Offset + 2 + entries * 12;
+      if (nextIfdOffsetPos + 4 <= segment.length) {
+        const dimensionsDiffer =
+          exportDimensions &&
+          ((exportDimensions.sourceWidth !== undefined && exportDimensions.width !== exportDimensions.sourceWidth) ||
+            (exportDimensions.sourceHeight !== undefined && exportDimensions.height !== exportDimensions.sourceHeight));
+        if (dimensionsDiffer) {
+          view.setUint32(nextIfdOffsetPos, 0, littleEndian);
+        }
+      }
+
+      // Update PixelXDimension (0xA002) and PixelYDimension (0xA003) in ExifSubIFD if present
+      if (exportDimensions && exifSubIfdOffset > 0 && exifSubIfdOffset + 2 <= segment.length) {
+        const subEntries = view.getUint16(exifSubIfdOffset, littleEndian);
+        for (let j = 0; j < subEntries; j++) {
+          const subEntryPos = exifSubIfdOffset + 2 + j * 12;
+          if (subEntryPos + 12 > segment.length) break;
+          const subTag = view.getUint16(subEntryPos, littleEndian);
+          const subType = view.getUint16(subEntryPos + 2, littleEndian);
+          const subCount = view.getUint32(subEntryPos + 4, littleEndian);
+
+          if (subCount === 1) {
+            if (subTag === 0xa002) {
+              if (subType === 4) view.setUint32(subEntryPos + 8, exportDimensions.width, littleEndian);
+              else if (subType === 3) view.setUint16(subEntryPos + 8, Math.min(exportDimensions.width, 0xffff), littleEndian);
+            } else if (subTag === 0xa003) {
+              if (subType === 4) view.setUint32(subEntryPos + 8, exportDimensions.height, littleEndian);
+              else if (subType === 3) view.setUint16(subEntryPos + 8, Math.min(exportDimensions.height, 0xffff), littleEndian);
+            }
+          }
         }
       }
     }
