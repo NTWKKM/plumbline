@@ -4,10 +4,9 @@
  */
 
 import React, { useCallback, useRef, useState } from 'react';
-import { Code2, Grid, ImagePlus } from 'lucide-react';
+import { Grid, ImagePlus } from 'lucide-react';
 import { CanvasViewMode, DarkroomCanvas } from './components/DarkroomCanvas';
 import { InspectorSidebar } from './components/InspectorSidebar';
-import { RustCodeModal } from './components/RustCodeModal';
 import {
   injectApp1ExifIntoJpegBlob,
   parseExifFromArrayBuffer,
@@ -41,7 +40,6 @@ export default function App() {
   const [viewMode, setViewMode] = useState<CanvasViewMode>('framed');
   const [splitPercent, setSplitPercent] = useState<number>(50);
   const [showHorizonGrid, setShowHorizonGrid] = useState<boolean>(false);
-  const [isRustModalOpen, setIsRustModalOpen] = useState<boolean>(false);
   const [isExporting, setIsExporting] = useState<boolean>(false);
   const [isImageLoaded, setIsImageLoaded] = useState<boolean>(false);
   const [exportBanner, setExportBanner] = useState<string | null>(null);
@@ -283,16 +281,6 @@ export default function App() {
           >
             Original Sensor
           </a>
-          <a
-            href="#rust-source"
-            onClick={(e) => {
-              e.preventDefault();
-              setIsRustModalOpen(true);
-            }}
-            className="hover:text-zinc-100 transition-colors whitespace-nowrap shrink-0"
-          >
-            macOS Rust Code
-          </a>
         </nav>
 
         {/* Zone 3: 1 primary action */}
@@ -368,24 +356,6 @@ export default function App() {
                 </button>
               );
             })}
-          </div>
-
-          {/* Native macOS Rust Bundle Card */}
-          <div className="mt-auto hidden lg:block border-t border-zinc-800/80 p-4 bg-[#141418]">
-            <div className="text-xs font-semibold text-zinc-200">
-              Native macOS App (Rust)
-            </div>
-            <p className="mt-1 text-[11px] leading-relaxed text-zinc-400">
-              Pure-Rust desktop binary using <code className="text-zinc-200">eframe/egui</code>, <code className="text-zinc-200">rawloader</code>, and <code className="text-zinc-200">img-parts</code>.
-            </p>
-            <button
-              type="button"
-              onClick={() => setIsRustModalOpen(true)}
-              className="mt-3 flex w-full items-center justify-center gap-1.5 rounded-lg border border-zinc-700 bg-zinc-800 px-3 py-2 text-xs font-medium text-zinc-100 transition-colors hover:bg-zinc-700 whitespace-nowrap shrink-0"
-            >
-              <Code2 className="h-3.5 w-3.5 text-blue-400" />
-              View Rust macOS Source
-            </button>
           </div>
         </aside>
 
@@ -489,15 +459,6 @@ export default function App() {
               >
                 <Grid className="h-3.5 w-3.5" />
                 Horizon Grid
-              </button>
-
-              <button
-                type="button"
-                onClick={() => setIsRustModalOpen(true)}
-                className="flex items-center gap-1.5 rounded-lg border border-zinc-700 bg-zinc-900 px-2.5 py-1 text-xs font-medium text-zinc-200 transition-colors hover:border-zinc-600 hover:text-white whitespace-nowrap shrink-0"
-              >
-                <Code2 className="h-3.5 w-3.5 text-blue-400" />
-                Rust Code
               </button>
             </div>
           </div>
@@ -607,12 +568,6 @@ export default function App() {
           isImageLoaded={isImageLoaded}
         />
       </main>
-
-      {/* Native macOS Rust Source Code Modal */}
-      <RustCodeModal
-        isOpen={isRustModalOpen}
-        onClose={() => setIsRustModalOpen(false)}
-      />
     </div>
   );
 }

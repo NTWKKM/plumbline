@@ -1,38 +1,4 @@
-/**
- * Complete, self-contained Rust macOS Native Desktop GUI implementation
- * Built with `eframe/egui` (Native Metal renderer on macOS), `image`, `imageproc`,
- * `rawloader` (Camera RAW decoding), and `kamadak-exif` / `img-parts` (lossless EXIF injection).
- *
- * Follows Andrej Karpathy's Coding Guidelines:
- * 1. Data-First Thinking (explicit structs first)
- * 2. Concrete Procedural Functions (zero trait/factory over-engineering)
- * 3. Self-Contained & Dependency-Light (Pure Rust, no C++ OpenCV dylib headaches on macOS)
- */
-
-export const RUST_CARGO_TOML = `[package]
-name = "whiteborder-macos"
-version = "0.1.0"
-edition = "2021"
-description = "macOS Native White Border Framing + Sobel Auto-Leveling + Inscribed Auto-Crop (JPEG & RAW)"
-
-[dependencies]
-eframe = { version = "0.29", default-features = false, features = ["default_fonts", "glow", "persistence"] }
-egui_extras = { version = "0.29", features = ["all_loaders"] }
-rfd = "0.15"                        # Native macOS NSOpenPanel / NSSavePanel file dialogs
-image = { version = "0.25", default-features = false, features = ["jpeg", "png", "tiff", "webp"] }
-imageproc = "0.25"                  # Bilinear/Bicubic rotation around image center
-rawloader = "0.37"                  # Pure-Rust Camera RAW decoder (.CR2, .NEF, .ARW, .DNG, .RAF)
-kamadak-exif = "0.5"                # Parse EXIF tags from source JPEG/RAW
-img-parts = "0.3"                   # Losslessly copy raw APP1 EXIF segment into output JPEG
-rayon = "1.10"                      # Data-parallel Sobel gradient & demosaicing on Apple Silicon
-
-[profile.release]
-opt-level = 3
-lto = "thin"
-codegen-units = 1
-`;
-
-export const RUST_MAIN_RS = `// src/main.rs
+// src/main.rs
 // macOS Native Desktop GUI: WhiteBorder + Auto-Leveling + Inscribed Auto-Crop
 // Run on macOS (Apple Silicon / Intel): \`cargo run --release\`
 
@@ -745,4 +711,3 @@ fn main() -> eframe::Result<()> {
         Box::new(|_cc| Ok(Box::new(WhiteBorderMacApp::default()))),
     )
 }
-`;
