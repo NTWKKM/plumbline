@@ -735,12 +735,12 @@ impl WhiteBorderMacApp {
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("WhiteBorder Studio — macOS")
+            .with_title("Plumb_Line — macOS")
             .with_inner_size([1280.0, 820.0]),
         ..Default::default()
     };
     eframe::run_native(
-        "WhiteBorder Studio",
+        "Plumb_Line",
         options,
         Box::new(|_cc| Ok(Box::new(WhiteBorderMacApp::default()))),
     )

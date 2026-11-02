@@ -230,7 +230,7 @@ export default function App() {
           }}
           className="font-display text-lg font-bold tracking-tight text-zinc-100 whitespace-nowrap shrink-0"
         >
-          WhiteBorder Studio
+          Plumb_Line
         </a>
 
         {/* Zone 2: 5 concise single-line text navigation links */}
