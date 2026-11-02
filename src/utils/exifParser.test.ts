@@ -103,7 +103,7 @@ test('injectApp1ExifIntoJpegBlob resets Orientation tag 0x0112 to 1 and returns 
   assert.equal(injectedBytes[2 + 29], 0x00);
 });
 
-test('injectApp1ExifIntoJpegBlob zeroes out IFD1 thumbnail pointer when export dimensions differ from source', async () => {
+test('injectApp1ExifIntoJpegBlob zeroes out IFD1 thumbnail pointer on exported images', async () => {
   const app1 = new Uint8Array(40);
   app1[0] = 0xff;
   app1[1] = 0xe1;
@@ -161,7 +161,7 @@ test('injectApp1ExifIntoJpegBlob zeroes out IFD1 thumbnail pointer when export d
   const viewDiff = new DataView(bytesDiff.buffer);
   assert.equal(viewDiff.getUint32(2 + 32, true), 0);
 
-  // When dimensions match, thumbnail offset should be preserved
+  // Even when dimensions match, thumbnail offset should still be cleared for re-rendered output
   const resultSame = await injectApp1ExifIntoJpegBlob(dummyBlob, app1, {
     width: 2000,
     height: 1500,
@@ -170,7 +170,13 @@ test('injectApp1ExifIntoJpegBlob zeroes out IFD1 thumbnail pointer when export d
   });
   const bytesSame = new Uint8Array(await resultSame.blob.arrayBuffer());
   const viewSame = new DataView(bytesSame.buffer);
-  assert.equal(viewSame.getUint32(2 + 32, true), 0x0100);
+  assert.equal(viewSame.getUint32(2 + 32, true), 0);
+
+  // When exportDimensions is not supplied, thumbnail offset should be preserved
+  const resultNoDims = await injectApp1ExifIntoJpegBlob(dummyBlob, app1);
+  const bytesNoDims = new Uint8Array(await resultNoDims.blob.arrayBuffer());
+  const viewNoDims = new DataView(bytesNoDims.buffer);
+  assert.equal(viewNoDims.getUint32(2 + 32, true), 0x0100);
 });
 
 test('injectApp1ExifIntoJpegBlob returns exifPreserved false when rawApp1Segment is null or missing', async () => {

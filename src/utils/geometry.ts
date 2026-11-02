@@ -376,6 +376,7 @@ export function detectHorizonTiltFromGrayscale(
 }
 
 export const MAX_CANVAS_DIMENSION = 16384;
+export const MAX_CANVAS_AREA = 67108864; // 8192 x 8192 px: WebKit / iOS Safari maximum canvas area limit
 
 /**
  * Computes the White Border frame canvas dimensions and centered inner photo coordinates
@@ -421,14 +422,33 @@ export function computeFrameLayout(
     canvasWidth = Math.ceil(canvasHeight * targetRatio);
   }
 
+  let wasCapped = false;
+
   // Cap computed frame dimensions at maximum supported canvas limit before allocation
   if (canvasWidth > MAX_CANVAS_DIMENSION) {
     canvasWidth = MAX_CANVAS_DIMENSION;
     canvasHeight = Math.max(1, Math.round(canvasWidth / targetRatio));
+    wasCapped = true;
   }
   if (canvasHeight > MAX_CANVAS_DIMENSION) {
     canvasHeight = MAX_CANVAS_DIMENSION;
     canvasWidth = Math.max(1, Math.round(canvasHeight * targetRatio));
+    wasCapped = true;
+  }
+
+  // Cap computed frame area at maximum supported browser canvas area limit (e.g. WebKit / iOS Safari)
+  if (canvasWidth * canvasHeight > MAX_CANVAS_AREA) {
+    const areaScale = Math.sqrt(MAX_CANVAS_AREA / (canvasWidth * canvasHeight));
+    canvasWidth = Math.max(1, Math.floor(canvasWidth * areaScale));
+    canvasHeight = Math.max(1, Math.floor(canvasWidth / targetRatio));
+    while (canvasWidth * canvasHeight > MAX_CANVAS_AREA && canvasWidth > 1 && canvasHeight > 1) {
+      if (canvasWidth / targetRatio >= canvasHeight) {
+        canvasWidth--;
+      } else {
+        canvasHeight--;
+      }
+    }
+    wasCapped = true;
   }
 
   // Reserve extra bottom margin if EXIF caption stamp is enabled
@@ -438,8 +458,8 @@ export function computeFrameLayout(
   let minMarginX = Math.floor(canvasWidth * padRatio);
   let minMarginY = Math.floor(canvasHeight * padRatio);
 
-  // If not capped at maximum canvas dimension, ensure available area does not fall below source size due to rounding
-  if (canvasWidth < MAX_CANVAS_DIMENSION && canvasHeight < MAX_CANVAS_DIMENSION) {
+  // If not capped at maximum canvas dimension or area, ensure available area does not fall below source size due to rounding
+  if (!wasCapped) {
     if (canvasWidth - minMarginX * 2 < safeW) {
       canvasWidth = safeW + minMarginX * 2;
       canvasHeight = Math.max(canvasHeight, Math.ceil(canvasWidth / targetRatio));

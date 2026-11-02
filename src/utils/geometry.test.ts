@@ -86,12 +86,19 @@ test('computeFrameLayout retains full source width for 4000x3000 landscape in 4:
   assert.equal(layout.imageHeight, 3000);
 });
 
-test('computeFrameLayout caps dimensions at MAX_CANVAS_DIMENSION (16384 px)', () => {
+test('computeFrameLayout caps dimensions at MAX_CANVAS_DIMENSION and MAX_CANVAS_AREA', () => {
   const layout = computeFrameLayout(20000, 15000, '1:1', 10, false);
   assert.ok(layout.canvasWidth <= 16384);
   assert.ok(layout.canvasHeight <= 16384);
-  assert.equal(layout.canvasWidth, 16384);
-  assert.equal(layout.canvasHeight, 16384);
+  assert.ok(layout.canvasWidth * layout.canvasHeight <= 67108864);
+  assert.equal(layout.canvasWidth, 8192);
+  assert.equal(layout.canvasHeight, 8192);
+
+  const layout169 = computeFrameLayout(20000, 11250, '16:9', 10, false);
+  assert.ok(layout169.canvasWidth <= 16384);
+  assert.ok(layout169.canvasHeight <= 16384);
+  assert.ok(layout169.canvasWidth * layout169.canvasHeight <= 67108864);
+  assert.ok(Math.abs(layout169.canvasWidth / layout169.canvasHeight - 16 / 9) < 0.01);
 });
 
 test('computeFrameLayout does not downscale source for odd dimensions with padding', () => {

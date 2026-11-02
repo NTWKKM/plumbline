@@ -173,8 +173,8 @@ export default function App() {
           blob,
           activePhoto.rawApp1Segment,
           {
-            width: frameLayout.canvasWidth,
-            height: frameLayout.canvasHeight,
+            width: canvas.width,
+            height: canvas.height,
             sourceWidth: sourceSize.width,
             sourceHeight: sourceSize.height,
           }
@@ -195,7 +195,7 @@ export default function App() {
       URL.revokeObjectURL(url);
 
       setExportBanner(
-        `Exported ${outName} (${frameLayout.canvasWidth} × ${frameLayout.canvasHeight} px · ${
+        `Exported ${outName} (${canvas.width} × ${canvas.height} px · ${
           exifPreserved ? 'EXIF Preserved' : 'EXIF Stripped'
         })`
       );

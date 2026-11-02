@@ -45,14 +45,16 @@ export function parseExifFromArrayBuffer(
       const segLength = view.getUint16(offset + 2, false);
       if (segLength < 2 || offset + 2 + segLength > bytes.length) break;
 
-      // APP1 marker (0xFFE1) with "Exif\0\0"
+      // APP1 marker (0xFFE1) with full "Exif\0\0" identifier
       if (
         marker === 0xe1 &&
         offset + 10 < bytes.length &&
         bytes[offset + 4] === 0x45 && // E
         bytes[offset + 5] === 0x78 && // x
         bytes[offset + 6] === 0x69 && // i
-        bytes[offset + 7] === 0x66    // f
+        bytes[offset + 7] === 0x66 && // f
+        bytes[offset + 8] === 0x00 &&
+        bytes[offset + 9] === 0x00
       ) {
         rawApp1Segment = bytes.slice(offset, offset + 2 + segLength);
         tiffOffset = offset + 10;
@@ -306,16 +308,10 @@ export async function injectApp1ExifIntoJpegBlob(
         }
       }
 
-      // If output dimensions differ from source, remove IFD1 thumbnail pointer (set 4-byte offset to 0)
+      // On exported images, remove the stale IFD1 thumbnail pointer (set 4-byte offset to 0)
       const nextIfdOffsetPos = ifd0Offset + 2 + entries * 12;
-      if (nextIfdOffsetPos + 4 <= segment.length) {
-        const dimensionsDiffer =
-          exportDimensions &&
-          ((exportDimensions.sourceWidth !== undefined && exportDimensions.width !== exportDimensions.sourceWidth) ||
-            (exportDimensions.sourceHeight !== undefined && exportDimensions.height !== exportDimensions.sourceHeight));
-        if (dimensionsDiffer) {
-          view.setUint32(nextIfdOffsetPos, 0, littleEndian);
-        }
+      if (exportDimensions && nextIfdOffsetPos + 4 <= segment.length) {
+        view.setUint32(nextIfdOffsetPos, 0, littleEndian);
       }
 
       // Update PixelXDimension (0xA002) and PixelYDimension (0xA003) in ExifSubIFD if present

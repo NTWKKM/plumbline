@@ -50,6 +50,7 @@ export const RustCodeModal: React.FC<RustCodeModalProps> = ({ isOpen, onClose })
       }
     } catch {
       if (copyRequestIdRef.current === currentRequestId) {
+        setCopied(false);
         setCopyError('Failed to copy');
         errorTimeoutRef.current = setTimeout(() => {
           if (copyRequestIdRef.current === currentRequestId) {

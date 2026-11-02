@@ -60,6 +60,7 @@ export const DarkroomCanvas: React.FC<DarkroomCanvasProps> = ({
   // Step 1: Load source photo, apply simulated camera sensor tilt if configured, and run Sobel/Radon Horizon Detection
   useEffect(() => {
     let cancelled = false;
+    setSensorCanvas(null);
     setLoadError(null);
     onImageLoaded?.(false);
 
