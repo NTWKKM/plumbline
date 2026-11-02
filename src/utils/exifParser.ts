@@ -439,18 +439,19 @@ export async function injectApp1ExifIntoJpegBlob(
           const gpsRel = type === 4
             ? view.getUint32(entryPos + 8, littleEndian)
             : view.getUint16(entryPos + 8, littleEndian);
-          if (gpsRel >= 8) {
-            const gpsOffset = tiffStart + gpsRel;
-            if (gpsOffset >= tiffStart + 8 && gpsOffset + 2 <= segment.length) {
-              const gpsEntries = view.getUint16(gpsOffset, littleEndian);
-              const gpsEnd = gpsOffset + 2 + gpsEntries * 12 + 4;
-              if (gpsEnd > segment.length) {
-                return { blob: jpegBlob, exifPreserved: false };
-              }
-              retainedRanges.push({
-                start: gpsOffset,
-                end: gpsEnd,
-              });
+          if (gpsRel < 8 || tiffStart + gpsRel + 2 > segment.length) {
+            return { blob: jpegBlob, exifPreserved: false };
+          }
+          const gpsOffset = tiffStart + gpsRel;
+          const gpsEntries = view.getUint16(gpsOffset, littleEndian);
+          const gpsEnd = gpsOffset + 2 + gpsEntries * 12 + 4;
+          if (gpsEnd > segment.length) {
+            return { blob: jpegBlob, exifPreserved: false };
+          }
+          retainedRanges.push({
+            start: gpsOffset,
+            end: gpsEnd,
+          });
               for (let g = 0; g < gpsEntries; g++) {
                 const gPos = gpsOffset + 2 + g * 12;
                 if (gPos + 12 > segment.length) break;
@@ -467,8 +468,6 @@ export async function injectApp1ExifIntoJpegBlob(
                   }
                 }
               }
-            }
-          }
         }
 
         // 0x0100 / 0x0101 = ImageWidth / ImageLength in IFD0 if present
