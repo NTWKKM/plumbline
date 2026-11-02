@@ -232,6 +232,66 @@ export interface ExportDimensions {
 }
 
 /**
+ * Returns the byte size of standard TIFF field types.
+ */
+function getTiffTypeSize(type: number): number {
+  switch (type) {
+    case 1: // BYTE
+    case 2: // ASCII
+    case 6: // SBYTE
+    case 7: // UNDEFINED
+      return 1;
+    case 3: // SHORT
+    case 8: // SSHORT
+      return 2;
+    case 4: // LONG
+    case 9: // SLONG
+    case 11: // FLOAT
+      return 4;
+    case 5: // RATIONAL
+    case 10: // SRATIONAL
+    case 12: // DOUBLE
+      return 8;
+    default:
+      return 0;
+  }
+}
+
+/**
+ * Reads an array of unsigned integer values (SHORT or LONG) from a TIFF directory entry.
+ */
+function readUintArray(
+  view: DataView,
+  tiffStart: number,
+  entryPos: number,
+  type: number,
+  count: number,
+  littleEndian: boolean,
+  segmentLength: number
+): number[] {
+  if (count <= 0 || (type !== 3 && type !== 4)) return [];
+  const typeSize = type === 3 ? 2 : 4;
+  const totalBytes = count * typeSize;
+  let dataOffset: number;
+  if (totalBytes <= 4) {
+    dataOffset = entryPos + 8;
+  } else {
+    if (entryPos + 12 > segmentLength) return [];
+    const valRel = view.getUint32(entryPos + 8, littleEndian);
+    dataOffset = tiffStart + valRel;
+  }
+  if (dataOffset < tiffStart || dataOffset + totalBytes > segmentLength) return [];
+  const results: number[] = [];
+  for (let i = 0; i < count; i++) {
+    const val = type === 3
+      ? view.getUint16(dataOffset + i * 2, littleEndian)
+      : view.getUint32(dataOffset + i * 4, littleEndian);
+    results.push(val);
+  }
+  return results;
+}
+
+/**
  * Losslessly injects an original JPEG APP1 EXIF segment into a freshly encoded JPEG Blob,
  * resetting Orientation (tag 0x0112) to 1 (normal) to prevent double-rotation in viewers.
  * Updates PixelXDimension / PixelYDimension to match export canvas, clears embedded IFD1
@@ -276,12 +336,37 @@ export async function injectApp1ExifIntoJpegBlob(
       const entries = view.getUint16(ifd0Offset, littleEndian);
       let exifSubIfdOffset = -1;
 
+      // Track retained TIFF byte ranges to ensure thumbnail scrub is completely disjoint
+      interface ByteRange {
+        start: number;
+        end: number;
+      }
+      const retainedRanges: ByteRange[] = [];
+      retainedRanges.push({ start: 0, end: tiffStart });
+      retainedRanges.push({ start: tiffStart, end: tiffStart + 8 });
+      retainedRanges.push({
+        start: ifd0Offset,
+        end: Math.min(segment.length, ifd0Offset + 2 + entries * 12 + 4),
+      });
+
       for (let i = 0; i < entries; i++) {
         const entryPos = ifd0Offset + 2 + i * 12;
         if (entryPos + 12 > segment.length) break;
         const tag = view.getUint16(entryPos, littleEndian);
         const type = view.getUint16(entryPos + 2, littleEndian);
         const count = view.getUint32(entryPos + 4, littleEndian);
+
+        // Record out-of-line value storage as retained
+        const typeSize = getTiffTypeSize(type);
+        const totalBytes = count * typeSize;
+        if (totalBytes > 4) {
+          const valRel = view.getUint32(entryPos + 8, littleEndian);
+          const valStart = tiffStart + valRel;
+          const valEnd = valStart + totalBytes;
+          if (valStart >= tiffStart && valEnd <= segment.length) {
+            retainedRanges.push({ start: valStart, end: valEnd });
+          }
+        }
 
         // 0x0112 = Orientation tag: only modify if inline SHORT with count 1
         if (tag === 0x0112 && type === 3 && count === 1) {
@@ -296,6 +381,35 @@ export async function injectApp1ExifIntoJpegBlob(
           exifSubIfdOffset = tiffStart + subRel;
         }
 
+        // 0x8825 = GPSInfo IFD pointer
+        if (tag === 0x8825 && (type === 3 || type === 4) && count === 1) {
+          const gpsRel = type === 4
+            ? view.getUint32(entryPos + 8, littleEndian)
+            : view.getUint16(entryPos + 8, littleEndian);
+          const gpsOffset = tiffStart + gpsRel;
+          if (gpsOffset >= tiffStart && gpsOffset + 2 <= segment.length) {
+            const gpsEntries = view.getUint16(gpsOffset, littleEndian);
+            retainedRanges.push({
+              start: gpsOffset,
+              end: Math.min(segment.length, gpsOffset + 2 + gpsEntries * 12 + 4),
+            });
+            for (let g = 0; g < gpsEntries; g++) {
+              const gPos = gpsOffset + 2 + g * 12;
+              if (gPos + 12 > segment.length) break;
+              const gType = view.getUint16(gPos + 2, littleEndian);
+              const gCount = view.getUint32(gPos + 4, littleEndian);
+              const gBytes = gCount * getTiffTypeSize(gType);
+              if (gBytes > 4) {
+                const gValRel = view.getUint32(gPos + 8, littleEndian);
+                const gValStart = tiffStart + gValRel;
+                if (gValStart >= tiffStart && gValStart + gBytes <= segment.length) {
+                  retainedRanges.push({ start: gValStart, end: gValStart + gBytes });
+                }
+              }
+            }
+          }
+        }
+
         // 0x0100 / 0x0101 = ImageWidth / ImageLength in IFD0 if present
         if (exportDimensions && count === 1) {
           if (tag === 0x0100) {
@@ -308,56 +422,14 @@ export async function injectApp1ExifIntoJpegBlob(
         }
       }
 
-      // On exported images, clear the embedded IFD1 thumbnail bytes and zero the IFD1 pointer
-      const nextIfdOffsetPos = ifd0Offset + 2 + entries * 12;
-      if (exportDimensions && nextIfdOffsetPos + 4 <= segment.length) {
-        const ifd1Rel = view.getUint32(nextIfdOffsetPos, littleEndian);
-        if (ifd1Rel > 0) {
-          const ifd1Offset = tiffStart + ifd1Rel;
-          if (ifd1Offset + 2 <= segment.length) {
-            const ifd1Entries = view.getUint16(ifd1Offset, littleEndian);
-            let thumbOffset = -1;
-            let thumbLength = 0;
-
-            for (let k = 0; k < ifd1Entries; k++) {
-              const ifd1EntryPos = ifd1Offset + 2 + k * 12;
-              if (ifd1EntryPos + 12 > segment.length) break;
-              const tag = view.getUint16(ifd1EntryPos, littleEndian);
-              const type = view.getUint16(ifd1EntryPos + 2, littleEndian);
-              const count = view.getUint32(ifd1EntryPos + 4, littleEndian);
-
-              if (count === 1 && (type === 3 || type === 4)) {
-                const val = type === 4
-                  ? view.getUint32(ifd1EntryPos + 8, littleEndian)
-                  : view.getUint16(ifd1EntryPos + 8, littleEndian);
-
-                // 0x0201 = JPEGInterchangeFormat, 0x0111 = StripOffsets
-                if (tag === 0x0201 || tag === 0x0111) {
-                  thumbOffset = tiffStart + val;
-                }
-                // 0x0202 = JPEGInterchangeFormatLength, 0x0117 = StripByteCounts
-                if (tag === 0x0202 || tag === 0x0117) {
-                  thumbLength = val;
-                }
-              }
-            }
-
-            // Zero out embedded thumbnail byte range if valid within segment bounds
-            if (
-              thumbOffset >= tiffStart &&
-              thumbLength > 0 &&
-              thumbOffset + thumbLength <= segment.length
-            ) {
-              segment.fill(0, thumbOffset, thumbOffset + thumbLength);
-            }
-          }
-        }
-        view.setUint32(nextIfdOffsetPos, 0, littleEndian);
-      }
-
       // Update PixelXDimension (0xA002) and PixelYDimension (0xA003) in ExifSubIFD if present
-      if (exportDimensions && exifSubIfdOffset > 0 && exifSubIfdOffset + 2 <= segment.length) {
+      // and establish all ExifSubIFD structures and referenced data as retained ranges
+      if (exifSubIfdOffset > 0 && exifSubIfdOffset + 2 <= segment.length) {
         const subEntries = view.getUint16(exifSubIfdOffset, littleEndian);
+        retainedRanges.push({
+          start: exifSubIfdOffset,
+          end: Math.min(segment.length, exifSubIfdOffset + 2 + subEntries * 12 + 4),
+        });
         for (let j = 0; j < subEntries; j++) {
           const subEntryPos = exifSubIfdOffset + 2 + j * 12;
           if (subEntryPos + 12 > segment.length) break;
@@ -365,7 +437,18 @@ export async function injectApp1ExifIntoJpegBlob(
           const subType = view.getUint16(subEntryPos + 2, littleEndian);
           const subCount = view.getUint32(subEntryPos + 4, littleEndian);
 
-          if (subCount === 1) {
+          const subTypeSize = getTiffTypeSize(subType);
+          const subTotalBytes = subCount * subTypeSize;
+          if (subTotalBytes > 4) {
+            const subValRel = view.getUint32(subEntryPos + 8, littleEndian);
+            const subValStart = tiffStart + subValRel;
+            const subValEnd = subValStart + subTotalBytes;
+            if (subValStart >= tiffStart && subValEnd <= segment.length) {
+              retainedRanges.push({ start: subValStart, end: subValEnd });
+            }
+          }
+
+          if (exportDimensions && subCount === 1) {
             if (subTag === 0xa002) {
               if (subType === 4) view.setUint32(subEntryPos + 8, exportDimensions.width, littleEndian);
               else if (subType === 3) view.setUint16(subEntryPos + 8, Math.min(exportDimensions.width, 0xffff), littleEndian);
@@ -375,6 +458,81 @@ export async function injectApp1ExifIntoJpegBlob(
             }
           }
         }
+      }
+
+      // On exported images, clear the embedded IFD1 thumbnail bytes (verifying bounds and disjointness)
+      // and zero the IFD1 pointer
+      const nextIfdOffsetPos = ifd0Offset + 2 + entries * 12;
+      if (exportDimensions && nextIfdOffsetPos + 4 <= segment.length) {
+        const ifd1Rel = view.getUint32(nextIfdOffsetPos, littleEndian);
+        if (ifd1Rel > 0) {
+          const ifd1Offset = tiffStart + ifd1Rel;
+          if (ifd1Offset + 2 <= segment.length) {
+            const ifd1Entries = view.getUint16(ifd1Offset, littleEndian);
+            let jpegOffset = -1;
+            let jpegLength = 0;
+            let stripOffsets: number[] = [];
+            let stripByteCounts: number[] = [];
+
+            for (let k = 0; k < ifd1Entries; k++) {
+              const ifd1EntryPos = ifd1Offset + 2 + k * 12;
+              if (ifd1EntryPos + 12 > segment.length) break;
+              const tag = view.getUint16(ifd1EntryPos, littleEndian);
+              const type = view.getUint16(ifd1EntryPos + 2, littleEndian);
+              const count = view.getUint32(ifd1EntryPos + 4, littleEndian);
+
+              // 0x0201 = JPEGInterchangeFormat, 0x0202 = JPEGInterchangeFormatLength
+              if (tag === 0x0201 && count === 1 && (type === 3 || type === 4)) {
+                jpegOffset = type === 4
+                  ? view.getUint32(ifd1EntryPos + 8, littleEndian)
+                  : view.getUint16(ifd1EntryPos + 8, littleEndian);
+              } else if (tag === 0x0202 && count === 1 && (type === 3 || type === 4)) {
+                jpegLength = type === 4
+                  ? view.getUint32(ifd1EntryPos + 8, littleEndian)
+                  : view.getUint16(ifd1EntryPos + 8, littleEndian);
+              } else if (tag === 0x0111 && (type === 3 || type === 4)) {
+                // Read all strip offsets
+                stripOffsets = readUintArray(view, tiffStart, ifd1EntryPos, type, count, littleEndian, segment.length);
+              } else if (tag === 0x0117 && (type === 3 || type === 4)) {
+                // Read all strip byte counts
+                stripByteCounts = readUintArray(view, tiffStart, ifd1EntryPos, type, count, littleEndian, segment.length);
+              }
+            }
+
+            const candidateRanges: ByteRange[] = [];
+            if (jpegOffset >= 0 && jpegLength > 0) {
+              candidateRanges.push({
+                start: tiffStart + jpegOffset,
+                end: tiffStart + jpegOffset + jpegLength,
+              });
+            }
+
+            const numStrips = Math.min(stripOffsets.length, stripByteCounts.length);
+            for (let s = 0; s < numStrips; s++) {
+              const sOffset = stripOffsets[s];
+              const sLen = stripByteCounts[s];
+              if (sOffset >= 0 && sLen > 0) {
+                candidateRanges.push({
+                  start: tiffStart + sOffset,
+                  end: tiffStart + sOffset + sLen,
+                });
+              }
+            }
+
+            // Zero out embedded thumbnail byte ranges only when within bounds and disjoint from all retained TIFF data
+            for (const cand of candidateRanges) {
+              if (cand.start >= tiffStart && cand.end <= segment.length && cand.start < cand.end) {
+                const overlapsRetained = retainedRanges.some(
+                  (r) => cand.start < r.end && cand.end > r.start
+                );
+                if (!overlapsRetained) {
+                  segment.fill(0, cand.start, cand.end);
+                }
+              }
+            }
+          }
+        }
+        view.setUint32(nextIfdOffsetPos, 0, littleEndian);
       }
     }
   }

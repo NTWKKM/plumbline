@@ -440,7 +440,7 @@ export function computeFrameLayout(
 
   // Cap computed frame area at maximum supported browser canvas area limit (e.g. WebKit / iOS Safari) or opt-in budget
   const effectiveMaxArea =
-    typeof pixelAreaBudget === 'number' && Number.isFinite(pixelAreaBudget) && pixelAreaBudget > 0
+    typeof pixelAreaBudget === 'number' && Number.isFinite(pixelAreaBudget) && pixelAreaBudget >= 1
       ? Math.min(MAX_CANVAS_AREA, pixelAreaBudget)
       : MAX_CANVAS_AREA;
 
@@ -562,9 +562,10 @@ export function computePixelAreaScale(
 
 /**
  * Applies a uniform scale to fit dimensions within the pixel-area budget.
- * Validates any supplied pixel-area budget as positive and finite.
+ * Validates any supplied pixel-area budget as positive and finite, using an effective
+ * budget with a minimum of one pixel for its early return, scaling calculation, and area-reduction loop.
  * Rounds scaled dimensions and ensures their resulting area stays strictly within the budget.
- * Full resolution is preserved when budget is omitted or invalid.
+ * Sub-pixel budgets produce a 1×1 result. Full resolution is preserved when budget is omitted or invalid.
  */
 export function getScaledDimensionsWithinBudget(
   width: number,
@@ -582,16 +583,17 @@ export function getScaledDimensionsWithinBudget(
     return { width: safeW, height: safeH, scale: 1.0 };
   }
 
+  const effectiveBudget = Math.max(1, pixelAreaBudget);
   const currentArea = safeW * safeH;
-  if (currentArea <= pixelAreaBudget) {
+  if (currentArea <= effectiveBudget) {
     return { width: safeW, height: safeH, scale: 1.0 };
   }
 
-  let scale = Math.sqrt(pixelAreaBudget / currentArea);
+  let scale = Math.sqrt(effectiveBudget / currentArea);
   let scaledW = Math.max(1, Math.round(safeW * scale));
   let scaledH = Math.max(1, Math.round(safeH * scale));
 
-  while (scaledW * scaledH > pixelAreaBudget && (scaledW > 1 || scaledH > 1)) {
+  while (scaledW * scaledH > effectiveBudget && (scaledW > 1 || scaledH > 1)) {
     if (scaledW / safeW >= scaledH / safeH && scaledW > 1) {
       scaledW--;
     } else if (scaledH > 1) {

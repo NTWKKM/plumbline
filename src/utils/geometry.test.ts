@@ -168,12 +168,23 @@ test('getScaledDimensionsWithinBudget uniformly scales and bounds dimensions wit
   // Scaling with odd dimensions and tight budget guarantees resulting area <= budget
   const tight = getScaledDimensionsWithinBudget(1920, 1080, 500000);
   assert.ok(tight.width * tight.height <= 500000);
+
+  // Sub-pixel budgets produce a 1x1 result using the effective 1-pixel minimum
+  const subPixel = getScaledDimensionsWithinBudget(4000, 3000, 0.5);
+  assert.equal(subPixel.width, 1);
+  assert.equal(subPixel.height, 1);
+  assert.equal(subPixel.width * subPixel.height, 1);
 });
 
 test('computeFrameLayout respects opt-in pixelAreaBudget while preserving MAX_CANVAS_AREA by default', () => {
   // Budget smaller than MAX_CANVAS_AREA caps canvas size within budget
   const budgeted = computeFrameLayout(4000, 3000, '1:1', 10, false, 1000000);
   assert.ok(budgeted.canvasWidth * budgeted.canvasHeight <= 1000000);
+
+  // Sub-pixel budgets (< 1 pixel) follow fallback behavior and preserve MAX_CANVAS_AREA
+  const subPixelLayout = computeFrameLayout(20000, 15000, '1:1', 10, false, 0.5);
+  assert.equal(subPixelLayout.canvasWidth, 8192);
+  assert.equal(subPixelLayout.canvasHeight, 8192);
 
   // When budget is omitted or invalid, MAX_CANVAS_AREA is preserved
   const defaultLayout = computeFrameLayout(20000, 15000, '1:1', 10, false, undefined);

@@ -299,3 +299,142 @@ test('injectApp1ExifIntoJpegBlob clears embedded IFD1 thumbnail byte range when 
   const view = new DataView(injectedBytes.buffer);
   assert.equal(view.getUint32(injectedNextIfdPos, true), 0);
 });
+
+test('injectApp1ExifIntoJpegBlob clears multiple strip thumbnail ranges from StripOffsets and StripByteCounts', async () => {
+  const totalLen = 120;
+  const app1 = new Uint8Array(totalLen);
+  app1[0] = 0xff;
+  app1[1] = 0xe1;
+  app1[2] = 0x00;
+  app1[3] = totalLen;
+  // 'Exif\0\0'
+  app1[4] = 0x45;
+  app1[5] = 0x78;
+  app1[6] = 0x69;
+  app1[7] = 0x66;
+  app1[8] = 0x00;
+  app1[9] = 0x00;
+
+  const tiffStart = 10;
+  app1[tiffStart] = 0x49; // 'II'
+  app1[tiffStart + 1] = 0x49;
+  app1[tiffStart + 2] = 0x2a; // 42
+  app1[tiffStart + 3] = 0x00;
+  // IFD0 offset = 8 (relative to TIFF header -> byte 18)
+  app1[tiffStart + 4] = 0x08;
+  app1[tiffStart + 5] = 0x00;
+  app1[tiffStart + 6] = 0x00;
+  app1[tiffStart + 7] = 0x00;
+
+  // IFD0 at byte 18: 0 entries
+  const ifd0Pos = tiffStart + 8;
+  app1[ifd0Pos] = 0x00;
+  app1[ifd0Pos + 1] = 0x00;
+  // IFD1 pointer at ifd0Pos + 2: offset relative to TIFF = 20 (byte 30)
+  const ifd1Rel = 20;
+  const nextIfdPos = ifd0Pos + 2;
+  app1[nextIfdPos] = ifd1Rel;
+
+  // IFD1 at byte 30: 2 entries (StripOffsets and StripByteCounts)
+  const ifd1Pos = tiffStart + ifd1Rel;
+  app1[ifd1Pos] = 0x02; // 2 entries
+  app1[ifd1Pos + 1] = 0x00;
+
+  // Entry 0: tag 0x0111 (StripOffsets), type 4 (LONG), count 2, value offset = 30 (byte 40 from TIFF -> byte 50)
+  const entry0Pos = ifd1Pos + 2;
+  const view1 = new DataView(app1.buffer);
+  view1.setUint16(entry0Pos, 0x0111, true);
+  view1.setUint16(entry0Pos + 2, 4, true); // LONG
+  view1.setUint32(entry0Pos + 4, 2, true); // count 2
+  view1.setUint32(entry0Pos + 8, 50, true); // offset relative to TIFF header -> byte 60
+
+  // Entry 1: tag 0x0117 (StripByteCounts), type 4 (LONG), count 2, value offset = 60 (byte 70)
+  const entry1Pos = entry0Pos + 12;
+  view1.setUint16(entry1Pos, 0x0117, true);
+  view1.setUint16(entry1Pos + 2, 4, true); // LONG
+  view1.setUint32(entry1Pos + 4, 2, true); // count 2
+  view1.setUint32(entry1Pos + 8, 60, true); // offset relative to TIFF header -> byte 70
+
+  // StripOffsets array at byte 60: strip 0 at rel offset 70 (byte 80), strip 1 at rel offset 80 (byte 90)
+  view1.setUint32(tiffStart + 50, 70, true);
+  view1.setUint32(tiffStart + 54, 80, true);
+
+  // StripByteCounts array at byte 70: strip 0 len = 10, strip 1 len = 10
+  view1.setUint32(tiffStart + 60, 10, true);
+  view1.setUint32(tiffStart + 64, 10, true);
+
+  // Fill strips at byte 80..90 and 90..100 with 0xBB
+  app1.fill(0xbb, tiffStart + 70, tiffStart + 70 + 10);
+  app1.fill(0xbb, tiffStart + 80, tiffStart + 80 + 10);
+
+  const dummyJpegBytes = new Uint8Array([0xff, 0xd8, 0xff, 0xd9]);
+  const dummyBlob = new Blob([dummyJpegBytes], { type: 'image/jpeg' });
+
+  const result = await injectApp1ExifIntoJpegBlob(dummyBlob, app1, {
+    width: 2000,
+    height: 2000,
+  });
+
+  const injected = new Uint8Array(await result.blob.arrayBuffer());
+  // Both strips should be cleared to 0
+  for (let i = 2 + tiffStart + 70; i < 2 + tiffStart + 90; i++) {
+    assert.equal(injected[i], 0x00, `Expected strip byte at ${i} to be zeroed`);
+  }
+});
+
+test('injectApp1ExifIntoJpegBlob preserves retained data if candidate thumbnail range overlaps IFD0', async () => {
+  const totalLen = 60;
+  const app1 = new Uint8Array(totalLen);
+  app1[0] = 0xff;
+  app1[1] = 0xe1;
+  app1[2] = 0x00;
+  app1[3] = totalLen;
+  app1[4] = 0x45;
+  app1[5] = 0x78;
+  app1[6] = 0x69;
+  app1[7] = 0x66;
+  app1[8] = 0x00;
+  app1[9] = 0x00;
+
+  const tiffStart = 10;
+  const view1 = new DataView(app1.buffer);
+  view1.setUint16(tiffStart, 0x4949, false); // 'II'
+  view1.setUint16(tiffStart + 2, 42, true);
+  view1.setUint32(tiffStart + 4, 8, true); // IFD0 at rel 8 (byte 18)
+
+  const ifd0Pos = tiffStart + 8;
+  view1.setUint16(ifd0Pos, 0, true); // 0 entries
+  view1.setUint32(ifd0Pos + 2, 20, true); // IFD1 at rel 20 (byte 30)
+
+  // In IFD1, set a bogus JPEGInterchangeFormat pointing back into IFD0 (rel offset 8)
+  const ifd1Pos = tiffStart + 20;
+  view1.setUint16(ifd1Pos, 2, true);
+  const entry0Pos = ifd1Pos + 2;
+  view1.setUint16(entry0Pos, 0x0201, true); // JPEGInterchangeFormat
+  view1.setUint16(entry0Pos + 2, 4, true);
+  view1.setUint32(entry0Pos + 4, 1, true);
+  view1.setUint32(entry0Pos + 8, 8, true); // Points to IFD0! (overlaps retained IFD0)
+
+  const entry1Pos = entry0Pos + 12;
+  view1.setUint16(entry1Pos, 0x0202, true); // JPEGInterchangeFormatLength
+  view1.setUint16(entry1Pos + 2, 4, true);
+  view1.setUint32(entry1Pos + 4, 1, true);
+  view1.setUint32(entry1Pos + 8, 10, true);
+
+  // Marker pattern in IFD0
+  app1[ifd0Pos] = 0xfe;
+  app1[ifd0Pos + 1] = 0xed;
+
+  const dummyJpegBytes = new Uint8Array([0xff, 0xd8, 0xff, 0xd9]);
+  const dummyBlob = new Blob([dummyJpegBytes], { type: 'image/jpeg' });
+
+  const result = await injectApp1ExifIntoJpegBlob(dummyBlob, app1, {
+    width: 1000,
+    height: 1000,
+  });
+
+  const injected = new Uint8Array(await result.blob.arrayBuffer());
+  // Because it overlapped retained IFD0, it must NOT have been zeroed!
+  assert.equal(injected[2 + ifd0Pos], 0xfe);
+  assert.equal(injected[2 + ifd0Pos + 1], 0xed);
+});

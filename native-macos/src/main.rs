@@ -3,12 +3,11 @@
 // Run on macOS (Apple Silicon / Intel): \`cargo run --release\`
 
 use eframe::egui;
-use image::{DynamicImage, GenericImageView, ImageBuffer, Rgba, RgbaImage};
+use image::{DynamicImage, ImageBuffer, Rgba, RgbaImage};
 use img_parts::jpeg::Jpeg;
 use img_parts::ImageEXIF;
-use rayon::prelude::*;
 use std::fs::File;
-use std::io::{BufReader, Cursor};
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
 
 // ============================================================================
@@ -45,6 +44,7 @@ pub struct ExifSummary {
     pub aperture: String,
     pub shutter_speed: String,
     pub iso: String,
+    pub orientation: u32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -93,6 +93,20 @@ impl Default for ProcessConfig {
 // 2. PURE PROCEDURAL PIPELINE (JPEG + RAW Decode, Auto-Level, Crop, Frame, EXIF)
 // ============================================================================
 
+/// Applies EXIF orientation transformation to normalize image to standard orientation (1 / upright).
+fn apply_exif_orientation(img: RgbaImage, orientation: u32) -> RgbaImage {
+    match orientation {
+        2 => image::imageops::flip_horizontal(&img),
+        3 => image::imageops::rotate180(&img),
+        4 => image::imageops::flip_vertical(&img),
+        5 => image::imageops::rotate90(&image::imageops::flip_horizontal(&img)),
+        6 => image::imageops::rotate90(&img),
+        7 => image::imageops::rotate270(&image::imageops::flip_horizontal(&img)),
+        8 => image::imageops::rotate270(&img),
+        _ => img,
+    }
+}
+
 /// Loads either standard JPEG/PNG/TIFF or decodes Camera RAW (.CR2, .NEF, .ARW, .DNG)
 /// into an 8-bit sRGB RgbaImage + extracts raw EXIF bytes.
 pub fn load_image_and_exif(path: &Path) -> Result<(RgbaImage, ExifSummary), String> {
@@ -107,19 +121,25 @@ pub fn load_image_and_exif(path: &Path) -> Result<(RgbaImage, ExifSummary), Stri
 
     let is_raw = matches!(
         ext.as_str(),
-        "cr2" | "nef" | "arw" | "dng" | "raf" | "orf" | "rw2" | "pef"
+        "cr2" | "nef" | "arw" | "dng" | "orf" | "rw2" | "pef"
     );
 
-    if is_raw {
+    let (mut rgba, exif_summary) = if is_raw {
         let raw_img = rawloader::decode_file(path).map_err(|e| format!("RAW decode error: {e}"))?;
-        let rgba = develop_raw_bilinear(&raw_img)?;
-        Ok((rgba, exif_summary))
+        let img = develop_raw_bilinear(&raw_img)?;
+        (img, exif_summary)
     } else {
         let img = image::load_from_memory(&raw_bytes)
             .map_err(|e| format!("Image decode error: {e}"))?
             .to_rgba8();
-        Ok((img, exif_summary))
+        (img, exif_summary)
+    };
+
+    if exif_summary.orientation > 1 {
+        rgba = apply_exif_orientation(rgba, exif_summary.orientation);
     }
+
+    Ok((rgba, exif_summary))
 }
 
 /// Fast bilinear Bayer demosaicing + sRGB gamma curve for Camera RAW sensors.
@@ -248,6 +268,10 @@ fn parse_exif_from_bytes(bytes: &[u8]) -> ExifSummary {
         summary.aperture = get_tag(exif::Tag::FNumber);
         summary.shutter_speed = get_tag(exif::Tag::ExposureTime);
         summary.iso = get_tag(exif::Tag::PhotographicSensitivity);
+        summary.orientation = exif
+            .get_field(exif::Tag::Orientation, exif::In::PRIMARY)
+            .and_then(|f| f.value.get_uint(0))
+            .unwrap_or(1);
     }
     summary
 }
@@ -484,6 +508,64 @@ pub fn render_pipeline(src: &RgbaImage, cfg: &ProcessConfig, auto_angle_deg: f32
     canvas
 }
 
+/// Resets EXIF Orientation tag (0x0112) in an APP1 byte buffer to 1 (normal / upright)
+/// so that viewers do not reapply rotation to already upright pixels.
+fn reset_app1_orientation_to_upright(bytes: &mut [u8]) {
+    let tiff_start = if bytes.len() >= 6 && &bytes[0..6] == b"Exif\0\0" {
+        6
+    } else if bytes.len() >= 10 && &bytes[4..10] == b"Exif\0\0" {
+        10
+    } else {
+        0
+    };
+    if bytes.len() < tiff_start + 8 {
+        return;
+    }
+    let is_le = match &bytes[tiff_start..tiff_start + 2] {
+        b"II" => true,
+        b"MM" => false,
+        _ => return,
+    };
+    let read_u16 = |buf: &[u8], offset: usize| -> u16 {
+        if is_le {
+            u16::from_le_bytes([buf[offset], buf[offset + 1]])
+        } else {
+            u16::from_be_bytes([buf[offset], buf[offset + 1]])
+        }
+    };
+    let read_u32 = |buf: &[u8], offset: usize| -> u32 {
+        if is_le {
+            u32::from_le_bytes([buf[offset], buf[offset + 1], buf[offset + 2], buf[offset + 3]])
+        } else {
+            u32::from_be_bytes([buf[offset], buf[offset + 1], buf[offset + 2], buf[offset + 3]])
+        }
+    };
+    let write_u16 = |buf: &mut [u8], offset: usize, val: u16| {
+        let b = if is_le { val.to_le_bytes() } else { val.to_be_bytes() };
+        buf[offset] = b[0];
+        buf[offset + 1] = b[1];
+    };
+
+    let first_ifd_rel = read_u32(bytes, tiff_start + 4) as usize;
+    let ifd0_offset = tiff_start + first_ifd_rel;
+    if ifd0_offset + 2 > bytes.len() {
+        return;
+    }
+    let entries = read_u16(bytes, ifd0_offset) as usize;
+    for i in 0..entries {
+        let entry_pos = ifd0_offset + 2 + i * 12;
+        if entry_pos + 12 > bytes.len() {
+            break;
+        }
+        let tag = read_u16(bytes, entry_pos);
+        let tag_type = read_u16(bytes, entry_pos + 2);
+        let count = read_u32(bytes, entry_pos + 4);
+        if tag == 0x0112 && tag_type == 3 && count == 1 {
+            write_u16(bytes, entry_pos + 8, 1);
+        }
+    }
+}
+
 /// Encodes JPEG and losslessly injects original EXIF APP1 metadata block if enabled.
 pub fn save_jpeg_preserving_exif(
     img: &RgbaImage,
@@ -499,9 +581,10 @@ pub fn save_jpeg_preserving_exif(
         .map_err(|e| format!("JPEG encode error: {e}"))?;
 
     if cfg.preserve_exif {
-        if let Some(raw_exif) = &exif.raw_app1_bytes {
+        if let Some(mut raw_exif) = exif.raw_app1_bytes.clone() {
+            reset_app1_orientation_to_upright(&mut raw_exif);
             if let Ok(mut parsed_jpeg) = Jpeg::from_bytes(jpeg_buf.clone().into()) {
-                parsed_jpeg.set_exif(Some(raw_exif.clone().into()));
+                parsed_jpeg.set_exif(Some(raw_exif.into()));
                 let out_file = File::create(dest).map_err(|e| e.to_string())?;
                 parsed_jpeg
                     .encoder()
@@ -688,8 +771,10 @@ impl WhiteBorderMacApp {
                 .set_file_name("framed_output.jpg")
                 .save_file()
             {
-                let out = render_pipeline(src, &self.cfg, self.auto_detected_angle);
-                match save_jpeg_preserving_exif(&out, &self.exif, &self.cfg, &dest) {
+                let mut export_cfg = self.cfg.clone();
+                export_cfg.split_compare = false;
+                let out = render_pipeline(src, &export_cfg, self.auto_detected_angle);
+                match save_jpeg_preserving_exif(&out, &self.exif, &export_cfg, &dest) {
                     Ok(()) => self.status_msg = format!("Saved to {}", dest.display()),
                     Err(e) => self.status_msg = e,
                 }
