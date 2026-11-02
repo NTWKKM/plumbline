@@ -186,6 +186,12 @@ test('computeFrameLayout respects opt-in pixelAreaBudget while preserving MAX_CA
   assert.equal(subPixelLayout.canvasWidth, 8192);
   assert.equal(subPixelLayout.canvasHeight, 8192);
 
+  // Tight budget shrinks width even when height reaches 1 px
+  const tightWide = computeFrameLayout(1000, 100, 'original', 0, false, 5);
+  assert.ok(tightWide.canvasWidth * tightWide.canvasHeight <= 5);
+  assert.equal(tightWide.canvasHeight, 1);
+  assert.ok(tightWide.canvasWidth <= 5);
+
   // When budget is omitted or invalid, MAX_CANVAS_AREA is preserved
   const defaultLayout = computeFrameLayout(20000, 15000, '1:1', 10, false, undefined);
   assert.equal(defaultLayout.canvasWidth, 8192);

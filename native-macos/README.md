@@ -6,7 +6,7 @@ Built with pure Rust:
 - **`eframe` / `egui`**: Native desktop UI using the `glow` (OpenGL) renderer
 - **`rawloader`**: Camera RAW decoder for 2x2 Bayer CFA files (.CR2, .NEF, .ARW, .DNG) with integer sensor data
 - **`image` / `imageproc`**: High-performance image processing & bilinear rotation
-- **`rayon`**: Multithreaded parallel horizon detection & demosaicing on Apple Silicon
+- **`rayon`**: Declared for future multithreading; current horizon detection and demosaicing operations run sequentially
 - **`img-parts` / `kamadak-exif`**: Lossless source EXIF metadata preservation for JPEG sources (RAW exports do not include source EXIF)
 
 ## How to Build and Run

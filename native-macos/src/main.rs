@@ -99,9 +99,9 @@ fn apply_exif_orientation(img: RgbaImage, orientation: u32) -> RgbaImage {
         2 => image::imageops::flip_horizontal(&img),
         3 => image::imageops::rotate180(&img),
         4 => image::imageops::flip_vertical(&img),
-        5 => image::imageops::rotate90(&image::imageops::flip_horizontal(&img)),
+        5 => image::imageops::rotate270(&image::imageops::flip_horizontal(&img)),
         6 => image::imageops::rotate90(&img),
-        7 => image::imageops::rotate270(&image::imageops::flip_horizontal(&img)),
+        7 => image::imageops::rotate90(&image::imageops::flip_horizontal(&img)),
         8 => image::imageops::rotate270(&img),
         _ => img,
     }
@@ -127,7 +127,22 @@ pub fn load_image_and_exif(path: &Path) -> Result<(RgbaImage, ExifSummary), Stri
     let (mut rgba, exif_summary) = if is_raw {
         let raw_img = rawloader::decode_file(path).map_err(|e| format!("RAW decode error: {e}"))?;
         let img = develop_raw_bilinear(&raw_img)?;
-        (img, exif_summary)
+
+        // Crop developed image using raw_img.crops (sensor margins [top, right, bottom, left])
+        // Convert margins to output pixels by rounding up for the 2x2 sensor-block downscale
+        let crop_top = raw_img.crops[0].div_ceil(2) as u32;
+        let crop_right = raw_img.crops[1].div_ceil(2) as u32;
+        let crop_bottom = raw_img.crops[2].div_ceil(2) as u32;
+        let crop_left = raw_img.crops[3].div_ceil(2) as u32;
+
+        if crop_left + crop_right >= img.width() || crop_top + crop_bottom >= img.height() {
+            return Err("Invalid RAW crop margins: crop bounds leave no image data".into());
+        }
+
+        let crop_w = img.width() - crop_left - crop_right;
+        let crop_h = img.height() - crop_top - crop_bottom;
+        let cropped = image::imageops::crop_imm(&img, crop_left, crop_top, crop_w, crop_h).to_image();
+        (cropped, exif_summary)
     } else {
         let img = image::load_from_memory(&raw_bytes)
             .map_err(|e| format!("Image decode error: {e}"))?
@@ -207,8 +222,22 @@ fn develop_raw_bilinear(raw: &rawloader::RawImage) -> Result<RgbaImage, String> 
         ));
     }
 
-    let black = raw.blacklevels[0] as f32;
-    let white = (raw.whitelevels[0] as f32).max(black + 1.0);
+    // Extract per-CFA-site black and white levels based on CFA pattern color mapping
+    let r_color = raw.cfa.color_at(r_pos.1, r_pos.0);
+    let g1_color = raw.cfa.color_at(g1_pos.1, g1_pos.0);
+    let g2_color = raw.cfa.color_at(g2_pos.1, g2_pos.0);
+    let b_color = raw.cfa.color_at(b_pos.1, b_pos.0);
+
+    let r_black = raw.blacklevels.get(r_color).copied().unwrap_or(raw.blacklevels[0]) as f32;
+    let g1_black = raw.blacklevels.get(g1_color).copied().unwrap_or(raw.blacklevels[0]) as f32;
+    let g2_black = raw.blacklevels.get(g2_color).copied().unwrap_or(raw.blacklevels[0]) as f32;
+    let b_black = raw.blacklevels.get(b_color).copied().unwrap_or(raw.blacklevels[0]) as f32;
+
+    let r_white = (raw.whitelevels.get(r_color).copied().unwrap_or(raw.whitelevels[0]) as f32).max(r_black + 1.0);
+    let g1_white = (raw.whitelevels.get(g1_color).copied().unwrap_or(raw.whitelevels[0]) as f32).max(g1_black + 1.0);
+    let g2_white = (raw.whitelevels.get(g2_color).copied().unwrap_or(raw.whitelevels[0]) as f32).max(g2_black + 1.0);
+    let b_white = (raw.whitelevels.get(b_color).copied().unwrap_or(raw.whitelevels[0]) as f32).max(b_black + 1.0);
+
     let wb = raw.wb_coeffs;
     let g_ref = wb[1].max(1.0);
     let r_gain = (wb[0] / g_ref).clamp(0.5, 4.0);
@@ -223,13 +252,13 @@ fn develop_raw_bilinear(raw: &rawloader::RawImage) -> Result<RgbaImage, String> 
         for ox in 0..out_w {
             let sx = ox * 2;
             let sy = oy * 2;
-            let norm = |v: u16| ((v as f32 - black) / (white - black)).clamp(0.0, 1.0);
+            let norm = |v: u16, black: f32, white: f32| ((v as f32 - black) / (white - black)).clamp(0.0, 1.0);
 
-            let r_val = norm(data[(sy + r_pos.1) * w + sx + r_pos.0]);
-            let g_val = (norm(data[(sy + g1_pos.1) * w + sx + g1_pos.0])
-                + norm(data[(sy + g2_pos.1) * w + sx + g2_pos.0]))
+            let r_val = norm(data[(sy + r_pos.1) * w + sx + r_pos.0], r_black, r_white);
+            let g_val = (norm(data[(sy + g1_pos.1) * w + sx + g1_pos.0], g1_black, g1_white)
+                + norm(data[(sy + g2_pos.1) * w + sx + g2_pos.0], g2_black, g2_white))
                 * 0.5;
-            let b_val = norm(data[(sy + b_pos.1) * w + sx + b_pos.0]);
+            let b_val = norm(data[(sy + b_pos.1) * w + sx + b_pos.0], b_black, b_white);
 
             let r = (r_val * r_gain).clamp(0.0, 1.0).powf(1.0 / 2.2);
             let g = g_val.clamp(0.0, 1.0).powf(1.0 / 2.2);
@@ -508,9 +537,12 @@ pub fn render_pipeline(src: &RgbaImage, cfg: &ProcessConfig, auto_angle_deg: f32
     canvas
 }
 
-/// Resets EXIF Orientation tag (0x0112) in an APP1 byte buffer to 1 (normal / upright)
-/// so that viewers do not reapply rotation to already upright pixels.
-fn reset_app1_orientation_to_upright(bytes: &mut [u8]) {
+/// Updates EXIF APP1 metadata block for export:
+/// - Resets Orientation (0x0112) to 1 (normal) if the source was rotated (orientation > 1).
+/// - Updates ImageWidth (0x0100), ImageLength (0x0101) in IFD0, and PixelXDimension (0xA002),
+///   PixelYDimension (0xA003) in ExifSubIFD to match the encoded output dimensions.
+/// - Clears IFD1 thumbnail byte ranges and zeros the IFD1 next-pointer.
+fn update_app1_exif_for_export(bytes: &mut [u8], width: u32, height: u32, orientation: u32) {
     let tiff_start = if bytes.len() >= 6 && &bytes[0..6] == b"Exif\0\0" {
         6
     } else if bytes.len() >= 10 && &bytes[4..10] == b"Exif\0\0" {
@@ -545,6 +577,13 @@ fn reset_app1_orientation_to_upright(bytes: &mut [u8]) {
         buf[offset] = b[0];
         buf[offset + 1] = b[1];
     };
+    let write_u32 = |buf: &mut [u8], offset: usize, val: u32| {
+        let b = if is_le { val.to_le_bytes() } else { val.to_be_bytes() };
+        buf[offset] = b[0];
+        buf[offset + 1] = b[1];
+        buf[offset + 2] = b[2];
+        buf[offset + 3] = b[3];
+    };
 
     let first_ifd_rel = read_u32(bytes, tiff_start + 4) as usize;
     let ifd0_offset = tiff_start + first_ifd_rel;
@@ -552,6 +591,8 @@ fn reset_app1_orientation_to_upright(bytes: &mut [u8]) {
         return;
     }
     let entries = read_u16(bytes, ifd0_offset) as usize;
+    let mut exif_sub_ifd_offset = 0;
+
     for i in 0..entries {
         let entry_pos = ifd0_offset + 2 + i * 12;
         if entry_pos + 12 > bytes.len() {
@@ -560,9 +601,115 @@ fn reset_app1_orientation_to_upright(bytes: &mut [u8]) {
         let tag = read_u16(bytes, entry_pos);
         let tag_type = read_u16(bytes, entry_pos + 2);
         let count = read_u32(bytes, entry_pos + 4);
-        if tag == 0x0112 && tag_type == 3 && count == 1 {
+
+        // Reset orientation only when source was rotated (orientation > 1)
+        if orientation > 1 && tag == 0x0112 && tag_type == 3 && count == 1 {
             write_u16(bytes, entry_pos + 8, 1);
         }
+
+        // 0x0100 / 0x0101 = ImageWidth / ImageLength in IFD0
+        if tag == 0x0100 && count == 1 {
+            if tag_type == 4 {
+                write_u32(bytes, entry_pos + 8, width);
+            } else if tag_type == 3 {
+                write_u16(bytes, entry_pos + 8, width.min(0xffff) as u16);
+            }
+        } else if tag == 0x0101 && count == 1 {
+            if tag_type == 4 {
+                write_u32(bytes, entry_pos + 8, height);
+            } else if tag_type == 3 {
+                write_u16(bytes, entry_pos + 8, height.min(0xffff) as u16);
+            }
+        }
+
+        // 0x8769 = ExifSubIFD pointer
+        if tag == 0x8769 && (tag_type == 3 || tag_type == 4) && count == 1 {
+            let sub_rel = if tag_type == 4 {
+                read_u32(bytes, entry_pos + 8) as usize
+            } else {
+                read_u16(bytes, entry_pos + 8) as usize
+            };
+            if sub_rel >= 8 {
+                exif_sub_ifd_offset = tiff_start + sub_rel;
+            }
+        }
+    }
+
+    // ExifSubIFD: update PixelXDimension (0xA002) and PixelYDimension (0xA003)
+    if exif_sub_ifd_offset >= tiff_start + 8 && exif_sub_ifd_offset + 2 <= bytes.len() {
+        let sub_entries = read_u16(bytes, exif_sub_ifd_offset) as usize;
+        for j in 0..sub_entries {
+            let sub_pos = exif_sub_ifd_offset + 2 + j * 12;
+            if sub_pos + 12 > bytes.len() {
+                break;
+            }
+            let sub_tag = read_u16(bytes, sub_pos);
+            let sub_type = read_u16(bytes, sub_pos + 2);
+            let sub_count = read_u32(bytes, sub_pos + 4);
+
+            if sub_count == 1 {
+                if sub_tag == 0xa002 {
+                    if sub_type == 4 {
+                        write_u32(bytes, sub_pos + 8, width);
+                    } else if sub_type == 3 {
+                        write_u16(bytes, sub_pos + 8, width.min(0xffff) as u16);
+                    }
+                } else if sub_tag == 0xa003 {
+                    if sub_type == 4 {
+                        write_u32(bytes, sub_pos + 8, height);
+                    } else if sub_type == 3 {
+                        write_u16(bytes, sub_pos + 8, height.min(0xffff) as u16);
+                    }
+                }
+            }
+        }
+    }
+
+    // On exported images, clear the embedded IFD1 thumbnail bytes and zero the IFD1 pointer
+    let next_ifd_offset_pos = ifd0_offset + 2 + entries * 12;
+    if next_ifd_offset_pos + 4 <= bytes.len() {
+        let ifd1_rel = read_u32(bytes, next_ifd_offset_pos) as usize;
+        if ifd1_rel >= 8 {
+            let ifd1_offset = tiff_start + ifd1_rel;
+            if ifd1_offset + 2 <= bytes.len() {
+                let ifd1_entries = read_u16(bytes, ifd1_offset) as usize;
+                let mut jpeg_offset = 0;
+                let mut jpeg_length = 0;
+
+                for k in 0..ifd1_entries {
+                    let ifd1_entry_pos = ifd1_offset + 2 + k * 12;
+                    if ifd1_entry_pos + 12 > bytes.len() {
+                        break;
+                    }
+                    let tag = read_u16(bytes, ifd1_entry_pos);
+                    let tag_type = read_u16(bytes, ifd1_entry_pos + 2);
+                    let count = read_u32(bytes, ifd1_entry_pos + 4);
+
+                    if tag == 0x0201 && count == 1 && (tag_type == 3 || tag_type == 4) {
+                        jpeg_offset = if tag_type == 4 {
+                            read_u32(bytes, ifd1_entry_pos + 8) as usize
+                        } else {
+                            read_u16(bytes, ifd1_entry_pos + 8) as usize
+                        };
+                    } else if tag == 0x0202 && count == 1 && (tag_type == 3 || tag_type == 4) {
+                        jpeg_length = if tag_type == 4 {
+                            read_u32(bytes, ifd1_entry_pos + 8) as usize
+                        } else {
+                            read_u16(bytes, ifd1_entry_pos + 8) as usize
+                        };
+                    }
+                }
+
+                if jpeg_offset > 0 && jpeg_length > 0 {
+                    let start = tiff_start + jpeg_offset;
+                    let end = (start + jpeg_length).min(bytes.len());
+                    if start < end && start >= tiff_start + 8 {
+                        bytes[start..end].fill(0);
+                    }
+                }
+            }
+        }
+        write_u32(bytes, next_ifd_offset_pos, 0);
     }
 }
 
@@ -582,7 +729,7 @@ pub fn save_jpeg_preserving_exif(
 
     if cfg.preserve_exif {
         if let Some(mut raw_exif) = exif.raw_app1_bytes.clone() {
-            reset_app1_orientation_to_upright(&mut raw_exif);
+            update_app1_exif_for_export(&mut raw_exif, img.width(), img.height(), exif.orientation);
             if let Ok(mut parsed_jpeg) = Jpeg::from_bytes(jpeg_buf.clone().into()) {
                 parsed_jpeg.set_exif(Some(raw_exif.into()));
                 let out_file = File::create(dest).map_err(|e| e.to_string())?;
@@ -667,10 +814,10 @@ impl eframe::App for WhiteBorderMacApp {
                 if ui.checkbox(&mut self.cfg.split_compare, "Before/After Split View").changed() {
                     self.dirty = true;
                 }
-                if self.cfg.split_compare {
-                    if ui.add(egui::Slider::new(&mut self.cfg.split_pct, 5.0..=95.0).text("Split Wipe (%)")).changed() {
-                        self.dirty = true;
-                    }
+                if self.cfg.split_compare
+                    && ui.add(egui::Slider::new(&mut self.cfg.split_pct, 5.0..=95.0).text("Split Wipe (%)")).changed()
+                {
+                    self.dirty = true;
                 }
 
                 ui.add_space(12.0);
@@ -771,7 +918,7 @@ impl WhiteBorderMacApp {
                 .set_file_name("framed_output.jpg")
                 .save_file()
             {
-                let mut export_cfg = self.cfg.clone();
+                let mut export_cfg = self.cfg;
                 export_cfg.split_compare = false;
                 let out = render_pipeline(src, &export_cfg, self.auto_detected_angle);
                 match save_jpeg_preserving_exif(&out, &self.exif, &export_cfg, &dest) {

@@ -278,9 +278,10 @@ function readUintArray(
   } else {
     if (entryPos + 12 > segmentLength) return [];
     const valRel = view.getUint32(entryPos + 8, littleEndian);
+    if (valRel < 8) return [];
     dataOffset = tiffStart + valRel;
   }
-  if (dataOffset < tiffStart || dataOffset + totalBytes > segmentLength) return [];
+  if (dataOffset < tiffStart + 8 || dataOffset + totalBytes > segmentLength) return [];
   const results: number[] = [];
   for (let i = 0; i < count; i++) {
     const val = type === 3
@@ -289,6 +290,58 @@ function readUintArray(
     results.push(val);
   }
   return results;
+}
+
+interface ByteRange {
+  start: number;
+  end: number;
+}
+
+/**
+ * Clears bytes in `range` that are strictly disjoint from any of the intervals in `retained`.
+ */
+function clearDisjointPortions(
+  segment: Uint8Array,
+  range: ByteRange,
+  retained: ByteRange[]
+): void {
+  const overlaps: ByteRange[] = [];
+  for (const r of retained) {
+    const oStart = Math.max(range.start, r.start);
+    const oEnd = Math.min(range.end, r.end);
+    if (oStart < oEnd) {
+      overlaps.push({ start: oStart, end: oEnd });
+    }
+  }
+
+  if (overlaps.length === 0) {
+    segment.fill(0, range.start, range.end);
+    return;
+  }
+
+  overlaps.sort((a, b) => a.start - b.start);
+
+  const merged: ByteRange[] = [{ start: overlaps[0].start, end: overlaps[0].end }];
+  for (let i = 1; i < overlaps.length; i++) {
+    const prev = merged[merged.length - 1];
+    const curr = overlaps[i];
+    if (curr.start <= prev.end) {
+      prev.end = Math.max(prev.end, curr.end);
+    } else {
+      merged.push({ start: curr.start, end: curr.end });
+    }
+  }
+
+  let cursor = range.start;
+  for (const m of merged) {
+    if (m.start > cursor) {
+      segment.fill(0, cursor, m.start);
+    }
+    cursor = Math.max(cursor, m.end);
+  }
+  if (cursor < range.end) {
+    segment.fill(0, cursor, range.end);
+  }
 }
 
 /**
@@ -337,10 +390,6 @@ export async function injectApp1ExifIntoJpegBlob(
       let exifSubIfdOffset = -1;
 
       // Track retained TIFF byte ranges to ensure thumbnail scrub is completely disjoint
-      interface ByteRange {
-        start: number;
-        end: number;
-      }
       const retainedRanges: ByteRange[] = [];
       retainedRanges.push({ start: 0, end: tiffStart });
       retainedRanges.push({ start: tiffStart, end: tiffStart + 8 });
@@ -361,10 +410,12 @@ export async function injectApp1ExifIntoJpegBlob(
         const totalBytes = count * typeSize;
         if (totalBytes > 4) {
           const valRel = view.getUint32(entryPos + 8, littleEndian);
-          const valStart = tiffStart + valRel;
-          const valEnd = valStart + totalBytes;
-          if (valStart >= tiffStart && valEnd <= segment.length) {
-            retainedRanges.push({ start: valStart, end: valEnd });
+          if (valRel >= 8) {
+            const valStart = tiffStart + valRel;
+            const valEnd = valStart + totalBytes;
+            if (valStart >= tiffStart + 8 && valEnd <= segment.length) {
+              retainedRanges.push({ start: valStart, end: valEnd });
+            }
           }
         }
 
@@ -378,7 +429,9 @@ export async function injectApp1ExifIntoJpegBlob(
           const subRel = type === 4
             ? view.getUint32(entryPos + 8, littleEndian)
             : view.getUint16(entryPos + 8, littleEndian);
-          exifSubIfdOffset = tiffStart + subRel;
+          if (subRel >= 8) {
+            exifSubIfdOffset = tiffStart + subRel;
+          }
         }
 
         // 0x8825 = GPSInfo IFD pointer
@@ -386,24 +439,28 @@ export async function injectApp1ExifIntoJpegBlob(
           const gpsRel = type === 4
             ? view.getUint32(entryPos + 8, littleEndian)
             : view.getUint16(entryPos + 8, littleEndian);
-          const gpsOffset = tiffStart + gpsRel;
-          if (gpsOffset >= tiffStart && gpsOffset + 2 <= segment.length) {
-            const gpsEntries = view.getUint16(gpsOffset, littleEndian);
-            retainedRanges.push({
-              start: gpsOffset,
-              end: Math.min(segment.length, gpsOffset + 2 + gpsEntries * 12 + 4),
-            });
-            for (let g = 0; g < gpsEntries; g++) {
-              const gPos = gpsOffset + 2 + g * 12;
-              if (gPos + 12 > segment.length) break;
-              const gType = view.getUint16(gPos + 2, littleEndian);
-              const gCount = view.getUint32(gPos + 4, littleEndian);
-              const gBytes = gCount * getTiffTypeSize(gType);
-              if (gBytes > 4) {
-                const gValRel = view.getUint32(gPos + 8, littleEndian);
-                const gValStart = tiffStart + gValRel;
-                if (gValStart >= tiffStart && gValStart + gBytes <= segment.length) {
-                  retainedRanges.push({ start: gValStart, end: gValStart + gBytes });
+          if (gpsRel >= 8) {
+            const gpsOffset = tiffStart + gpsRel;
+            if (gpsOffset >= tiffStart + 8 && gpsOffset + 2 <= segment.length) {
+              const gpsEntries = view.getUint16(gpsOffset, littleEndian);
+              retainedRanges.push({
+                start: gpsOffset,
+                end: Math.min(segment.length, gpsOffset + 2 + gpsEntries * 12 + 4),
+              });
+              for (let g = 0; g < gpsEntries; g++) {
+                const gPos = gpsOffset + 2 + g * 12;
+                if (gPos + 12 > segment.length) break;
+                const gType = view.getUint16(gPos + 2, littleEndian);
+                const gCount = view.getUint32(gPos + 4, littleEndian);
+                const gBytes = gCount * getTiffTypeSize(gType);
+                if (gBytes > 4) {
+                  const gValRel = view.getUint32(gPos + 8, littleEndian);
+                  if (gValRel >= 8) {
+                    const gValStart = tiffStart + gValRel;
+                    if (gValStart >= tiffStart + 8 && gValStart + gBytes <= segment.length) {
+                      retainedRanges.push({ start: gValStart, end: gValStart + gBytes });
+                    }
+                  }
                 }
               }
             }
@@ -424,7 +481,7 @@ export async function injectApp1ExifIntoJpegBlob(
 
       // Update PixelXDimension (0xA002) and PixelYDimension (0xA003) in ExifSubIFD if present
       // and establish all ExifSubIFD structures and referenced data as retained ranges
-      if (exifSubIfdOffset > 0 && exifSubIfdOffset + 2 <= segment.length) {
+      if (exifSubIfdOffset >= tiffStart + 8 && exifSubIfdOffset + 2 <= segment.length) {
         const subEntries = view.getUint16(exifSubIfdOffset, littleEndian);
         retainedRanges.push({
           start: exifSubIfdOffset,
@@ -441,10 +498,45 @@ export async function injectApp1ExifIntoJpegBlob(
           const subTotalBytes = subCount * subTypeSize;
           if (subTotalBytes > 4) {
             const subValRel = view.getUint32(subEntryPos + 8, littleEndian);
-            const subValStart = tiffStart + subValRel;
-            const subValEnd = subValStart + subTotalBytes;
-            if (subValStart >= tiffStart && subValEnd <= segment.length) {
-              retainedRanges.push({ start: subValStart, end: subValEnd });
+            if (subValRel >= 8) {
+              const subValStart = tiffStart + subValRel;
+              const subValEnd = subValStart + subTotalBytes;
+              if (subValStart >= tiffStart + 8 && subValEnd <= segment.length) {
+                retainedRanges.push({ start: subValStart, end: subValEnd });
+              }
+            }
+          }
+
+          // 0xA005 = InteroperabilityIFD pointer
+          if (subTag === 0xa005 && (subType === 3 || subType === 4) && subCount === 1) {
+            const interopRel = subType === 4
+              ? view.getUint32(subEntryPos + 8, littleEndian)
+              : view.getUint16(subEntryPos + 8, littleEndian);
+            if (interopRel >= 8) {
+              const interopOffset = tiffStart + interopRel;
+              if (interopOffset >= tiffStart + 8 && interopOffset + 2 <= segment.length) {
+                const interopEntries = view.getUint16(interopOffset, littleEndian);
+                retainedRanges.push({
+                  start: interopOffset,
+                  end: Math.min(segment.length, interopOffset + 2 + interopEntries * 12 + 4),
+                });
+                for (let m = 0; m < interopEntries; m++) {
+                  const mPos = interopOffset + 2 + m * 12;
+                  if (mPos + 12 > segment.length) break;
+                  const mType = view.getUint16(mPos + 2, littleEndian);
+                  const mCount = view.getUint32(mPos + 4, littleEndian);
+                  const mBytes = mCount * getTiffTypeSize(mType);
+                  if (mBytes > 4) {
+                    const mValRel = view.getUint32(mPos + 8, littleEndian);
+                    if (mValRel >= 8) {
+                      const mValStart = tiffStart + mValRel;
+                      if (mValStart >= tiffStart + 8 && mValStart + mBytes <= segment.length) {
+                        retainedRanges.push({ start: mValStart, end: mValStart + mBytes });
+                      }
+                    }
+                  }
+                }
+              }
             }
           }
 
@@ -499,6 +591,10 @@ export async function injectApp1ExifIntoJpegBlob(
               }
             }
 
+            if (stripOffsets.length !== stripByteCounts.length) {
+              return { blob: jpegBlob, exifPreserved: false };
+            }
+
             const candidateRanges: ByteRange[] = [];
             if (jpegOffset >= 0 && jpegLength > 0) {
               candidateRanges.push({
@@ -507,8 +603,7 @@ export async function injectApp1ExifIntoJpegBlob(
               });
             }
 
-            const numStrips = Math.min(stripOffsets.length, stripByteCounts.length);
-            for (let s = 0; s < numStrips; s++) {
+            for (let s = 0; s < stripOffsets.length; s++) {
               const sOffset = stripOffsets[s];
               const sLen = stripByteCounts[s];
               if (sOffset >= 0 && sLen > 0) {
@@ -519,15 +614,10 @@ export async function injectApp1ExifIntoJpegBlob(
               }
             }
 
-            // Zero out embedded thumbnail byte ranges only when within bounds and disjoint from all retained TIFF data
+            // Zero out embedded thumbnail byte ranges outside retained TIFF data
             for (const cand of candidateRanges) {
               if (cand.start >= tiffStart && cand.end <= segment.length && cand.start < cand.end) {
-                const overlapsRetained = retainedRanges.some(
-                  (r) => cand.start < r.end && cand.end > r.start
-                );
-                if (!overlapsRetained) {
-                  segment.fill(0, cand.start, cand.end);
-                }
+                clearDisjointPortions(segment, cand, retainedRanges);
               }
             }
           }

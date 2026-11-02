@@ -448,11 +448,13 @@ export function computeFrameLayout(
     const areaScale = Math.sqrt(effectiveMaxArea / (canvasWidth * canvasHeight));
     canvasWidth = Math.max(1, Math.floor(canvasWidth * areaScale));
     canvasHeight = Math.max(1, Math.floor(canvasWidth / targetRatio));
-    while (canvasWidth * canvasHeight > effectiveMaxArea && canvasWidth > 1 && canvasHeight > 1) {
-      if (canvasWidth / targetRatio >= canvasHeight) {
+    while (canvasWidth * canvasHeight > effectiveMaxArea && (canvasWidth > 1 || canvasHeight > 1)) {
+      if (canvasWidth > 1 && (canvasHeight <= 1 || canvasWidth / targetRatio >= canvasHeight)) {
         canvasWidth--;
-      } else {
+      } else if (canvasHeight > 1) {
         canvasHeight--;
+      } else {
+        break;
       }
     }
     wasCapped = true;
