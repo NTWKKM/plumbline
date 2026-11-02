@@ -443,9 +443,13 @@ export async function injectApp1ExifIntoJpegBlob(
             const gpsOffset = tiffStart + gpsRel;
             if (gpsOffset >= tiffStart + 8 && gpsOffset + 2 <= segment.length) {
               const gpsEntries = view.getUint16(gpsOffset, littleEndian);
+              const gpsEnd = gpsOffset + 2 + gpsEntries * 12 + 4;
+              if (gpsEnd > segment.length) {
+                return { blob: jpegBlob, exifPreserved: false };
+              }
               retainedRanges.push({
                 start: gpsOffset,
-                end: Math.min(segment.length, gpsOffset + 2 + gpsEntries * 12 + 4),
+                end: gpsEnd,
               });
               for (let g = 0; g < gpsEntries; g++) {
                 const gPos = gpsOffset + 2 + g * 12;
@@ -616,8 +620,9 @@ export async function injectApp1ExifIntoJpegBlob(
 
             // Zero out embedded thumbnail byte ranges outside retained TIFF data
             for (const cand of candidateRanges) {
-              if (cand.start >= tiffStart && cand.end <= segment.length && cand.start < cand.end) {
-                clearDisjointPortions(segment, cand, retainedRanges);
+              const clampedEnd = Math.min(cand.end, segment.length);
+              if (cand.start >= tiffStart && cand.start < clampedEnd) {
+                clearDisjointPortions(segment, { start: cand.start, end: clampedEnd }, retainedRanges);
               }
             }
           }

@@ -129,11 +129,14 @@ pub fn load_image_and_exif(path: &Path) -> Result<(RgbaImage, ExifSummary), Stri
         let img = develop_raw_bilinear(&raw_img)?;
 
         // Crop developed image using raw_img.crops (sensor margins [top, right, bottom, left])
-        // Convert margins to output pixels by rounding up for the 2x2 sensor-block downscale
         let crop_top = raw_img.crops[0].div_ceil(2) as u32;
-        let crop_right = raw_img.crops[1].div_ceil(2) as u32;
-        let crop_bottom = raw_img.crops[2].div_ceil(2) as u32;
         let crop_left = raw_img.crops[3].div_ceil(2) as u32;
+
+        let max_ox = (raw_img.width.saturating_sub(raw_img.crops[1] + 1)) / 2;
+        let crop_right = (img.width() as usize).saturating_sub(max_ox + 1) as u32;
+
+        let max_oy = (raw_img.height.saturating_sub(raw_img.crops[2] + 1)) / 2;
+        let crop_bottom = (img.height() as usize).saturating_sub(max_oy + 1) as u32;
 
         if crop_left + crop_right >= img.width() || crop_top + crop_bottom >= img.height() {
             return Err("Invalid RAW crop margins: crop bounds leave no image data".into());
@@ -222,16 +225,22 @@ fn develop_raw_bilinear(raw: &rawloader::RawImage) -> Result<RgbaImage, String> 
         ));
     }
 
-    // Extract per-CFA-site black and white levels based on CFA pattern color mapping
+    // Extract per-CFA-site black levels using CFA site coordinates (pos.1 * 2 + pos.0)
+    // to preserve distinct G1 and G2 levels for DNG inputs
+    let r_site = r_pos.1 * 2 + r_pos.0;
+    let g1_site = g1_pos.1 * 2 + g1_pos.0;
+    let g2_site = g2_pos.1 * 2 + g2_pos.0;
+    let b_site = b_pos.1 * 2 + b_pos.0;
+
+    let r_black = raw.blacklevels.get(r_site).copied().unwrap_or(raw.blacklevels[0]) as f32;
+    let g1_black = raw.blacklevels.get(g1_site).copied().unwrap_or(raw.blacklevels[0]) as f32;
+    let g2_black = raw.blacklevels.get(g2_site).copied().unwrap_or(raw.blacklevels[0]) as f32;
+    let b_black = raw.blacklevels.get(b_site).copied().unwrap_or(raw.blacklevels[0]) as f32;
+
     let r_color = raw.cfa.color_at(r_pos.1, r_pos.0);
     let g1_color = raw.cfa.color_at(g1_pos.1, g1_pos.0);
     let g2_color = raw.cfa.color_at(g2_pos.1, g2_pos.0);
     let b_color = raw.cfa.color_at(b_pos.1, b_pos.0);
-
-    let r_black = raw.blacklevels.get(r_color).copied().unwrap_or(raw.blacklevels[0]) as f32;
-    let g1_black = raw.blacklevels.get(g1_color).copied().unwrap_or(raw.blacklevels[0]) as f32;
-    let g2_black = raw.blacklevels.get(g2_color).copied().unwrap_or(raw.blacklevels[0]) as f32;
-    let b_black = raw.blacklevels.get(b_color).copied().unwrap_or(raw.blacklevels[0]) as f32;
 
     let r_white = (raw.whitelevels.get(r_color).copied().unwrap_or(raw.whitelevels[0]) as f32).max(r_black + 1.0);
     let g1_white = (raw.whitelevels.get(g1_color).copied().unwrap_or(raw.whitelevels[0]) as f32).max(g1_black + 1.0);
@@ -537,11 +546,79 @@ pub fn render_pipeline(src: &RgbaImage, cfg: &ProcessConfig, auto_angle_deg: f32
     canvas
 }
 
+fn get_tiff_type_size(tag_type: u16) -> usize {
+    match tag_type {
+        1 | 2 | 6 | 7 => 1,
+        3 | 8 => 2,
+        4 | 9 | 11 => 4,
+        5 | 10 | 12 => 8,
+        _ => 0,
+    }
+}
+
+fn read_uint_array(
+    buf: &[u8],
+    tiff_start: usize,
+    entry_pos: usize,
+    tag_type: u16,
+    count: usize,
+    is_le: bool,
+) -> Vec<usize> {
+    if count == 0 || (tag_type != 3 && tag_type != 4) {
+        return Vec::new();
+    }
+    let type_size = if tag_type == 3 { 2 } else { 4 };
+    let total_bytes = count.saturating_mul(type_size);
+    let read_u16 = |offset: usize| -> u16 {
+        if is_le {
+            u16::from_le_bytes([buf[offset], buf[offset + 1]])
+        } else {
+            u16::from_be_bytes([buf[offset], buf[offset + 1]])
+        }
+    };
+    let read_u32 = |offset: usize| -> u32 {
+        if is_le {
+            u32::from_le_bytes([buf[offset], buf[offset + 1], buf[offset + 2], buf[offset + 3]])
+        } else {
+            u32::from_be_bytes([buf[offset], buf[offset + 1], buf[offset + 2], buf[offset + 3]])
+        }
+    };
+
+    let data_offset = if total_bytes <= 4 {
+        entry_pos + 8
+    } else {
+        if entry_pos + 12 > buf.len() {
+            return Vec::new();
+        }
+        let val_rel = read_u32(entry_pos + 8) as usize;
+        if val_rel < 8 {
+            return Vec::new();
+        }
+        tiff_start + val_rel
+    };
+
+    if data_offset < tiff_start + 8 || data_offset + total_bytes > buf.len() {
+        return Vec::new();
+    }
+
+    let mut result = Vec::with_capacity(count);
+    for i in 0..count {
+        let val = if tag_type == 3 {
+            read_u16(data_offset + i * 2) as usize
+        } else {
+            read_u32(data_offset + i * 4) as usize
+        };
+        result.push(val);
+    }
+    result
+}
+
 /// Updates EXIF APP1 metadata block for export:
 /// - Resets Orientation (0x0112) to 1 (normal) if the source was rotated (orientation > 1).
 /// - Updates ImageWidth (0x0100), ImageLength (0x0101) in IFD0, and PixelXDimension (0xA002),
 ///   PixelYDimension (0xA003) in ExifSubIFD to match the encoded output dimensions.
-/// - Clears IFD1 thumbnail byte ranges and zeros the IFD1 next-pointer.
+/// - Clears IFD1 thumbnail byte ranges (JPEG & strips) if non-overlapping with retained TIFF data,
+///   and zeros the IFD1 next-pointer.
 fn update_app1_exif_for_export(bytes: &mut [u8], width: u32, height: u32, orientation: u32) {
     let tiff_start = if bytes.len() >= 6 && &bytes[0..6] == b"Exif\0\0" {
         6
@@ -593,6 +670,11 @@ fn update_app1_exif_for_export(bytes: &mut [u8], width: u32, height: u32, orient
     let entries = read_u16(bytes, ifd0_offset) as usize;
     let mut exif_sub_ifd_offset = 0;
 
+    let mut retained_ranges: Vec<(usize, usize)> = Vec::new();
+    retained_ranges.push((0, tiff_start + 8));
+    let ifd0_end = (ifd0_offset + 2 + entries * 12 + 4).min(bytes.len());
+    retained_ranges.push((ifd0_offset, ifd0_end));
+
     for i in 0..entries {
         let entry_pos = ifd0_offset + 2 + i * 12;
         if entry_pos + 12 > bytes.len() {
@@ -601,6 +683,19 @@ fn update_app1_exif_for_export(bytes: &mut [u8], width: u32, height: u32, orient
         let tag = read_u16(bytes, entry_pos);
         let tag_type = read_u16(bytes, entry_pos + 2);
         let count = read_u32(bytes, entry_pos + 4);
+
+        let type_size = get_tiff_type_size(tag_type);
+        let total_bytes = (count as usize).saturating_mul(type_size);
+        if total_bytes > 4 {
+            let val_rel = read_u32(bytes, entry_pos + 8) as usize;
+            if val_rel >= 8 {
+                let val_start = tiff_start + val_rel;
+                let val_end = val_start + total_bytes;
+                if val_start >= tiff_start + 8 && val_end <= bytes.len() {
+                    retained_ranges.push((val_start, val_end));
+                }
+            }
+        }
 
         // Reset orientation only when source was rotated (orientation > 1)
         if orientation > 1 && tag == 0x0112 && tag_type == 3 && count == 1 {
@@ -633,11 +728,50 @@ fn update_app1_exif_for_export(bytes: &mut [u8], width: u32, height: u32, orient
                 exif_sub_ifd_offset = tiff_start + sub_rel;
             }
         }
+
+        // 0x8825 = GPSInfo IFD pointer
+        if tag == 0x8825 && (tag_type == 3 || tag_type == 4) && count == 1 {
+            let gps_rel = if tag_type == 4 {
+                read_u32(bytes, entry_pos + 8) as usize
+            } else {
+                read_u16(bytes, entry_pos + 8) as usize
+            };
+            if gps_rel >= 8 {
+                let gps_offset = tiff_start + gps_rel;
+                if gps_offset >= tiff_start + 8 && gps_offset + 2 <= bytes.len() {
+                    let gps_entries = read_u16(bytes, gps_offset) as usize;
+                    let gps_end = (gps_offset + 2 + gps_entries * 12 + 4).min(bytes.len());
+                    retained_ranges.push((gps_offset, gps_end));
+                    for g in 0..gps_entries {
+                        let g_pos = gps_offset + 2 + g * 12;
+                        if g_pos + 12 > bytes.len() {
+                            break;
+                        }
+                        let g_type = read_u16(bytes, g_pos + 2);
+                        let g_count = read_u32(bytes, g_pos + 4) as usize;
+                        let g_bytes = g_count.saturating_mul(get_tiff_type_size(g_type));
+                        if g_bytes > 4 {
+                            let g_val_rel = read_u32(bytes, g_pos + 8) as usize;
+                            if g_val_rel >= 8 {
+                                let g_val_start = tiff_start + g_val_rel;
+                                let g_val_end = g_val_start + g_bytes;
+                                if g_val_start >= tiff_start + 8 && g_val_end <= bytes.len() {
+                                    retained_ranges.push((g_val_start, g_val_end));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // ExifSubIFD: update PixelXDimension (0xA002) and PixelYDimension (0xA003)
     if exif_sub_ifd_offset >= tiff_start + 8 && exif_sub_ifd_offset + 2 <= bytes.len() {
         let sub_entries = read_u16(bytes, exif_sub_ifd_offset) as usize;
+        let sub_end = (exif_sub_ifd_offset + 2 + sub_entries * 12 + 4).min(bytes.len());
+        retained_ranges.push((exif_sub_ifd_offset, sub_end));
+
         for j in 0..sub_entries {
             let sub_pos = exif_sub_ifd_offset + 2 + j * 12;
             if sub_pos + 12 > bytes.len() {
@@ -646,6 +780,54 @@ fn update_app1_exif_for_export(bytes: &mut [u8], width: u32, height: u32, orient
             let sub_tag = read_u16(bytes, sub_pos);
             let sub_type = read_u16(bytes, sub_pos + 2);
             let sub_count = read_u32(bytes, sub_pos + 4);
+
+            let sub_bytes = (sub_count as usize).saturating_mul(get_tiff_type_size(sub_type));
+            if sub_bytes > 4 {
+                let sub_val_rel = read_u32(bytes, sub_pos + 8) as usize;
+                if sub_val_rel >= 8 {
+                    let sub_val_start = tiff_start + sub_val_rel;
+                    let sub_val_end = sub_val_start + sub_bytes;
+                    if sub_val_start >= tiff_start + 8 && sub_val_end <= bytes.len() {
+                        retained_ranges.push((sub_val_start, sub_val_end));
+                    }
+                }
+            }
+
+            // 0xA005 = InteroperabilityIFD pointer
+            if sub_tag == 0xa005 && (sub_type == 3 || sub_type == 4) && sub_count == 1 {
+                let interop_rel = if sub_type == 4 {
+                    read_u32(bytes, sub_pos + 8) as usize
+                } else {
+                    read_u16(bytes, sub_pos + 8) as usize
+                };
+                if interop_rel >= 8 {
+                    let interop_offset = tiff_start + interop_rel;
+                    if interop_offset >= tiff_start + 8 && interop_offset + 2 <= bytes.len() {
+                        let interop_entries = read_u16(bytes, interop_offset) as usize;
+                        let interop_end = (interop_offset + 2 + interop_entries * 12 + 4).min(bytes.len());
+                        retained_ranges.push((interop_offset, interop_end));
+                        for m in 0..interop_entries {
+                            let m_pos = interop_offset + 2 + m * 12;
+                            if m_pos + 12 > bytes.len() {
+                                break;
+                            }
+                            let m_type = read_u16(bytes, m_pos + 2);
+                            let m_count = read_u32(bytes, m_pos + 4) as usize;
+                            let m_bytes = m_count.saturating_mul(get_tiff_type_size(m_type));
+                            if m_bytes > 4 {
+                                let m_val_rel = read_u32(bytes, m_pos + 8) as usize;
+                                if m_val_rel >= 8 {
+                                    let m_val_start = tiff_start + m_val_rel;
+                                    let m_val_end = m_val_start + m_bytes;
+                                    if m_val_start >= tiff_start + 8 && m_val_end <= bytes.len() {
+                                        retained_ranges.push((m_val_start, m_val_end));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
 
             if sub_count == 1 {
                 if sub_tag == 0xa002 {
@@ -675,6 +857,8 @@ fn update_app1_exif_for_export(bytes: &mut [u8], width: u32, height: u32, orient
                 let ifd1_entries = read_u16(bytes, ifd1_offset) as usize;
                 let mut jpeg_offset = 0;
                 let mut jpeg_length = 0;
+                let mut strip_offsets: Vec<usize> = Vec::new();
+                let mut strip_byte_counts: Vec<usize> = Vec::new();
 
                 for k in 0..ifd1_entries {
                     let ifd1_entry_pos = ifd1_offset + 2 + k * 12;
@@ -683,7 +867,7 @@ fn update_app1_exif_for_export(bytes: &mut [u8], width: u32, height: u32, orient
                     }
                     let tag = read_u16(bytes, ifd1_entry_pos);
                     let tag_type = read_u16(bytes, ifd1_entry_pos + 2);
-                    let count = read_u32(bytes, ifd1_entry_pos + 4);
+                    let count = read_u32(bytes, ifd1_entry_pos + 4) as usize;
 
                     if tag == 0x0201 && count == 1 && (tag_type == 3 || tag_type == 4) {
                         jpeg_offset = if tag_type == 4 {
@@ -697,14 +881,36 @@ fn update_app1_exif_for_export(bytes: &mut [u8], width: u32, height: u32, orient
                         } else {
                             read_u16(bytes, ifd1_entry_pos + 8) as usize
                         };
+                    } else if tag == 0x0111 && (tag_type == 3 || tag_type == 4) {
+                        strip_offsets = read_uint_array(bytes, tiff_start, ifd1_entry_pos, tag_type, count, is_le);
+                    } else if tag == 0x0117 && (tag_type == 3 || tag_type == 4) {
+                        strip_byte_counts = read_uint_array(bytes, tiff_start, ifd1_entry_pos, tag_type, count, is_le);
                     }
                 }
 
+                let mut candidate_ranges: Vec<(usize, usize)> = Vec::new();
                 if jpeg_offset > 0 && jpeg_length > 0 {
-                    let start = tiff_start + jpeg_offset;
-                    let end = (start + jpeg_length).min(bytes.len());
-                    if start < end && start >= tiff_start + 8 {
-                        bytes[start..end].fill(0);
+                    candidate_ranges.push((tiff_start + jpeg_offset, tiff_start + jpeg_offset + jpeg_length));
+                }
+
+                if !strip_offsets.is_empty() && strip_offsets.len() == strip_byte_counts.len() {
+                    for s in 0..strip_offsets.len() {
+                        let s_off = strip_offsets[s];
+                        let s_len = strip_byte_counts[s];
+                        if s_off > 0 && s_len > 0 {
+                            candidate_ranges.push((tiff_start + s_off, tiff_start + s_off + s_len));
+                        }
+                    }
+                }
+
+                for (cand_start, cand_end) in candidate_ranges {
+                    if cand_start >= tiff_start + 8 && cand_end <= bytes.len() && cand_start < cand_end {
+                        let overlaps = retained_ranges.iter().any(|&(r_start, r_end)| {
+                            cand_start < r_end && cand_end > r_start
+                        });
+                        if !overlaps {
+                            bytes[cand_start..cand_end].fill(0);
+                        }
                     }
                 }
             }
@@ -942,4 +1148,127 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(|_cc| Ok(Box::new(WhiteBorderMacApp::default()))),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_update_app1_exif_skips_overlapping_thumbnail() {
+        let mut app1 = vec![0u8; 120];
+        app1[0] = 0xff;
+        app1[1] = 0xe1;
+        app1[2] = 0x00;
+        app1[3] = 120;
+        app1[4..10].copy_from_slice(b"Exif\0\0");
+
+        let tiff_start = 10;
+        // 'II' little-endian, 42, first IFD at rel 8
+        app1[tiff_start..tiff_start + 2].copy_from_slice(b"II");
+        app1[tiff_start + 2..tiff_start + 4].copy_from_slice(&42u16.to_le_bytes());
+        app1[tiff_start + 4..tiff_start + 8].copy_from_slice(&8u32.to_le_bytes());
+
+        // IFD0 at rel 8 (byte 18): 1 entry (0x0110 Model, type 2 ASCII, count 8, valRel 60)
+        let ifd0 = tiff_start + 8;
+        app1[ifd0..ifd0 + 2].copy_from_slice(&1u16.to_le_bytes());
+        let e0 = ifd0 + 2;
+        app1[e0..e0 + 2].copy_from_slice(&0x0110u16.to_le_bytes()); // Model
+        app1[e0 + 2..e0 + 4].copy_from_slice(&2u16.to_le_bytes()); // ASCII
+        app1[e0 + 4..e0 + 8].copy_from_slice(&8u32.to_le_bytes()); // count 8
+        app1[e0 + 8..e0 + 12].copy_from_slice(&60u32.to_le_bytes()); // valRel 60
+        // IFD0 next pointer: IFD1 at rel 26
+        app1[e0 + 12..e0 + 16].copy_from_slice(&26u32.to_le_bytes());
+
+        // Fill Model string at tiff_start + 60 (byte 70) with marker bytes
+        app1[tiff_start + 60..tiff_start + 68].copy_from_slice(b"MYCAMERA");
+
+        // IFD1 at rel 26 (byte 36): 2 entries (JPEGInterchangeFormat rel 56, len 20 -> overlaps rel 60..68!)
+        let ifd1 = tiff_start + 26;
+        app1[ifd1..ifd1 + 2].copy_from_slice(&2u16.to_le_bytes());
+        let ifd1_e0 = ifd1 + 2;
+        app1[ifd1_e0..ifd1_e0 + 2].copy_from_slice(&0x0201u16.to_le_bytes());
+        app1[ifd1_e0 + 2..ifd1_e0 + 4].copy_from_slice(&4u16.to_le_bytes());
+        app1[ifd1_e0 + 4..ifd1_e0 + 8].copy_from_slice(&1u32.to_le_bytes());
+        app1[ifd1_e0 + 8..ifd1_e0 + 12].copy_from_slice(&56u32.to_le_bytes()); // starts at rel 56
+
+        let ifd1_e1 = ifd1_e0 + 12;
+        app1[ifd1_e1..ifd1_e1 + 2].copy_from_slice(&0x0202u16.to_le_bytes());
+        app1[ifd1_e1 + 2..ifd1_e1 + 4].copy_from_slice(&4u16.to_le_bytes());
+        app1[ifd1_e1 + 4..ifd1_e1 + 8].copy_from_slice(&1u32.to_le_bytes());
+        app1[ifd1_e1 + 8..ifd1_e1 + 12].copy_from_slice(&20u32.to_le_bytes()); // len 20 -> covers rel 56..76
+
+        update_app1_exif_for_export(&mut app1, 1920, 1080, 1);
+
+        // Because candidate range overlaps retained Model data, it must NOT be cleared!
+        assert_eq!(&app1[tiff_start + 60..tiff_start + 68], b"MYCAMERA");
+        // But the IFD1 next pointer must still be zeroed
+        assert_eq!(&app1[e0 + 12..e0 + 16], &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn test_update_app1_exif_clears_non_overlapping_strips() {
+        let mut app1 = vec![0u8; 120];
+        app1[0] = 0xff;
+        app1[1] = 0xe1;
+        app1[2] = 0x00;
+        app1[3] = 120;
+        app1[4..10].copy_from_slice(b"Exif\0\0");
+
+        let tiff_start = 10;
+        app1[tiff_start..tiff_start + 2].copy_from_slice(b"II");
+        app1[tiff_start + 2..tiff_start + 4].copy_from_slice(&42u16.to_le_bytes());
+        app1[tiff_start + 4..tiff_start + 8].copy_from_slice(&8u32.to_le_bytes());
+
+        // IFD0 at rel 8: 0 entries, next pointer to IFD1 at rel 20
+        let ifd0 = tiff_start + 8;
+        app1[ifd0..ifd0 + 2].copy_from_slice(&0u16.to_le_bytes());
+        app1[ifd0 + 2..ifd0 + 6].copy_from_slice(&20u32.to_le_bytes());
+
+        // IFD1 at rel 20: StripOffsets (0x0111) rel 70, StripByteCounts (0x0117) 20
+        let ifd1 = tiff_start + 20;
+        app1[ifd1..ifd1 + 2].copy_from_slice(&2u16.to_le_bytes());
+        let e0 = ifd1 + 2;
+        app1[e0..e0 + 2].copy_from_slice(&0x0111u16.to_le_bytes());
+        app1[e0 + 2..e0 + 4].copy_from_slice(&4u16.to_le_bytes());
+        app1[e0 + 4..e0 + 8].copy_from_slice(&1u32.to_le_bytes());
+        app1[e0 + 8..e0 + 12].copy_from_slice(&70u32.to_le_bytes()); // strip offset rel 70
+
+        let e1 = e0 + 12;
+        app1[e1..e1 + 2].copy_from_slice(&0x0117u16.to_le_bytes());
+        app1[e1 + 2..e1 + 4].copy_from_slice(&4u16.to_le_bytes());
+        app1[e1 + 4..e1 + 8].copy_from_slice(&1u32.to_le_bytes());
+        app1[e1 + 8..e1 + 12].copy_from_slice(&20u32.to_le_bytes()); // count 20
+
+        // Pre-fill strip at rel 70..90 with 0xFF
+        app1[tiff_start + 70..tiff_start + 90].fill(0xff);
+
+        update_app1_exif_for_export(&mut app1, 1000, 1000, 1);
+
+        // Disjoint strip should be completely zeroed
+        for b in &app1[tiff_start + 70..tiff_start + 90] {
+            assert_eq!(*b, 0x00);
+        }
+        // IFD1 pointer zeroed
+        assert_eq!(&app1[ifd0 + 2..ifd0 + 6], &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn test_crop_margin_odd_dimension_retention() {
+        // Sensor width 101, left margin 0, right margin 1 -> active width 100
+        let w = 101usize;
+        let crop_right_raw = 1usize;
+        let out_w = w / 2; // 50
+        let max_ox = (w.saturating_sub(crop_right_raw + 1)) / 2; // (101 - 2)/2 = 49
+        let crop_right = out_w.saturating_sub(max_ox + 1); // 50 - 50 = 0
+        assert_eq!(crop_right, 0);
+
+        // Sensor width 100, left margin 4, right margin 4 -> active width 92
+        let w2 = 100usize;
+        let crop_right_raw2 = 4usize;
+        let out_w2 = w2 / 2; // 50
+        let max_ox2 = (w2.saturating_sub(crop_right_raw2 + 1)) / 2; // (100 - 5)/2 = 47
+        let crop_right2 = out_w2.saturating_sub(max_ox2 + 1); // 50 - 48 = 2
+        assert_eq!(crop_right2, 2);
+    }
 }

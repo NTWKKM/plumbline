@@ -514,6 +514,7 @@ test('injectApp1ExifIntoJpegBlob rejects mismatched strip count', async () => {
   });
 
   assert.equal(result.exifPreserved, false);
+  assert.equal(result.blob, dummyBlob);
 });
 
 test('injectApp1ExifIntoJpegBlob preserves 0xA005 InteroperabilityIFD directory and values', async () => {
@@ -604,6 +605,10 @@ test('injectApp1ExifIntoJpegBlob preserves 0xA005 InteroperabilityIFD directory 
   assert.equal(injected[2 + tiffStart + 49], 0x00);
 
   // InteroperabilityIFD directory entry should be preserved intact
+  const viewInj = new DataView(injected.buffer, injected.byteOffset, injected.byteLength);
+  assert.equal(viewInj.getUint16(2 + interopEntry0, true), 0x0001);
+  assert.equal(viewInj.getUint16(2 + interopEntry0 + 2, true), 2);
+  assert.equal(viewInj.getUint32(2 + interopEntry0 + 4, true), 4);
   assert.equal(injected[2 + interopEntry0 + 8], 0x52);
   assert.equal(injected[2 + interopEntry0 + 9], 0x39);
   assert.equal(injected[2 + interopEntry0 + 10], 0x38);
@@ -611,4 +616,107 @@ test('injectApp1ExifIntoJpegBlob preserves 0xA005 InteroperabilityIFD directory 
   // The gap at rel 68..74 should be cleared to 0
   assert.equal(injected[2 + tiffStart + 68], 0x00);
   assert.equal(injected[2 + tiffStart + 73], 0x00);
+});
+
+test('injectApp1ExifIntoJpegBlob rejects truncated GPS directory extent', async () => {
+  const totalLen = 60;
+  const app1 = new Uint8Array(totalLen);
+  app1[0] = 0xff;
+  app1[1] = 0xe1;
+  app1[2] = 0x00;
+  app1[3] = totalLen;
+  app1[4] = 0x45;
+  app1[5] = 0x78;
+  app1[6] = 0x69;
+  app1[7] = 0x66;
+  app1[8] = 0x00;
+  app1[9] = 0x00;
+
+  const tiffStart = 10;
+  const view1 = new DataView(app1.buffer);
+  view1.setUint16(tiffStart, 0x4949, false); // 'II'
+  view1.setUint16(tiffStart + 2, 42, true);
+  view1.setUint32(tiffStart + 4, 8, true); // IFD0 at rel 8
+
+  const ifd0Pos = tiffStart + 8;
+  view1.setUint16(ifd0Pos, 1, true); // 1 entry: GPSInfo pointer
+  const ifd0Entry0 = ifd0Pos + 2;
+  view1.setUint16(ifd0Entry0, 0x8825, true); // GPSInfo
+  view1.setUint16(ifd0Entry0 + 2, 4, true);
+  view1.setUint32(ifd0Entry0 + 4, 1, true);
+  view1.setUint32(ifd0Entry0 + 8, 26, true); // GPSInfo at rel 26
+  view1.setUint32(ifd0Entry0 + 12, 0, true);
+
+  // GPSInfo at rel 26 reports 10 entries (needs 2 + 10*12 + 4 = 126 bytes, but segment only has totalLen=60)
+  const gpsPos = tiffStart + 26;
+  view1.setUint16(gpsPos, 10, true);
+
+  const dummyJpegBytes = new Uint8Array([0xff, 0xd8, 0xff, 0xd9]);
+  const dummyBlob = new Blob([dummyJpegBytes], { type: 'image/jpeg' });
+
+  const result = await injectApp1ExifIntoJpegBlob(dummyBlob, app1, {
+    width: 1000,
+    height: 1000,
+  });
+
+  assert.equal(result.exifPreserved, false);
+  assert.equal(result.blob, dummyBlob);
+});
+
+test('injectApp1ExifIntoJpegBlob clamps thumbnail range ending past segment', async () => {
+  const totalLen = 80;
+  const app1 = new Uint8Array(totalLen);
+  app1[0] = 0xff;
+  app1[1] = 0xe1;
+  app1[2] = 0x00;
+  app1[3] = totalLen;
+  app1[4] = 0x45;
+  app1[5] = 0x78;
+  app1[6] = 0x69;
+  app1[7] = 0x66;
+  app1[8] = 0x00;
+  app1[9] = 0x00;
+
+  const tiffStart = 10;
+  const view1 = new DataView(app1.buffer);
+  view1.setUint16(tiffStart, 0x4949, false); // 'II'
+  view1.setUint16(tiffStart + 2, 42, true);
+  view1.setUint32(tiffStart + 4, 8, true); // IFD0 at rel 8
+
+  const ifd0Pos = tiffStart + 8;
+  view1.setUint16(ifd0Pos, 0, true); // 0 entries
+  view1.setUint32(ifd0Pos + 2, 20, true); // IFD1 at rel 20
+
+  const ifd1Pos = tiffStart + 20;
+  view1.setUint16(ifd1Pos, 2, true);
+  const entry0Pos = ifd1Pos + 2;
+  view1.setUint16(entry0Pos, 0x0201, true); // JPEGInterchangeFormat
+  view1.setUint16(entry0Pos + 2, 4, true);
+  view1.setUint32(entry0Pos + 4, 1, true);
+  view1.setUint32(entry0Pos + 8, 50, true); // starts at rel 50 (byte 60)
+
+  const entry1Pos = entry0Pos + 12;
+  view1.setUint16(entry1Pos, 0x0202, true); // JPEGInterchangeFormatLength
+  view1.setUint16(entry1Pos + 2, 4, true);
+  view1.setUint32(entry1Pos + 4, 1, true);
+  view1.setUint32(entry1Pos + 8, 100, true); // length = 100 (extends far beyond segment.length 80)
+  view1.setUint32(entry1Pos + 12, 0, true);
+
+  // Pre-fill byte 60..80 with 0xEE
+  app1.fill(0xee, tiffStart + 50, totalLen);
+
+  const dummyJpegBytes = new Uint8Array([0xff, 0xd8, 0xff, 0xd9]);
+  const dummyBlob = new Blob([dummyJpegBytes], { type: 'image/jpeg' });
+
+  const result = await injectApp1ExifIntoJpegBlob(dummyBlob, app1, {
+    width: 1000,
+    height: 1000,
+  });
+
+  assert.equal(result.exifPreserved, true);
+  const injected = new Uint8Array(await result.blob.arrayBuffer());
+  // The in-bounds portion of thumbnail range (byte 60..80) should be cleared
+  for (let i = 2 + tiffStart + 50; i < 2 + totalLen; i++) {
+    assert.equal(injected[i], 0x00, `Expected byte at ${i} to be zeroed`);
+  }
 });
