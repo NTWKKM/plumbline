@@ -43,7 +43,9 @@ export default function App() {
   const [showHorizonGrid, setShowHorizonGrid] = useState<boolean>(false);
   const [isRustModalOpen, setIsRustModalOpen] = useState<boolean>(false);
   const [isExporting, setIsExporting] = useState<boolean>(false);
+  const [isImageLoaded, setIsImageLoaded] = useState<boolean>(false);
   const [exportBanner, setExportBanner] = useState<string | null>(null);
+  const [exportError, setExportError] = useState<string | null>(null);
 
   const [analysis, setAnalysis] = useState<LevelingAnalysis>({
     detectedTiltDeg: 0,
@@ -77,6 +79,7 @@ export default function App() {
   });
 
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const exportCanvasRef = useRef<(() => HTMLCanvasElement | null) | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   const activePhoto = photos.find((p) => p.id === selectedId) || photos[0];
@@ -118,8 +121,13 @@ export default function App() {
     const parsed = parseExifFromArrayBuffer(buffer, file.name);
     const objectUrl = URL.createObjectURL(file);
 
+    const uniqueSuffix =
+      typeof crypto !== 'undefined' && crypto.randomUUID
+        ? crypto.randomUUID()
+        : `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+
     const newItem: StudioPhotoItem = {
-      id: `imported-${Date.now()}`,
+      id: `imported-${Date.now()}-${uniqueSuffix}`,
       title: file.name.replace(/\.[^.]+$/, ''),
       fileName: file.name,
       src: objectUrl,
@@ -135,24 +143,36 @@ export default function App() {
   };
 
   const handleExportJpeg = async () => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
     setIsExporting(true);
     setExportBanner(null);
+    setExportError(null);
 
     try {
+      // Use the offscreen framed canvas generator to exclude inspection labels, dividers, crop guides, and Horizon Grid lines
+      const canvas = exportCanvasRef.current ? exportCanvasRef.current() : canvasRef.current;
+      if (!canvas) {
+        setExportError('Darkroom canvas is not ready for export.');
+        return;
+      }
+
       const quality = Math.max(0.7, Math.min(1.0, config.jpegQuality / 100));
       const blob = await new Promise<Blob | null>((resolve) =>
         canvas.toBlob((b) => resolve(b), 'image/jpeg', quality)
       );
+
       if (!blob) {
-        setIsExporting(false);
+        setExportError('Failed to encode canvas to JPEG format.');
         return;
       }
 
-      const finalBlob = config.preserveExifMetadata
-        ? await injectApp1ExifIntoJpegBlob(blob, activePhoto.rawApp1Segment)
-        : blob;
+      let finalBlob = blob;
+      let exifPreserved = false;
+
+      if (config.preserveExifMetadata) {
+        const injectResult = await injectApp1ExifIntoJpegBlob(blob, activePhoto.rawApp1Segment);
+        finalBlob = injectResult.blob;
+        exifPreserved = injectResult.exifPreserved;
+      }
 
       const url = URL.createObjectURL(finalBlob);
       const a = document.createElement('a');
@@ -167,9 +187,12 @@ export default function App() {
 
       setExportBanner(
         `Exported ${outName} (${frameLayout.canvasWidth} × ${frameLayout.canvasHeight} px · ${
-          config.preserveExifMetadata ? 'EXIF Preserved' : 'EXIF Stripped'
+          exifPreserved ? 'EXIF Preserved' : 'EXIF Stripped'
         })`
       );
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setExportBanner(`Export failed. ${msg}`);
     } finally {
       setIsExporting(false);
     }
@@ -177,14 +200,14 @@ export default function App() {
 
   return (
     <div className="flex min-h-screen lg:h-screen lg:overflow-hidden flex-col bg-[#0b0b0d] text-zinc-100">
-      {/* Hidden File Input for JPEG & Camera RAW */}
+      {/* Hidden File Input for Supported Image Formats */}
       <input
         ref={fileInputRef}
         type="file"
-        accept=".jpg,.jpeg,.png,.webp,.dng,.cr2,.nef,.arw,.raf"
+        accept=".jpg,.jpeg,.png,.webp"
         onChange={handleFileImport}
         className="hidden"
-        aria-label="Upload JPEG or RAW photo"
+        aria-label="Upload photo"
       />
 
       {/* Strict 3-Zone Top Bar Contract */}
@@ -470,14 +493,38 @@ export default function App() {
             </div>
           </div>
 
+          {/* Export Error Alert Banner */}
+          {exportError && (
+            <div className="flex items-center justify-between border-b border-rose-900/60 bg-rose-950/40 px-5 py-2 text-xs text-rose-300">
+              <span className="font-mono">Export error: {exportError}</span>
+              <button
+                type="button"
+                onClick={() => setExportError(null)}
+                className="text-rose-400 hover:text-rose-200"
+              >
+                Dismiss
+              </button>
+            </div>
+          )}
+
           {/* Export Confirmation Toast Banner */}
           {exportBanner && (
-            <div className="flex items-center justify-between border-b border-emerald-900/60 bg-emerald-950/40 px-5 py-2 text-xs text-emerald-300">
+            <div
+              className={`flex items-center justify-between border-b px-5 py-2 text-xs ${
+                exportBanner.startsWith('Export failed.')
+                  ? 'border-amber-900/60 bg-amber-950/40 text-amber-300'
+                  : 'border-emerald-900/60 bg-emerald-950/40 text-emerald-300'
+              }`}
+            >
               <span className="font-mono">{exportBanner}</span>
               <button
                 type="button"
                 onClick={() => setExportBanner(null)}
-                className="text-emerald-400 hover:text-emerald-200"
+                className={
+                  exportBanner.startsWith('Export failed.')
+                    ? 'text-amber-400 hover:text-amber-200'
+                    : 'text-emerald-400 hover:text-emerald-200'
+                }
               >
                 Dismiss
               </button>
@@ -487,6 +534,7 @@ export default function App() {
           {/* Canvas Stage */}
           <div className="flex-1 min-h-0 flex items-center justify-center overflow-hidden">
             <DarkroomCanvas
+              key={activePhoto.id}
               photo={activePhoto}
               config={config}
               viewMode={viewMode}
@@ -495,6 +543,8 @@ export default function App() {
               showHorizonGrid={showHorizonGrid}
               onAnalysisUpdate={handleAnalysisUpdate}
               canvasRef={canvasRef}
+              onImageLoaded={setIsImageLoaded}
+              exportCanvasRef={exportCanvasRef}
             />
           </div>
 
@@ -502,10 +552,18 @@ export default function App() {
           <footer className="flex flex-wrap items-center justify-between gap-4 border-t border-zinc-800/80 bg-[#111114] px-6 py-2.5 text-xs text-zinc-400 font-mono tabular-nums">
             <div className="flex flex-wrap items-center gap-2">
               <span className="text-zinc-200 font-semibold">{activePhoto.fileName}</span>
-              <span aria-hidden="true">·</span>
-              <span>{activePhoto.exif.cameraModel}</span>
-              <span aria-hidden="true">·</span>
-              <span>{activePhoto.exif.lensModel}</span>
+              {activePhoto.exif.cameraModel && (
+                <>
+                  <span aria-hidden="true">·</span>
+                  <span>{activePhoto.exif.cameraModel}</span>
+                </>
+              )}
+              {activePhoto.exif.lensModel && (
+                <>
+                  <span aria-hidden="true">·</span>
+                  <span>{activePhoto.exif.lensModel}</span>
+                </>
+              )}
             </div>
             <div className="flex flex-wrap items-center gap-2">
               <span>
@@ -537,6 +595,7 @@ export default function App() {
           onResetAll={handleResetAll}
           onExportJpeg={handleExportJpeg}
           isExporting={isExporting}
+          isImageLoaded={isImageLoaded}
         />
       </main>
 

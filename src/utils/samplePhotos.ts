@@ -1,4 +1,7 @@
 import { ExifData } from './geometry';
+import coastalHorizonSrc from '../assets/images/sample_coastal_horizon_1793590430896.jpg';
+import tokyoArchitectureSrc from '../assets/images/sample_tokyo_architecture_1793590432060.jpg';
+import alpineLakeSrc from '../assets/images/sample_alpine_lake_1793590432475.jpg';
 
 export interface StudioPhotoItem {
   id: string;
@@ -16,7 +19,7 @@ export const INITIAL_SAMPLE_PHOTOS: StudioPhotoItem[] = [
     id: 'coastal-horizon',
     title: 'Cape Elizabeth Lighthouse',
     fileName: 'L1004821.DNG',
-    src: '/src/assets/images/sample_coastal_horizon_1793590430896.jpg',
+    src: coastalHorizonSrc,
     isRaw: true,
     simulatedSensorTiltDeg: 3.4,
     rawApp1Segment: null,
@@ -36,7 +39,7 @@ export const INITIAL_SAMPLE_PHOTOS: StudioPhotoItem[] = [
     id: 'tokyo-architecture',
     title: 'Tokyo Concrete Facade',
     fileName: 'DSC09412.ARW',
-    src: '/src/assets/images/sample_tokyo_architecture_1793590432060.jpg',
+    src: tokyoArchitectureSrc,
     isRaw: true,
     simulatedSensorTiltDeg: -2.6,
     rawApp1Segment: null,
@@ -56,7 +59,7 @@ export const INITIAL_SAMPLE_PHOTOS: StudioPhotoItem[] = [
     id: 'alpine-lake',
     title: 'Lofoten Fjord Reflection',
     fileName: 'DSCF3109.JPG',
-    src: '/src/assets/images/sample_alpine_lake_1793590432475.jpg',
+    src: alpineLakeSrc,
     isRaw: false,
     simulatedSensorTiltDeg: 2.1,
     rawApp1Segment: null,

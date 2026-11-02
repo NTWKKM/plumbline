@@ -30,6 +30,7 @@ interface InspectorSidebarProps {
   onResetAll: () => void;
   onExportJpeg: () => void;
   isExporting: boolean;
+  isImageLoaded?: boolean;
 }
 
 const ASPECT_PRESETS: { value: AspectRatioPreset; label: string }[] = [
@@ -53,6 +54,7 @@ export const InspectorSidebar: React.FC<InspectorSidebarProps> = ({
   onResetAll,
   onExportJpeg,
   isExporting,
+  isImageLoaded = true,
 }) => {
   const totalRotationDeg = Number(
     ((config.autoLevelEnabled ? analysis.appliedRotationDeg : 0) + config.manualAngleOffsetDeg).toFixed(2)
@@ -367,24 +369,42 @@ export const InspectorSidebar: React.FC<InspectorSidebarProps> = ({
 
           {/* Clean Unboxed EXIF Readout */}
           <div className="mt-2.5 space-y-1 border-t border-zinc-800/80 pt-2.5 text-xs text-zinc-400">
-            <div className="flex justify-between">
-              <span>Camera & Format</span>
-              <span className="font-mono text-zinc-200">
-                {exif.cameraModel} · {exif.rawFormat || 'JPEG'}
-              </span>
-            </div>
-            <div className="flex justify-between">
-              <span>Lens</span>
-              <span className="font-mono text-zinc-200 truncate max-w-[200px]">
-                {exif.lensModel}
-              </span>
-            </div>
-            <div className="flex justify-between">
-              <span>Exposure</span>
-              <span className="font-mono text-zinc-200 tabular-nums">
-                {exif.focalLength} · {exif.aperture} · {exif.shutterSpeed} · ISO {exif.iso}
-              </span>
-            </div>
+            {(exif.cameraModel || exif.rawFormat) && (
+              <div className="flex justify-between">
+                <span>Camera & Format</span>
+                <span className="font-mono text-zinc-200">
+                  {[exif.cameraModel, exif.rawFormat || 'JPEG'].filter(Boolean).join(' · ')}
+                </span>
+              </div>
+            )}
+            {exif.lensModel && (
+              <div className="flex justify-between">
+                <span>Lens</span>
+                <span className="font-mono text-zinc-200 truncate max-w-[200px]">
+                  {exif.lensModel}
+                </span>
+              </div>
+            )}
+            {[
+              exif.focalLength,
+              exif.aperture,
+              exif.shutterSpeed,
+              exif.iso ? `ISO ${exif.iso.replace(/^ISO\s*/i, '')}` : '',
+            ].some(Boolean) && (
+              <div className="flex justify-between">
+                <span>Exposure</span>
+                <span className="font-mono text-zinc-200 tabular-nums">
+                  {[
+                    exif.focalLength,
+                    exif.aperture,
+                    exif.shutterSpeed,
+                    exif.iso ? `ISO ${exif.iso.replace(/^ISO\s*/i, '')}` : '',
+                  ]
+                    .filter(Boolean)
+                    .join(' · ')}
+                </span>
+              </div>
+            )}
             <div className="flex justify-between">
               <span>Source Sensor</span>
               <span className="font-mono text-zinc-300 tabular-nums">
@@ -399,7 +419,7 @@ export const InspectorSidebar: React.FC<InspectorSidebarProps> = ({
           <button
             type="button"
             onClick={onExportJpeg}
-            disabled={isExporting}
+            disabled={isExporting || !isImageLoaded}
             className="flex w-full items-center justify-center gap-2 rounded-lg bg-blue-600 px-4 py-2 text-xs font-semibold text-white shadow-sm transition-colors hover:bg-blue-500 disabled:opacity-50 whitespace-nowrap shrink-0"
           >
             <Download className="h-4 w-4" />

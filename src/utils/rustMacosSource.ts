@@ -165,6 +165,38 @@ fn develop_raw_bilinear(raw: &rawloader::RawImage) -> Result<RgbaImage, String> 
         _ => return Err("Unsupported floating-point RAW sensor data".into()),
     };
 
+    // Validate CFA pattern: reject unsupported layouts (e.g. 6x6 X-Trans pattern in certain .raf files)
+    if raw.cfa.width != 2 || raw.cfa.height != 2 {
+        return Err(format!(
+            "Unsupported CFA pattern {}x{} (e.g. Fujifilm X-Trans). Only 2x2 Bayer CFA layouts are currently supported.",
+            raw.cfa.width, raw.cfa.height
+        ));
+    }
+
+    // Inspect the 2x2 CFA layout to dynamically map sensor samples to Red, Green, and Blue channels
+    let mut r_pos = (0, 0);
+    let mut b_pos = (1, 1);
+    let mut g1_pos = (1, 0);
+    let mut g2_pos = (0, 1);
+    let mut g_count = 0;
+
+    for dy in 0..2 {
+        for dx in 0..2 {
+            match raw.cfa.color_at(dy, dx) {
+                0 => r_pos = (dx, dy), // Red
+                2 => b_pos = (dx, dy), // Blue
+                _ => {                 // Green
+                    if g_count == 0 {
+                        g1_pos = (dx, dy);
+                        g_count += 1;
+                    } else {
+                        g2_pos = (dx, dy);
+                    }
+                }
+            }
+        }
+    }
+
     let black = raw.blacklevels[0] as f32;
     let white = (raw.whitelevels[0] as f32).max(black + 1.0);
     let wb = raw.wb_coeffs;
@@ -172,7 +204,7 @@ fn develop_raw_bilinear(raw: &rawloader::RawImage) -> Result<RgbaImage, String> 
     let r_gain = (wb[0] / g_ref).clamp(0.5, 4.0);
     let b_gain = (wb[2] / g_ref).clamp(0.5, 4.0);
 
-    // Downsample 2x2 super-pixel RGGB block for fast interactive preview/export
+    // Downsample 2x2 super-pixel Bayer block for fast interactive preview/export
     let out_w = (w / 2).max(1);
     let out_h = (h / 2).max(1);
     let mut out = ImageBuffer::new(out_w as u32, out_h as u32);
@@ -183,14 +215,15 @@ fn develop_raw_bilinear(raw: &rawloader::RawImage) -> Result<RgbaImage, String> 
             let sy = oy * 2;
             let norm = |v: u16| ((v as f32 - black) / (white - black)).clamp(0.0, 1.0);
 
-            let p00 = norm(data[sy * w + sx]);
-            let p01 = norm(data[sy * w + sx + 1]);
-            let p10 = norm(data[(sy + 1) * w + sx]);
-            let p11 = norm(data[(sy + 1) * w + sx + 1]);
+            let r_val = norm(data[(sy + r_pos.1) * w + sx + r_pos.0]);
+            let g_val = (norm(data[(sy + g1_pos.1) * w + sx + g1_pos.0])
+                + norm(data[(sy + g2_pos.1) * w + sx + g2_pos.0]))
+                * 0.5;
+            let b_val = norm(data[(sy + b_pos.1) * w + sx + b_pos.0]);
 
-            let r = (p00 * r_gain).clamp(0.0, 1.0).powf(1.0 / 2.2);
-            let g = ((p01 + p10) * 0.5).clamp(0.0, 1.0).powf(1.0 / 2.2);
-            let b = (p11 * b_gain).clamp(0.0, 1.0).powf(1.0 / 2.2);
+            let r = (r_val * r_gain).clamp(0.0, 1.0).powf(1.0 / 2.2);
+            let g = g_val.clamp(0.0, 1.0).powf(1.0 / 2.2);
+            let b = (b_val * b_gain).clamp(0.0, 1.0).powf(1.0 / 2.2);
 
             out.put_pixel(
                 ox as u32,

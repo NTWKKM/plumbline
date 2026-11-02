@@ -1,6 +1,6 @@
 {
   "name": "WhiteBorder Studio & AutoLevel",
-  "description": "macOS-style photo framing, square-fit white border, and automatic horizon leveling & inscribed-rectangle cropping tool with Rust/Go native engine support.",
+  "description": "macOS-style photo framing, square-fit white border, and automatic horizon leveling & inscribed-rectangle cropping tool with Rust native engine support.",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }

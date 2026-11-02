@@ -28,6 +28,8 @@ interface DarkroomCanvasProps {
     sourceSize: { width: number; height: number }
   ) => void;
   canvasRef: React.RefObject<HTMLCanvasElement | null>;
+  onImageLoaded?: (loaded: boolean) => void;
+  exportCanvasRef?: React.MutableRefObject<(() => HTMLCanvasElement | null) | null>;
 }
 
 export const DarkroomCanvas: React.FC<DarkroomCanvasProps> = ({
@@ -39,6 +41,8 @@ export const DarkroomCanvas: React.FC<DarkroomCanvasProps> = ({
   showHorizonGrid,
   onAnalysisUpdate,
   canvasRef,
+  onImageLoaded,
+  exportCanvasRef,
 }) => {
   const [sensorCanvas, setSensorCanvas] = useState<HTMLCanvasElement | null>(null);
   const [analysis, setAnalysis] = useState<LevelingAnalysis>({
@@ -57,6 +61,7 @@ export const DarkroomCanvas: React.FC<DarkroomCanvasProps> = ({
   useEffect(() => {
     let cancelled = false;
     setLoadError(null);
+    onImageLoaded?.(false);
 
     const img = new Image();
     img.crossOrigin = 'anonymous';
@@ -115,11 +120,13 @@ export const DarkroomCanvas: React.FC<DarkroomCanvasProps> = ({
 
       setSensorCanvas(offscreen);
       setAnalysis(detected);
+      onImageLoaded?.(true);
     };
 
     img.onerror = () => {
       if (!cancelled) {
-        setLoadError('Unable to decode image buffer. Using procedural calibration chart.');
+        setLoadError('Unable to decode image buffer.');
+        onImageLoaded?.(false);
       }
     };
 
@@ -128,7 +135,7 @@ export const DarkroomCanvas: React.FC<DarkroomCanvasProps> = ({
     return () => {
       cancelled = true;
     };
-  }, [photo.id, photo.src, photo.simulatedSensorTiltDeg, config.maxAutoAngleDeg]);
+  }, [photo.id, photo.src, photo.simulatedSensorTiltDeg, config.maxAutoAngleDeg, onImageLoaded]);
 
   // Step 2: Render the active pipeline stage onto the visible darkroom canvas
   useEffect(() => {
@@ -169,16 +176,13 @@ export const DarkroomCanvas: React.FC<DarkroomCanvasProps> = ({
     const rCtx = rotCanvas.getContext('2d');
     if (!rCtx) return;
 
-    rCtx.fillStyle = '#09090b';
+    rCtx.fillStyle = config.backgroundColor;
     rCtx.fillRect(0, 0, srcW, srcH);
     rCtx.save();
     rCtx.translate(srcW / 2, srcH / 2);
     rCtx.rotate((totalRotDeg * Math.PI) / 180);
     rCtx.drawImage(sensorCanvas, -srcW / 2, -srcH / 2);
     rCtx.restore();
-
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
 
     const drawProcessedFrame = (targetCtx: CanvasRenderingContext2D) => {
       // 1. Fill border background
@@ -202,20 +206,66 @@ export const DarkroomCanvas: React.FC<DarkroomCanvasProps> = ({
 
       // 3. Optional EXIF typographic caption in bottom border
       if (config.renderExifCaption) {
-        const isDarkBg = isHexColorDark(config.backgroundColor);
-        targetCtx.fillStyle = isDarkBg ? '#a1a1aa' : '#3f3f46';
-        const fontSize = Math.max(12, Math.round(layout.canvasHeight * 0.0145));
-        targetCtx.font = `500 ${fontSize}px "JetBrains Mono", monospace`;
-        targetCtx.textAlign = 'center';
-        targetCtx.textBaseline = 'middle';
-        const captionY = layout.imageY + layout.imageHeight + layout.borderBottom * 0.52;
-        targetCtx.fillText(
-          formatExifSummaryLine(photo.exif),
-          layout.canvasWidth / 2,
-          captionY
-        );
+        const captionText = formatExifSummaryLine(photo.exif);
+        if (captionText) {
+          const isDarkBg = isHexColorDark(config.backgroundColor);
+          targetCtx.fillStyle = isDarkBg ? '#a1a1aa' : '#3f3f46';
+          let fontSize = Math.max(12, Math.round(layout.canvasHeight * 0.0145));
+          targetCtx.font = `500 ${fontSize}px "JetBrains Mono", monospace`;
+          targetCtx.textAlign = 'center';
+          targetCtx.textBaseline = 'middle';
+
+          // Measure caption and ensure rendered width fits within canvas boundaries
+          const maxCaptionWidth = Math.max(
+            10,
+            layout.canvasWidth - Math.max(32, Math.round(layout.canvasWidth * 0.08))
+          );
+          let textWidth = targetCtx.measureText(captionText).width;
+
+          if (textWidth > maxCaptionWidth) {
+            const scaledFontSize = Math.max(
+              9,
+              Math.floor(fontSize * (maxCaptionWidth / textWidth))
+            );
+            if (scaledFontSize < fontSize) {
+              fontSize = scaledFontSize;
+              targetCtx.font = `500 ${fontSize}px "JetBrains Mono", monospace`;
+              textWidth = targetCtx.measureText(captionText).width;
+            }
+          }
+
+          let finalCaption = captionText;
+          if (textWidth > maxCaptionWidth) {
+            while (
+              finalCaption.length > 3 &&
+              targetCtx.measureText(finalCaption + '…').width > maxCaptionWidth
+            ) {
+              finalCaption = finalCaption.slice(0, -1);
+            }
+            finalCaption += '…';
+          }
+
+          const captionY = layout.imageY + layout.imageHeight + layout.borderBottom * 0.52;
+          targetCtx.fillText(finalCaption, layout.canvasWidth / 2, captionY);
+        }
       }
     };
+
+    // Expose offscreen framed canvas generator for clean export without inspection overlays
+    if (exportCanvasRef) {
+      exportCanvasRef.current = () => {
+        const offscreen = document.createElement('canvas');
+        offscreen.width = layout.canvasWidth;
+        offscreen.height = layout.canvasHeight;
+        const oCtx = offscreen.getContext('2d');
+        if (!oCtx) return null;
+        drawProcessedFrame(oCtx);
+        return offscreen;
+      };
+    }
+
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
 
     if (viewMode === 'original') {
       canvas.width = srcW;
@@ -417,8 +467,12 @@ export const DarkroomCanvas: React.FC<DarkroomCanvasProps> = ({
   };
 
   const handlePointerDown = (e: React.PointerEvent<HTMLCanvasElement>) => {
-    if (viewMode !== 'split') return;
-    e.currentTarget.setPointerCapture(e.pointerId);
+    if (viewMode !== 'split' || e.button !== 0) return;
+    try {
+      e.currentTarget.setPointerCapture(e.pointerId);
+    } catch {
+      // Ignore if pointer capture fails
+    }
     setIsDraggingSplit(true);
     updateSplitFromClientX(e.clientX);
   };
@@ -430,7 +484,20 @@ export const DarkroomCanvas: React.FC<DarkroomCanvasProps> = ({
 
   const handlePointerUp = (e: React.PointerEvent<HTMLCanvasElement>) => {
     if (!isDraggingSplit) return;
-    e.currentTarget.releasePointerCapture(e.pointerId);
+    if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+      e.currentTarget.releasePointerCapture(e.pointerId);
+    }
+    setIsDraggingSplit(false);
+  };
+
+  const handlePointerCancel = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+      e.currentTarget.releasePointerCapture(e.pointerId);
+    }
+    setIsDraggingSplit(false);
+  };
+
+  const handleLostPointerCapture = () => {
     setIsDraggingSplit(false);
   };
 
@@ -455,6 +522,8 @@ export const DarkroomCanvas: React.FC<DarkroomCanvasProps> = ({
         onPointerDown={handlePointerDown}
         onPointerMove={handlePointerMove}
         onPointerUp={handlePointerUp}
+        onPointerCancel={handlePointerCancel}
+        onLostPointerCapture={handleLostPointerCapture}
         className={`max-h-full max-w-full object-contain shadow-2xl transition-opacity duration-150 ${
           viewMode === 'split' ? 'cursor-ew-resize select-none touch-none' : ''
         }`}

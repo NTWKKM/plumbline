@@ -10,18 +10,21 @@ interface RustCodeModalProps {
 export const RustCodeModal: React.FC<RustCodeModalProps> = ({ isOpen, onClose }) => {
   const [activeFile, setActiveFile] = useState<'main.rs' | 'Cargo.toml'>('main.rs');
   const [copied, setCopied] = useState(false);
+  const [copyError, setCopyError] = useState<string | null>(null);
 
   if (!isOpen) return null;
 
   const activeCode = activeFile === 'main.rs' ? RUST_MAIN_RS : RUST_CARGO_TOML;
 
   const handleCopy = async () => {
+    setCopyError(null);
     try {
       await navigator.clipboard.writeText(activeCode);
       setCopied(true);
       setTimeout(() => setCopied(false), 1800);
     } catch {
-      // Fallback
+      setCopyError('Failed to copy');
+      setTimeout(() => setCopyError(null), 3000);
     }
   };
 
@@ -70,7 +73,7 @@ export const RustCodeModal: React.FC<RustCodeModalProps> = ({ isOpen, onClose })
           <div className="flex items-center gap-3 text-xs text-zinc-300">
             <Terminal className="h-4 w-4 text-blue-400 shrink-0" />
             <span className="font-mono">
-              mkdir whiteborder-macos && cd whiteborder-macos && cargo run --release
+              mkdir -p whiteborder-macos/src && cd whiteborder-macos; save Cargo.toml here and src/main.rs in src/, then cargo run --release
             </span>
           </div>
 
@@ -79,7 +82,11 @@ export const RustCodeModal: React.FC<RustCodeModalProps> = ({ isOpen, onClose })
             <div className="flex items-center rounded-lg bg-zinc-900 p-1 border border-zinc-800">
               <button
                 type="button"
-                onClick={() => setActiveFile('main.rs')}
+                onClick={() => {
+                  setActiveFile('main.rs');
+                  setCopied(false);
+                  setCopyError(null);
+                }}
                 className={`rounded-md px-3 py-1 text-xs font-mono font-medium transition-colors whitespace-nowrap shrink-0 ${
                   activeFile === 'main.rs'
                     ? 'bg-zinc-800 text-white'
@@ -90,7 +97,11 @@ export const RustCodeModal: React.FC<RustCodeModalProps> = ({ isOpen, onClose })
               </button>
               <button
                 type="button"
-                onClick={() => setActiveFile('Cargo.toml')}
+                onClick={() => {
+                  setActiveFile('Cargo.toml');
+                  setCopied(false);
+                  setCopyError(null);
+                }}
                 className={`rounded-md px-3 py-1 text-xs font-mono font-medium transition-colors whitespace-nowrap shrink-0 ${
                   activeFile === 'Cargo.toml'
                     ? 'bg-zinc-800 text-white'
@@ -100,6 +111,12 @@ export const RustCodeModal: React.FC<RustCodeModalProps> = ({ isOpen, onClose })
                 Cargo.toml
               </button>
             </div>
+
+            {copyError && (
+              <span className="text-xs text-rose-400 font-mono" role="alert">
+                {copyError}
+              </span>
+            )}
 
             <button
               type="button"

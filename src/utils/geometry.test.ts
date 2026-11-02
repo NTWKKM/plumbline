@@ -53,6 +53,23 @@ test('detectHorizonTiltFromGrayscale accurately recovers a synthetic tilted hori
   );
   assert.equal(analysis.appliedRotationDeg, Number((-analysis.detectedTiltDeg).toFixed(2)));
   assert.ok(analysis.strongEdgeCount > 100);
+  assert.ok(analysis.confidence > 0.35);
+});
+
+test('detectHorizonTiltFromGrayscale sets appliedRotationDeg to 0 when confidence is below minimum threshold on random noise', () => {
+  const w = 180;
+  const h = 120;
+  const gray = new Uint8Array(w * h);
+  // Fill with deterministic pseudo-random noise without any dominant linear edge
+  let s = 12345;
+  for (let i = 0; i < gray.length; i++) {
+    s = (s * 1103515245 + 12345) & 0x7fffffff;
+    gray[i] = s % 256;
+  }
+
+  const analysis = detectHorizonTiltFromGrayscale(gray, w, h, 15.0);
+  assert.equal(analysis.appliedRotationDeg, 0);
+  assert.ok(analysis.confidence < 0.35);
 });
 
 test('computeFrameLayout creates 1:1 square frame with symmetric white borders', () => {
@@ -61,6 +78,12 @@ test('computeFrameLayout creates 1:1 square frame with symmetric white borders',
   assert.ok(layout.borderLeft >= Math.floor(layout.canvasWidth * 0.1));
   assert.equal(layout.borderLeft + layout.imageWidth + layout.borderRight, layout.canvasWidth);
   assert.equal(layout.borderTop + layout.imageHeight + layout.borderBottom, layout.canvasHeight);
+});
+
+test('computeFrameLayout retains full source width for 4000x3000 landscape in 4:5 preset at 10% padding', () => {
+  const layout = computeFrameLayout(4000, 3000, '4:5', 10, false);
+  assert.equal(layout.imageWidth, 4000);
+  assert.equal(layout.imageHeight, 3000);
 });
 
 test('formatExifSummaryLine joins non-empty EXIF fields cleanly', () => {

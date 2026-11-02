@@ -12,13 +12,13 @@ export interface ParsedFileMetadata {
 }
 
 const DEFAULT_FALLBACK_EXIF: ExifData = {
-  cameraModel: 'Sony ILCE-7RM5',
-  lensModel: 'FE 35mm F1.4 GM',
-  focalLength: '35mm',
-  aperture: 'f/2.8',
-  shutterSpeed: '1/500s',
-  iso: '100',
-  dateTimeOriginal: '2026:11:01 17:15:00',
+  cameraModel: '',
+  lensModel: '',
+  focalLength: '',
+  aperture: '',
+  shutterSpeed: '',
+  iso: '',
+  dateTimeOriginal: '',
   colorSpace: 'sRGB',
 };
 
@@ -170,7 +170,19 @@ function readTiffIfdTags(
         }
         // 0x8827 = ISO
         if (tag === 0x8827) {
-          const isoVal = type === 3 ? view.getUint16(entryPos + 8, littleEndian) : valRel;
+          let isoVal = 0;
+          if (type === 3) {
+            // SHORT: inline if count is 1 or 2, from valOffset when count > 2
+            if (count === 1 || count === 2) {
+              isoVal = view.getUint16(entryPos + 8, littleEndian);
+            } else if (count > 2) {
+              if (valOffset >= 0 && valOffset + 2 <= view.byteLength) {
+                isoVal = view.getUint16(valOffset, littleEndian);
+              }
+            }
+          } else {
+            isoVal = valRel;
+          }
           if (isoVal > 0 && isoVal < 409600) result.iso = String(isoVal);
         }
         // 0x9003 = DateTimeOriginal
@@ -200,25 +212,69 @@ function readTiffIfdTags(
   return result;
 }
 
+export interface InjectExifResult {
+  blob: Blob;
+  exifPreserved: boolean;
+}
+
 /**
- * Losslessly injects an original JPEG APP1 EXIF segment into a freshly encoded JPEG Blob.
+ * Losslessly injects an original JPEG APP1 EXIF segment into a freshly encoded JPEG Blob,
+ * resetting Orientation (tag 0x0112) to 1 (normal) to prevent double-rotation in viewers.
  */
 export async function injectApp1ExifIntoJpegBlob(
   jpegBlob: Blob,
   rawApp1Segment: Uint8Array | null
-): Promise<Blob> {
-  if (!rawApp1Segment || rawApp1Segment.length < 6) {
-    return jpegBlob;
+): Promise<InjectExifResult> {
+  if (!rawApp1Segment || rawApp1Segment.length < 14) {
+    return { blob: jpegBlob, exifPreserved: false };
   }
   const buf = await jpegBlob.arrayBuffer();
   const bytes = new Uint8Array(buf);
   if (bytes.length < 4 || bytes[0] !== 0xff || bytes[1] !== 0xd8) {
-    return jpegBlob;
+    return { blob: jpegBlob, exifPreserved: false };
   }
+
+  // Clone APP1 segment so caller's buffer is not mutated
+  const segment = new Uint8Array(rawApp1Segment);
+
+  // Check APP1 marker and "Exif\0\0" header
+  if (
+    segment[0] === 0xff &&
+    segment[1] === 0xe1 &&
+    segment[4] === 0x45 &&
+    segment[5] === 0x78 &&
+    segment[6] === 0x69 &&
+    segment[7] === 0x66 &&
+    segment[8] === 0x00 &&
+    segment[9] === 0x00 &&
+    segment.length >= 18
+  ) {
+    const tiffStart = 10;
+    const view = new DataView(segment.buffer, segment.byteOffset, segment.byteLength);
+    const littleEndian = view.getUint16(tiffStart, false) === 0x4949;
+    const firstIfdRel = view.getUint32(tiffStart + 4, littleEndian);
+    const ifd0Offset = tiffStart + firstIfdRel;
+
+    if (ifd0Offset >= 0 && ifd0Offset + 2 <= segment.length) {
+      const entries = view.getUint16(ifd0Offset, littleEndian);
+      for (let i = 0; i < entries; i++) {
+        const entryPos = ifd0Offset + 2 + i * 12;
+        if (entryPos + 12 > segment.length) break;
+        const tag = view.getUint16(entryPos, littleEndian);
+        // 0x0112 = Orientation tag
+        if (tag === 0x0112) {
+          // Reset orientation to 1 (Normal / Top-Left) since canvas has already applied sensor rotation
+          view.setUint16(entryPos + 8, 1, littleEndian);
+          break;
+        }
+      }
+    }
+  }
+
   // Splice rawApp1Segment immediately after SOI (0xFFD8)
-  const merged = new Uint8Array(bytes.length + rawApp1Segment.length);
+  const merged = new Uint8Array(bytes.length + segment.length);
   merged.set(bytes.slice(0, 2), 0);
-  merged.set(rawApp1Segment, 2);
-  merged.set(bytes.slice(2), 2 + rawApp1Segment.length);
-  return new Blob([merged], { type: 'image/jpeg' });
+  merged.set(segment, 2);
+  merged.set(bytes.slice(2), 2 + segment.length);
+  return { blob: new Blob([merged], { type: 'image/jpeg' }), exifPreserved: true };
 }

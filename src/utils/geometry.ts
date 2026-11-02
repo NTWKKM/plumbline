@@ -358,10 +358,14 @@ export function detectHorizonTiltFromGrayscale(
   }
 
   const detectedTiltDeg = Number((refinedBin * binStep - limit).toFixed(2));
-  const appliedRotationDeg = Number((-detectedTiltDeg).toFixed(2));
   const meanEnergy = totalEnergy / numBins;
   const peakRatio = maxEnergy > 0 ? (maxEnergy - meanEnergy) / maxEnergy : 0;
-  const confidence = clamp(Number(peakRatio.toFixed(2)), 0.25, 0.99);
+  const confidence = clamp(Number(peakRatio.toFixed(2)), 0.0, 0.99);
+
+  // Confidence threshold: suppress erratic rotation on low-contrast/textured scenes
+  const MIN_CONFIDENCE_THRESHOLD = 0.35;
+  const appliedRotationDeg =
+    confidence >= MIN_CONFIDENCE_THRESHOLD ? Number((-detectedTiltDeg).toFixed(2)) : 0;
 
   return {
     detectedTiltDeg,
@@ -392,16 +396,26 @@ export function computeFrameLayout(
   else if (aspectPreset === '16:9') targetRatio = 16 / 9;
   else if (aspectPreset === '3:2') targetRatio = 3 / 2;
 
-  // Base longest side on the source image so resolution is never degraded
-  const baseLongSide = Math.max(safeW, safeH);
+  // Account for padding margins and bottom EXIF caption reserve
+  const footerRatio = renderExifCaption ? 0.045 : 0;
+  const hFraction = Math.max(0.2, 1 - 2 * padRatio);
+  const vFraction = Math.max(0.2, 1 - 2 * padRatio - footerRatio);
+
+  // Binding canvas dimensions: ensure neither width nor height constraints cause downscaling of source image
+  const reqCanvasW_from_W = safeW / hFraction;
+  const reqCanvasH_from_W = reqCanvasW_from_W / targetRatio;
+
+  const reqCanvasH_from_H = safeH / vFraction;
+  const reqCanvasW_from_H = reqCanvasH_from_H * targetRatio;
+
   let canvasWidth: number;
   let canvasHeight: number;
 
-  if (targetRatio >= 1) {
-    canvasWidth = Math.round(baseLongSide / (1 - Math.min(0.7, padRatio * 1.6)));
+  if (reqCanvasW_from_W >= reqCanvasW_from_H) {
+    canvasWidth = Math.round(reqCanvasW_from_W);
     canvasHeight = Math.round(canvasWidth / targetRatio);
   } else {
-    canvasHeight = Math.round(baseLongSide / (1 - Math.min(0.7, padRatio * 1.6)));
+    canvasHeight = Math.round(reqCanvasH_from_H);
     canvasWidth = Math.round(canvasHeight * targetRatio);
   }
 
