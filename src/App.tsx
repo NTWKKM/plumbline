@@ -1,0 +1,550 @@
+/**
+ * @license
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+import React, { useCallback, useRef, useState } from 'react';
+import { Code2, Grid, ImagePlus } from 'lucide-react';
+import { CanvasViewMode, DarkroomCanvas } from './components/DarkroomCanvas';
+import { InspectorSidebar } from './components/InspectorSidebar';
+import { RustCodeModal } from './components/RustCodeModal';
+import {
+  injectApp1ExifIntoJpegBlob,
+  parseExifFromArrayBuffer,
+} from './utils/exifParser';
+import {
+  CropRect,
+  FrameLayout,
+  LevelingAnalysis,
+  PipelineConfig,
+} from './utils/geometry';
+import { INITIAL_SAMPLE_PHOTOS, StudioPhotoItem } from './utils/samplePhotos';
+
+const DEFAULT_PIPELINE_CONFIG: PipelineConfig = {
+  autoLevelEnabled: true,
+  maxAutoAngleDeg: 15.0,
+  manualAngleOffsetDeg: 0,
+  autoCropEnabled: true,
+  preserveAspectRatioInCrop: true,
+  aspectPreset: '1:1',
+  paddingPercent: 10,
+  backgroundColor: '#FFFFFF',
+  preserveExifMetadata: true,
+  renderExifCaption: true,
+  jpegQuality: 95,
+};
+
+export default function App() {
+  const [photos, setPhotos] = useState<StudioPhotoItem[]>(INITIAL_SAMPLE_PHOTOS);
+  const [selectedId, setSelectedId] = useState<string>(INITIAL_SAMPLE_PHOTOS[0].id);
+  const [config, setConfig] = useState<PipelineConfig>(DEFAULT_PIPELINE_CONFIG);
+  const [viewMode, setViewMode] = useState<CanvasViewMode>('framed');
+  const [splitPercent, setSplitPercent] = useState<number>(50);
+  const [showHorizonGrid, setShowHorizonGrid] = useState<boolean>(false);
+  const [isRustModalOpen, setIsRustModalOpen] = useState<boolean>(false);
+  const [isExporting, setIsExporting] = useState<boolean>(false);
+  const [exportBanner, setExportBanner] = useState<string | null>(null);
+
+  const [analysis, setAnalysis] = useState<LevelingAnalysis>({
+    detectedTiltDeg: 0,
+    appliedRotationDeg: 0,
+    confidence: 0,
+    strongEdgeCount: 0,
+  });
+  const [cropRect, setCropRect] = useState<CropRect>({
+    x: 0,
+    y: 0,
+    width: 1600,
+    height: 900,
+    scaleFactor: 1,
+    areaRetainedPercent: 100,
+  });
+  const [frameLayout, setFrameLayout] = useState<FrameLayout>({
+    canvasWidth: 1800,
+    canvasHeight: 1800,
+    imageX: 180,
+    imageY: 450,
+    imageWidth: 1440,
+    imageHeight: 900,
+    borderTop: 450,
+    borderBottom: 450,
+    borderLeft: 180,
+    borderRight: 180,
+  });
+  const [sourceSize, setSourceSize] = useState<{ width: number; height: number }>({
+    width: 1600,
+    height: 900,
+  });
+
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+
+  const activePhoto = photos.find((p) => p.id === selectedId) || photos[0];
+
+  const handleAnalysisUpdate = useCallback(
+    (
+      newAnalysis: LevelingAnalysis,
+      newCrop: CropRect,
+      newLayout: FrameLayout,
+      newSourceSize: { width: number; height: number }
+    ) => {
+      setAnalysis(newAnalysis);
+      setCropRect(newCrop);
+      setFrameLayout(newLayout);
+      setSourceSize(newSourceSize);
+    },
+    []
+  );
+
+  const handleChangeSimulatedTilt = (deg: number) => {
+    setPhotos((prev) =>
+      prev.map((item) =>
+        item.id === activePhoto.id ? { ...item, simulatedSensorTiltDeg: deg } : item
+      )
+    );
+  };
+
+  const handleResetAll = () => {
+    setConfig(DEFAULT_PIPELINE_CONFIG);
+    setSplitPercent(50);
+    handleChangeSimulatedTilt(0);
+  };
+
+  const handleFileImport = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    const buffer = await file.arrayBuffer();
+    const parsed = parseExifFromArrayBuffer(buffer, file.name);
+    const objectUrl = URL.createObjectURL(file);
+
+    const newItem: StudioPhotoItem = {
+      id: `imported-${Date.now()}`,
+      title: file.name.replace(/\.[^.]+$/, ''),
+      fileName: file.name,
+      src: objectUrl,
+      isRaw: parsed.isRawContainer,
+      simulatedSensorTiltDeg: 0,
+      exif: parsed.exif,
+      rawApp1Segment: parsed.rawApp1Segment,
+    };
+
+    setPhotos((prev) => [newItem, ...prev]);
+    setSelectedId(newItem.id);
+    e.target.value = '';
+  };
+
+  const handleExportJpeg = async () => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    setIsExporting(true);
+    setExportBanner(null);
+
+    try {
+      const quality = Math.max(0.7, Math.min(1.0, config.jpegQuality / 100));
+      const blob = await new Promise<Blob | null>((resolve) =>
+        canvas.toBlob((b) => resolve(b), 'image/jpeg', quality)
+      );
+      if (!blob) {
+        setIsExporting(false);
+        return;
+      }
+
+      const finalBlob = config.preserveExifMetadata
+        ? await injectApp1ExifIntoJpegBlob(blob, activePhoto.rawApp1Segment)
+        : blob;
+
+      const url = URL.createObjectURL(finalBlob);
+      const a = document.createElement('a');
+      const baseName = activePhoto.fileName.replace(/\.[^.]+$/, '');
+      const outName = `${baseName}_whiteborder_${config.aspectPreset.replace(':', 'x')}.jpg`;
+      a.href = url;
+      a.download = outName;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+
+      setExportBanner(
+        `Exported ${outName} (${frameLayout.canvasWidth} × ${frameLayout.canvasHeight} px · ${
+          config.preserveExifMetadata ? 'EXIF Preserved' : 'EXIF Stripped'
+        })`
+      );
+    } finally {
+      setIsExporting(false);
+    }
+  };
+
+  return (
+    <div className="flex min-h-screen lg:h-screen lg:overflow-hidden flex-col bg-[#0b0b0d] text-zinc-100">
+      {/* Hidden File Input for JPEG & Camera RAW */}
+      <input
+        ref={fileInputRef}
+        type="file"
+        accept=".jpg,.jpeg,.png,.webp,.dng,.cr2,.nef,.arw,.raf"
+        onChange={handleFileImport}
+        className="hidden"
+        aria-label="Upload JPEG or RAW photo"
+      />
+
+      {/* Strict 3-Zone Top Bar Contract */}
+      <header className="flex items-center justify-between gap-8 border-b border-zinc-800/90 bg-[#111114] px-6 py-3.5">
+        {/* Zone 1: Single text element wordmark */}
+        <a
+          href="#workspace"
+          onClick={(e) => {
+            e.preventDefault();
+            setViewMode('framed');
+          }}
+          className="font-display text-lg font-bold tracking-tight text-zinc-100 whitespace-nowrap shrink-0"
+        >
+          WhiteBorder Studio
+        </a>
+
+        {/* Zone 2: 5 concise single-line text navigation links */}
+        <nav aria-label="Primary Workspace Views" className="hidden md:flex items-center gap-6 text-xs font-medium text-zinc-400">
+          <a
+            href="#framed"
+            onClick={(e) => {
+              e.preventDefault();
+              setViewMode('framed');
+            }}
+            className={`hover:text-zinc-100 transition-colors whitespace-nowrap shrink-0 ${
+              viewMode === 'framed' ? 'text-zinc-100 underline underline-offset-4' : ''
+            }`}
+          >
+            Framed Canvas
+          </a>
+          <a
+            href="#split"
+            onClick={(e) => {
+              e.preventDefault();
+              setViewMode('split');
+            }}
+            className={`hover:text-zinc-100 transition-colors whitespace-nowrap shrink-0 ${
+              viewMode === 'split' ? 'text-zinc-100 underline underline-offset-4' : ''
+            }`}
+          >
+            Before / After
+          </a>
+          <a
+            href="#geometry"
+            onClick={(e) => {
+              e.preventDefault();
+              setViewMode('geometry');
+            }}
+            className={`hover:text-zinc-100 transition-colors whitespace-nowrap shrink-0 ${
+              viewMode === 'geometry' ? 'text-zinc-100 underline underline-offset-4' : ''
+            }`}
+          >
+            Inscribed Crop
+          </a>
+          <a
+            href="#original"
+            onClick={(e) => {
+              e.preventDefault();
+              setViewMode('original');
+            }}
+            className={`hover:text-zinc-100 transition-colors whitespace-nowrap shrink-0 ${
+              viewMode === 'original' ? 'text-zinc-100 underline underline-offset-4' : ''
+            }`}
+          >
+            Original Sensor
+          </a>
+          <a
+            href="#rust-source"
+            onClick={(e) => {
+              e.preventDefault();
+              setIsRustModalOpen(true);
+            }}
+            className="hover:text-zinc-100 transition-colors whitespace-nowrap shrink-0"
+          >
+            macOS Rust Code
+          </a>
+        </nav>
+
+        {/* Zone 3: 1 primary action */}
+        <div className="flex items-center gap-3 shrink-0">
+          <button
+            type="button"
+            onClick={() => fileInputRef.current?.click()}
+            className="flex items-center gap-1.5 rounded-lg bg-blue-600 px-3.5 py-2 text-xs font-semibold text-white transition-colors hover:bg-blue-500 whitespace-nowrap shrink-0"
+          >
+            <ImagePlus className="h-3.5 w-3.5" />
+            Import JPEG / RAW
+          </button>
+        </div>
+      </header>
+
+      {/* Main 3-Column macOS Studio Layout */}
+      <main className="flex flex-1 flex-col lg:flex-row overflow-hidden">
+        {/* Left Filmstrip Queue (240px on desktop) */}
+        <aside
+          aria-label="Photo Filmstrip Queue"
+          className="flex w-full lg:w-[250px] shrink-0 flex-col border-b lg:border-b-0 lg:border-r border-zinc-800/90 bg-[#111114]"
+        >
+          <div className="flex items-center justify-between border-b border-zinc-800/80 px-4 py-3">
+            <span className="font-display text-xs font-semibold text-zinc-200">
+              Filmstrip Queue ({photos.length})
+            </span>
+            <button
+              type="button"
+              onClick={() => fileInputRef.current?.click()}
+              className="text-xs font-medium text-blue-400 hover:text-blue-300 whitespace-nowrap shrink-0"
+            >
+              + Add File
+            </button>
+          </div>
+
+          <div className="flex lg:flex-col gap-2.5 overflow-x-auto lg:overflow-y-auto p-3">
+            {photos.map((item) => {
+              const isSelected = item.id === activePhoto.id;
+              return (
+                <button
+                  key={item.id}
+                  type="button"
+                  onClick={() => setSelectedId(item.id)}
+                  className={`group flex w-56 lg:w-full shrink-0 flex-col rounded-lg border p-2 text-left transition-colors ${
+                    isSelected
+                      ? 'border-blue-500 bg-zinc-900'
+                      : 'border-zinc-800/80 bg-[#151519] hover:border-zinc-700'
+                  }`}
+                >
+                  <div className="relative h-28 w-full overflow-hidden rounded bg-zinc-950">
+                    <img
+                      src={item.src}
+                      alt={item.title}
+                      referrerPolicy="no-referrer"
+                      className="h-full w-full object-cover transition-transform duration-150 group-hover:scale-[1.02]"
+                    />
+                  </div>
+                  <div className="mt-2">
+                    <div className="truncate text-xs font-semibold text-zinc-100">
+                      {item.title}
+                    </div>
+                    {/* Clean unboxed metadata with typographic separator */}
+                    <div className="mt-0.5 flex items-center gap-1.5 text-[11px] text-zinc-400 font-mono tabular-nums">
+                      <span>{item.fileName}</span>
+                      <span aria-hidden="true">·</span>
+                      <span>
+                        {item.simulatedSensorTiltDeg > 0
+                          ? `+${item.simulatedSensorTiltDeg.toFixed(1)}°`
+                          : `${item.simulatedSensorTiltDeg.toFixed(1)}°`}
+                      </span>
+                    </div>
+                  </div>
+                </button>
+              );
+            })}
+          </div>
+
+          {/* Native macOS Rust Bundle Card */}
+          <div className="mt-auto hidden lg:block border-t border-zinc-800/80 p-4 bg-[#141418]">
+            <div className="text-xs font-semibold text-zinc-200">
+              Native macOS App (Rust)
+            </div>
+            <p className="mt-1 text-[11px] leading-relaxed text-zinc-400">
+              Pure-Rust desktop binary using <code className="text-zinc-200">eframe/egui</code>, <code className="text-zinc-200">rawloader</code>, and <code className="text-zinc-200">img-parts</code>.
+            </p>
+            <button
+              type="button"
+              onClick={() => setIsRustModalOpen(true)}
+              className="mt-3 flex w-full items-center justify-center gap-1.5 rounded-lg border border-zinc-700 bg-zinc-800 px-3 py-2 text-xs font-medium text-zinc-100 transition-colors hover:bg-zinc-700 whitespace-nowrap shrink-0"
+            >
+              <Code2 className="h-3.5 w-3.5 text-blue-400" />
+              View Rust macOS Source
+            </button>
+          </div>
+        </aside>
+
+        {/* Center Interactive Darkroom Viewport */}
+        <section
+          aria-label="Darkroom Canvas Workspace"
+          className="flex flex-1 min-w-0 min-h-0 flex-col bg-[#0b0b0d]"
+        >
+          {/* Workspace Secondary Toolbar */}
+          <div className="flex flex-wrap items-center justify-between gap-2 border-b border-zinc-800/80 bg-[#111114]/60 px-4 py-2">
+            {/* View Mode Segmented Control */}
+            <div
+              className="flex items-center gap-0.5 rounded-lg bg-zinc-900 p-1 border border-zinc-800"
+              role="group"
+              aria-label="Canvas Inspection Mode"
+            >
+              <button
+                type="button"
+                onClick={() => setViewMode('framed')}
+                className={`rounded-md px-2.5 py-1 text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${
+                  viewMode === 'framed'
+                    ? 'bg-zinc-800 text-white shadow-sm'
+                    : 'text-zinc-400 hover:text-zinc-200'
+                }`}
+              >
+                Framed Output
+              </button>
+              <button
+                type="button"
+                onClick={() => setViewMode('split')}
+                className={`rounded-md px-2.5 py-1 text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${
+                  viewMode === 'split'
+                    ? 'bg-blue-600 text-white shadow-sm'
+                    : 'text-zinc-400 hover:text-zinc-200'
+                }`}
+              >
+                Before / After Split
+              </button>
+              <button
+                type="button"
+                onClick={() => setViewMode('geometry')}
+                className={`rounded-md px-2.5 py-1 text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${
+                  viewMode === 'geometry'
+                    ? 'bg-zinc-800 text-white shadow-sm'
+                    : 'text-zinc-400 hover:text-zinc-200'
+                }`}
+              >
+                Inscribed Crop Box
+              </button>
+              <button
+                type="button"
+                onClick={() => setViewMode('original')}
+                className={`rounded-md px-2.5 py-1 text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${
+                  viewMode === 'original'
+                    ? 'bg-zinc-800 text-white shadow-sm'
+                    : 'text-zinc-400 hover:text-zinc-200'
+                }`}
+              >
+                Original Sensor
+              </button>
+            </div>
+
+            <div className="flex items-center gap-2">
+              {/* Interactive Split Position Slider when in Before/After Split mode */}
+              {viewMode === 'split' && (
+                <div className="flex items-center gap-2 rounded-lg border border-zinc-800 bg-zinc-900/90 px-2.5 py-1">
+                  <label
+                    htmlFor="slider-split-position"
+                    className="text-xs text-zinc-300 whitespace-nowrap shrink-0"
+                  >
+                    Split
+                  </label>
+                  <input
+                    id="slider-split-position"
+                    type="range"
+                    aria-label="Before/After Split Position"
+                    min={5}
+                    max={95}
+                    step={1}
+                    value={splitPercent}
+                    onChange={(e) => setSplitPercent(parseFloat(e.target.value))}
+                    className="h-1.5 w-20 cursor-pointer appearance-none rounded-lg bg-zinc-700 accent-blue-500"
+                  />
+                  <span
+                    className="font-mono text-xs text-blue-400 tabular-nums whitespace-nowrap shrink-0"
+                    data-testid="split-percent-val"
+                  >
+                    {Math.round(splitPercent)}%
+                  </span>
+                </div>
+              )}
+
+              <button
+                type="button"
+                onClick={() => setShowHorizonGrid((prev) => !prev)}
+                className={`flex items-center gap-1.5 rounded-lg border px-2.5 py-1 text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${
+                  showHorizonGrid
+                    ? 'border-blue-500/60 bg-blue-500/15 text-blue-300'
+                    : 'border-zinc-800 bg-zinc-900 text-zinc-300 hover:border-zinc-700'
+                }`}
+              >
+                <Grid className="h-3.5 w-3.5" />
+                Horizon Grid
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setIsRustModalOpen(true)}
+                className="flex items-center gap-1.5 rounded-lg border border-zinc-700 bg-zinc-900 px-2.5 py-1 text-xs font-medium text-zinc-200 transition-colors hover:border-zinc-600 hover:text-white whitespace-nowrap shrink-0"
+              >
+                <Code2 className="h-3.5 w-3.5 text-blue-400" />
+                Rust Code
+              </button>
+            </div>
+          </div>
+
+          {/* Export Confirmation Toast Banner */}
+          {exportBanner && (
+            <div className="flex items-center justify-between border-b border-emerald-900/60 bg-emerald-950/40 px-5 py-2 text-xs text-emerald-300">
+              <span className="font-mono">{exportBanner}</span>
+              <button
+                type="button"
+                onClick={() => setExportBanner(null)}
+                className="text-emerald-400 hover:text-emerald-200"
+              >
+                Dismiss
+              </button>
+            </div>
+          )}
+
+          {/* Canvas Stage */}
+          <div className="flex-1 min-h-0 flex items-center justify-center overflow-hidden">
+            <DarkroomCanvas
+              photo={activePhoto}
+              config={config}
+              viewMode={viewMode}
+              splitPercent={splitPercent}
+              onSplitPercentChange={setSplitPercent}
+              showHorizonGrid={showHorizonGrid}
+              onAnalysisUpdate={handleAnalysisUpdate}
+              canvasRef={canvasRef}
+            />
+          </div>
+
+          {/* Quiet Unboxed Metadata Footer Bar */}
+          <footer className="flex flex-wrap items-center justify-between gap-4 border-t border-zinc-800/80 bg-[#111114] px-6 py-2.5 text-xs text-zinc-400 font-mono tabular-nums">
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="text-zinc-200 font-semibold">{activePhoto.fileName}</span>
+              <span aria-hidden="true">·</span>
+              <span>{activePhoto.exif.cameraModel}</span>
+              <span aria-hidden="true">·</span>
+              <span>{activePhoto.exif.lensModel}</span>
+            </div>
+            <div className="flex flex-wrap items-center gap-2">
+              <span>
+                Horizon Tilt: {analysis.detectedTiltDeg > 0 ? `+${analysis.detectedTiltDeg.toFixed(2)}°` : `${analysis.detectedTiltDeg.toFixed(2)}°`}
+              </span>
+              <span aria-hidden="true">·</span>
+              <span>
+                Inscribed Crop: {cropRect.width}×{cropRect.height} ({cropRect.areaRetainedPercent}%)
+              </span>
+              <span aria-hidden="true">·</span>
+              <span>
+                Frame: {frameLayout.canvasWidth}×{frameLayout.canvasHeight} ({config.aspectPreset})
+              </span>
+            </div>
+          </footer>
+        </section>
+
+        {/* Right Inspector Sidebar */}
+        <InspectorSidebar
+          config={config}
+          onChangeConfig={setConfig}
+          analysis={analysis}
+          cropRect={cropRect}
+          frameLayout={frameLayout}
+          sourceSize={sourceSize}
+          exif={activePhoto.exif}
+          simulatedTiltDeg={activePhoto.simulatedSensorTiltDeg}
+          onChangeSimulatedTilt={handleChangeSimulatedTilt}
+          onResetAll={handleResetAll}
+          onExportJpeg={handleExportJpeg}
+          isExporting={isExporting}
+        />
+      </main>
+
+      {/* Native macOS Rust Source Code Modal */}
+      <RustCodeModal
+        isOpen={isRustModalOpen}
+        onClose={() => setIsRustModalOpen(false)}
+      />
+    </div>
+  );
+}
