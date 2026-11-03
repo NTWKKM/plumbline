@@ -1,6 +1,6 @@
 // src/main.rs
 // macOS Native Desktop GUI: WhiteBorder + Auto-Leveling + Inscribed Auto-Crop
-// Run on macOS (Apple Silicon / Intel): \`cargo run --release\`
+// Run on macOS (Apple Silicon / Intel): `cargo run --release`
 
 use eframe::egui;
 use image::{DynamicImage, ImageBuffer, Rgba, RgbaImage};
@@ -16,11 +16,11 @@ use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AspectPreset {
-    Square1x1,      // 1:1 Instagram / Square Fit
-    Portrait4x5,    // 4:5 Editorial Portrait
-    Landscape16x9,  // 16:9 Cinema Frame
-    Classic3x2,     // 3:2 Leica / Full-Frame
-    Original,       // Preserve source aspect ratio
+    Square1x1,     // 1:1 Instagram / Square Fit
+    Portrait4x5,   // 4:5 Editorial Portrait
+    Landscape16x9, // 16:9 Cinema Frame
+    Classic3x2,    // 3:2 Leica / Full-Frame
+    Original,      // Preserve source aspect ratio
 }
 
 impl AspectPreset {
@@ -444,7 +444,7 @@ pub fn detect_auto_level_angle_deg(img: &RgbaImage, max_angle_deg: f32) -> f32 {
 }
 
 /// Computes the Largest Inscribed Axis-Aligned Rectangle preserving original aspect ratio
-/// inside an image of size (w, h) rotated by \`angle_deg\`.
+/// inside an image of size (w, h) rotated by `angle_deg`.
 pub fn compute_inscribed_crop(w: u32, h: u32, angle_deg: f32) -> CropRect {
     let rad = angle_deg.abs().to_radians();
     if rad < 1e-5 || w == 0 || h == 0 {
@@ -853,8 +853,13 @@ fn retain_sub_ifd_tree(
             }
         }
 
+        // SubIFD strip image data: reject when offset and byte count arrays differ in length
+        if strip_offsets.len() != strip_byte_counts.len() {
+            return false;
+        }
+
         // SubIFD strip image data: add to candidate_ranges for clearing, do NOT retain
-        let strip_count = strip_offsets.len().min(strip_byte_counts.len());
+        let strip_count = strip_offsets.len();
         for s in 0..strip_count {
             let s_off = strip_offsets[s];
             let s_len = strip_byte_counts[s];
@@ -862,6 +867,9 @@ fn retain_sub_ifd_tree(
                 if let Some(s_start) = tiff_start.checked_add(s_off) {
                     if let Some(s_end) = s_start.checked_add(s_len) {
                         if s_start >= tiff_start + 8 {
+                            if candidate_ranges.len() >= MAX_SUB_IFD_PREVIEW_CANDIDATES {
+                                return false;
+                            }
                             candidate_ranges.push((s_start, s_end));
                         }
                     }
@@ -1261,11 +1269,30 @@ pub fn save_jpeg_preserving_exif(
             let mut parsed_jpeg = Jpeg::from_bytes(jpeg_buf.clone().into())
                 .map_err(|e| format!("JPEG parse error: {e}"))?;
             parsed_jpeg.set_exif(Some(raw_exif.into()));
-            let out_file = File::create(dest).map_err(|e| e.to_string())?;
-            parsed_jpeg
-                .encoder()
-                .write_to(out_file)
-                .map_err(|e| format!("EXIF write error: {e}"))?;
+
+            let parent = dest.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
+            let file_stem = dest.file_name().and_then(|n| n.to_str()).unwrap_or("output.jpg");
+            let unique_nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let tmp_path = parent.join(format!(".{file_stem}.{}.{unique_nanos}.tmp", std::process::id()));
+
+            let out_file = File::create(&tmp_path).map_err(|e| e.to_string())?;
+            if let Err(e) = parsed_jpeg.encoder().write_to(&out_file) {
+                let _ = std::fs::remove_file(&tmp_path);
+                return Err(format!("EXIF write error: {e}"));
+            }
+            if let Err(e) = out_file.sync_all() {
+                let _ = std::fs::remove_file(&tmp_path);
+                return Err(format!("File sync error: {e}"));
+            }
+            drop(out_file);
+
+            std::fs::rename(&tmp_path, dest).map_err(|e| {
+                let _ = std::fs::remove_file(&tmp_path);
+                format!("File rename error: {e}")
+            })?;
             return Ok(());
         }
     }
@@ -2440,6 +2467,53 @@ mod tests {
     }
 
     #[test]
+    fn test_update_app1_exif_rejects_sub_ifd_with_mismatched_strip_counts() {
+        let total_len = 160;
+        let mut app1 = vec![0u8; total_len];
+        app1[0] = 0xff;
+        app1[1] = 0xe1;
+        let marker_len = (total_len - 2) as u16;
+        app1[2..4].copy_from_slice(&marker_len.to_be_bytes());
+        app1[4..10].copy_from_slice(b"Exif\0\0");
+
+        let tiff_start = 10;
+        app1[tiff_start..tiff_start + 2].copy_from_slice(b"II");
+        app1[tiff_start + 2..tiff_start + 4].copy_from_slice(&42u16.to_le_bytes());
+        app1[tiff_start + 4..tiff_start + 8].copy_from_slice(&8u32.to_le_bytes());
+
+        // IFD0 at rel 8 pointing to SubIFD at rel 26
+        let ifd0 = tiff_start + 8;
+        app1[ifd0..ifd0 + 2].copy_from_slice(&1u16.to_le_bytes());
+        let e0 = ifd0 + 2;
+        app1[e0..e0 + 2].copy_from_slice(&0x014au16.to_le_bytes());
+        app1[e0 + 2..e0 + 4].copy_from_slice(&4u16.to_le_bytes());
+        app1[e0 + 4..e0 + 8].copy_from_slice(&1u32.to_le_bytes());
+        app1[e0 + 8..e0 + 12].copy_from_slice(&26u32.to_le_bytes());
+        app1[e0 + 12..e0 + 16].copy_from_slice(&0u32.to_le_bytes());
+
+        // SubIFD at rel 26: 0x0111 (StripOffsets) count 2, but 0x0117 (StripByteCounts) count 1
+        let sub = tiff_start + 26;
+        app1[sub..sub + 2].copy_from_slice(&2u16.to_le_bytes());
+        let sub_e0 = sub + 2;
+        app1[sub_e0..sub_e0 + 2].copy_from_slice(&0x0111u16.to_le_bytes());
+        app1[sub_e0 + 2..sub_e0 + 4].copy_from_slice(&4u16.to_le_bytes());
+        app1[sub_e0 + 4..sub_e0 + 8].copy_from_slice(&2u32.to_le_bytes());
+        app1[sub_e0 + 8..sub_e0 + 12].copy_from_slice(&56u32.to_le_bytes()); // table at rel 56
+
+        let sub_e1 = sub_e0 + 12;
+        app1[sub_e1..sub_e1 + 2].copy_from_slice(&0x0117u16.to_le_bytes());
+        app1[sub_e1 + 2..sub_e1 + 4].copy_from_slice(&4u16.to_le_bytes());
+        app1[sub_e1 + 4..sub_e1 + 8].copy_from_slice(&1u32.to_le_bytes());
+        app1[sub_e1 + 8..sub_e1 + 12].copy_from_slice(&10u32.to_le_bytes()); // single byte count
+
+        // Offsets table at rel 56: [72, 86]
+        app1[tiff_start + 56..tiff_start + 60].copy_from_slice(&72u32.to_le_bytes());
+        app1[tiff_start + 60..tiff_start + 64].copy_from_slice(&86u32.to_le_bytes());
+
+        assert!(!update_app1_exif_for_export(&mut app1, 1000, 1000, 1));
+    }
+
+    #[test]
     fn test_update_app1_exif_fails_when_preview_candidates_cap_exceeded() {
         let count = MAX_SUB_IFD_PREVIEW_CANDIDATES + 1;
         let total_len = 10 + 26 + 30 + count * 4 * 2 + 100;
@@ -2482,6 +2556,59 @@ mod tests {
         app1[sub_e1 + 8..sub_e1 + 12].copy_from_slice(&(lengths_rel as u32).to_le_bytes());
 
         // Populate valid offsets and lengths
+        for i in 0..count {
+            let off = (lengths_rel + count * 4 + i * 4) as u32;
+            app1[tiff_start + offsets_rel + i * 4..tiff_start + offsets_rel + (i + 1) * 4]
+                .copy_from_slice(&off.to_le_bytes());
+            app1[tiff_start + lengths_rel + i * 4..tiff_start + lengths_rel + (i + 1) * 4]
+                .copy_from_slice(&4u32.to_le_bytes());
+        }
+
+        assert!(!update_app1_exif_for_export(&mut app1, 1000, 1000, 1));
+    }
+
+    #[test]
+    fn test_update_app1_exif_fails_when_strip_candidates_cap_exceeded() {
+        let count = MAX_SUB_IFD_PREVIEW_CANDIDATES + 1;
+        let total_len = 10 + 26 + 30 + count * 4 * 2 + 100;
+        let mut app1 = vec![0u8; total_len];
+        app1[0] = 0xff;
+        app1[1] = 0xe1;
+        let marker_len = (total_len - 2) as u16;
+        app1[2..4].copy_from_slice(&marker_len.to_be_bytes());
+        app1[4..10].copy_from_slice(b"Exif\0\0");
+
+        let tiff_start = 10;
+        app1[tiff_start..tiff_start + 2].copy_from_slice(b"II");
+        app1[tiff_start + 2..tiff_start + 4].copy_from_slice(&42u16.to_le_bytes());
+        app1[tiff_start + 4..tiff_start + 8].copy_from_slice(&8u32.to_le_bytes());
+
+        // IFD0 at rel 8 pointing to SubIFD at rel 26
+        let ifd0 = tiff_start + 8;
+        app1[ifd0..ifd0 + 2].copy_from_slice(&1u16.to_le_bytes());
+        let e0 = ifd0 + 2;
+        app1[e0..e0 + 2].copy_from_slice(&0x014au16.to_le_bytes());
+        app1[e0 + 2..e0 + 4].copy_from_slice(&4u16.to_le_bytes());
+        app1[e0 + 4..e0 + 8].copy_from_slice(&1u32.to_le_bytes());
+        app1[e0 + 8..e0 + 12].copy_from_slice(&26u32.to_le_bytes());
+
+        // SubIFD at rel 26 using StripOffsets (0x0111) and StripByteCounts (0x0117)
+        let sub = tiff_start + 26;
+        app1[sub..sub + 2].copy_from_slice(&2u16.to_le_bytes());
+        let sub_e0 = sub + 2;
+        app1[sub_e0..sub_e0 + 2].copy_from_slice(&0x0111u16.to_le_bytes());
+        app1[sub_e0 + 2..sub_e0 + 4].copy_from_slice(&4u16.to_le_bytes());
+        app1[sub_e0 + 4..sub_e0 + 8].copy_from_slice(&(count as u32).to_le_bytes());
+        let offsets_rel = 60;
+        app1[sub_e0 + 8..sub_e0 + 12].copy_from_slice(&(offsets_rel as u32).to_le_bytes());
+
+        let sub_e1 = sub_e0 + 12;
+        app1[sub_e1..sub_e1 + 2].copy_from_slice(&0x0117u16.to_le_bytes());
+        app1[sub_e1 + 2..sub_e1 + 4].copy_from_slice(&4u16.to_le_bytes());
+        app1[sub_e1 + 4..sub_e1 + 8].copy_from_slice(&(count as u32).to_le_bytes());
+        let lengths_rel = offsets_rel + count * 4;
+        app1[sub_e1 + 8..sub_e1 + 12].copy_from_slice(&(lengths_rel as u32).to_le_bytes());
+
         for i in 0..count {
             let off = (lengths_rel + count * 4 + i * 4) as u32;
             app1[tiff_start + offsets_rel + i * 4..tiff_start + offsets_rel + (i + 1) * 4]
@@ -2605,5 +2732,113 @@ mod tests {
         let res = save_jpeg_preserving_exif(&img, &exif, &cfg, &dest);
         assert!(res.is_err());
         assert!(!dest.exists());
+    }
+
+    #[test]
+    fn test_save_jpeg_preserving_exif_succeeds_and_updates_metadata() {
+        let img = RgbaImage::from_pixel(32, 24, Rgba([200, 100, 50, 255]));
+        let mut exif = ExifSummary::default();
+        exif.orientation = 6; // Source had 90° CW orientation, should be reset to 1 on export
+
+        // Construct valid raw_app1_bytes (Exif\0\0 + TIFF header + IFD0 + ExifSubIFD)
+        let mut app1 = vec![0u8; 160];
+        app1[0..6].copy_from_slice(b"Exif\0\0");
+        let tiff_start = 6;
+        app1[tiff_start..tiff_start + 2].copy_from_slice(b"II");
+        app1[tiff_start + 2..tiff_start + 4].copy_from_slice(&42u16.to_le_bytes());
+        app1[tiff_start + 4..tiff_start + 8].copy_from_slice(&8u32.to_le_bytes());
+
+        // IFD0 at rel 8 (5 entries: ImageWidth 0x0100, ImageLength 0x0101, Model 0x0110, Orientation 0x0112, ExifSubIFD 0x8769)
+        let ifd0 = tiff_start + 8;
+        app1[ifd0..ifd0 + 2].copy_from_slice(&5u16.to_le_bytes());
+
+        // Entry 0: 0x0100 ImageWidth = 100 (will be updated to 32)
+        let e0 = ifd0 + 2;
+        app1[e0..e0 + 2].copy_from_slice(&0x0100u16.to_le_bytes());
+        app1[e0 + 2..e0 + 4].copy_from_slice(&4u16.to_le_bytes()); // LONG
+        app1[e0 + 4..e0 + 8].copy_from_slice(&1u32.to_le_bytes());
+        app1[e0 + 8..e0 + 12].copy_from_slice(&100u32.to_le_bytes());
+
+        // Entry 1: 0x0101 ImageLength = 100 (will be updated to 24)
+        let e1 = e0 + 12;
+        app1[e1..e1 + 2].copy_from_slice(&0x0101u16.to_le_bytes());
+        app1[e1 + 2..e1 + 4].copy_from_slice(&4u16.to_le_bytes()); // LONG
+        app1[e1 + 4..e1 + 8].copy_from_slice(&1u32.to_le_bytes());
+        app1[e1 + 8..e1 + 12].copy_from_slice(&100u32.to_le_bytes());
+
+        // Entry 2: 0x0110 Model = "TESTCAM\0" at rel 120
+        let e2 = e1 + 12;
+        app1[e2..e2 + 2].copy_from_slice(&0x0110u16.to_le_bytes());
+        app1[e2 + 2..e2 + 4].copy_from_slice(&2u16.to_le_bytes()); // ASCII
+        app1[e2 + 4..e2 + 8].copy_from_slice(&8u32.to_le_bytes());
+        app1[e2 + 8..e2 + 12].copy_from_slice(&120u32.to_le_bytes());
+        app1[tiff_start + 120..tiff_start + 128].copy_from_slice(b"TESTCAM\0");
+
+        // Entry 3: 0x0112 Orientation = 6 (will be reset to 1)
+        let e3 = e2 + 12;
+        app1[e3..e3 + 2].copy_from_slice(&0x0112u16.to_le_bytes());
+        app1[e3 + 2..e3 + 4].copy_from_slice(&3u16.to_le_bytes()); // SHORT
+        app1[e3 + 4..e3 + 8].copy_from_slice(&1u32.to_le_bytes());
+        app1[e3 + 8..e3 + 10].copy_from_slice(&6u16.to_le_bytes());
+
+        // Entry 4: 0x8769 ExifSubIFD at rel 80
+        let e4 = e3 + 12;
+        app1[e4..e4 + 2].copy_from_slice(&0x8769u16.to_le_bytes());
+        app1[e4 + 2..e4 + 4].copy_from_slice(&4u16.to_le_bytes()); // LONG
+        app1[e4 + 4..e4 + 8].copy_from_slice(&1u32.to_le_bytes());
+        app1[e4 + 8..e4 + 12].copy_from_slice(&80u32.to_le_bytes());
+        app1[e4 + 12..e4 + 16].copy_from_slice(&0u32.to_le_bytes()); // next IFD = 0
+
+        // ExifSubIFD at rel 80 (2 entries: PixelXDimension 0xA002, PixelYDimension 0xA003)
+        let sub = tiff_start + 80;
+        app1[sub..sub + 2].copy_from_slice(&2u16.to_le_bytes());
+        let s0 = sub + 2;
+        app1[s0..s0 + 2].copy_from_slice(&0xa002u16.to_le_bytes());
+        app1[s0 + 2..s0 + 4].copy_from_slice(&4u16.to_le_bytes());
+        app1[s0 + 4..s0 + 8].copy_from_slice(&1u32.to_le_bytes());
+        app1[s0 + 8..s0 + 12].copy_from_slice(&100u32.to_le_bytes());
+
+        let s1 = s0 + 12;
+        app1[s1..s1 + 2].copy_from_slice(&0xa003u16.to_le_bytes());
+        app1[s1 + 2..s1 + 4].copy_from_slice(&4u16.to_le_bytes());
+        app1[s1 + 4..s1 + 8].copy_from_slice(&1u32.to_le_bytes());
+        app1[s1 + 8..s1 + 12].copy_from_slice(&100u32.to_le_bytes());
+        app1[s1 + 12..s1 + 16].copy_from_slice(&0u32.to_le_bytes());
+
+        exif.raw_app1_bytes = Some(app1);
+
+        let mut cfg = ProcessConfig::default();
+        cfg.preserve_exif = true;
+
+        let dest = std::env::temp_dir().join("test_save_jpeg_preserving_exif_ok.jpg");
+        if dest.exists() {
+            let _ = std::fs::remove_file(&dest);
+        }
+
+        let res = save_jpeg_preserving_exif(&img, &exif, &cfg, &dest);
+        assert!(res.is_ok(), "Expected save_jpeg_preserving_exif to succeed, got: {:?}", res);
+        assert!(dest.exists());
+
+        let saved_bytes = std::fs::read(&dest).expect("Failed to read saved destination JPEG");
+        let parsed_summary = parse_exif_from_bytes(&saved_bytes);
+        assert_eq!(parsed_summary.camera_model, "TESTCAM");
+        assert_eq!(parsed_summary.orientation, 1);
+
+        let saved_exif = parsed_summary.raw_app1_bytes.expect("Saved JPEG should contain EXIF APP1 bytes");
+        let saved_tiff = if saved_exif.starts_with(b"Exif\0\0") { 6 } else { 0 };
+        let saved_ifd0 = saved_tiff + 8;
+        let saved_e0 = saved_ifd0 + 2;
+        let saved_e1 = saved_e0 + 12;
+        let saved_sub = saved_tiff + 80;
+        let saved_s0 = saved_sub + 2;
+        let saved_s1 = saved_s0 + 12;
+
+        // Verify updated ImageWidth (32) and ImageLength (24) in IFD0 and ExifSubIFD
+        assert_eq!(u32::from_le_bytes(saved_exif[saved_e0 + 8..saved_e0 + 12].try_into().unwrap()), 32);
+        assert_eq!(u32::from_le_bytes(saved_exif[saved_e1 + 8..saved_e1 + 12].try_into().unwrap()), 24);
+        assert_eq!(u32::from_le_bytes(saved_exif[saved_s0 + 8..saved_s0 + 12].try_into().unwrap()), 32);
+        assert_eq!(u32::from_le_bytes(saved_exif[saved_s1 + 8..saved_s1 + 12].try_into().unwrap()), 24);
+
+        let _ = std::fs::remove_file(&dest);
     }
 }
