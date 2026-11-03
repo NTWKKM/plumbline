@@ -703,13 +703,20 @@ fn retain_sub_ifd_tree(
     tiff_start: usize,
     sub_rel: usize,
     is_le: bool,
-    visited: &mut std::collections::HashSet<usize>,
+    visited: &mut std::collections::HashMap<usize, usize>,
     retained_ranges: &mut Vec<(usize, usize)>,
     depth: usize,
 ) {
-    if depth > 4 || sub_rel < 8 || !visited.insert(sub_rel) {
+    if depth > 4 || sub_rel < 8 {
         return;
     }
+    if let Some(&min_depth) = visited.get(&sub_rel) {
+        if depth >= min_depth {
+            return;
+        }
+    }
+    visited.insert(sub_rel, depth);
+
     let sub_offset = tiff_start + sub_rel;
     if sub_offset < tiff_start + 8 || sub_offset + 2 > bytes.len() {
         return;
@@ -733,6 +740,11 @@ fn retain_sub_ifd_tree(
     let sub_end = (sub_offset + 2 + sub_entries * 12 + 4).min(bytes.len());
     retained_ranges.push((sub_offset, sub_end));
 
+    let mut jpeg_offset = 0;
+    let mut jpeg_length = 0;
+    let mut strip_offsets: Vec<usize> = Vec::new();
+    let mut strip_byte_counts: Vec<usize> = Vec::new();
+
     for s in 0..sub_entries {
         let s_pos = sub_offset + 2 + s * 12;
         if s_pos + 12 > bytes.len() {
@@ -753,8 +765,8 @@ fn retain_sub_ifd_tree(
             }
         }
 
-        // Detect nested SubIFD directories (tag 0x014a or IFD pointer type 13)
-        if (s_tag == 0x014a || s_type == 13) && s_count >= 1 {
+        // Detect nested SubIFD directories (tag 0x014a or IFD pointer type 13) or ExifIFD (tag 0x8769)
+        if (s_tag == 0x014a || s_type == 13 || s_tag == 0x8769) && s_count >= 1 {
             let nested_offsets = read_uint_array(
                 bytes,
                 tiff_start,
@@ -768,6 +780,70 @@ fn retain_sub_ifd_tree(
                     bytes,
                     tiff_start,
                     n_rel,
+                    is_le,
+                    visited,
+                    retained_ranges,
+                    depth + 1,
+                );
+            }
+        }
+
+        // Image data tags in SubIFD
+        if s_tag == 0x0201 && (s_type == 3 || s_type == 4) {
+            let arr = read_uint_array(bytes, tiff_start, s_pos, s_type, s_count, is_le);
+            if let Some(&off) = arr.first() {
+                jpeg_offset = off;
+            }
+        } else if s_tag == 0x0202 && (s_type == 3 || s_type == 4) {
+            let arr = read_uint_array(bytes, tiff_start, s_pos, s_type, s_count, is_le);
+            if let Some(&len) = arr.first() {
+                jpeg_length = len;
+            }
+        } else if s_tag == 0x0111 && (s_type == 3 || s_type == 4) {
+            strip_offsets = read_uint_array(bytes, tiff_start, s_pos, s_type, s_count, is_le);
+        } else if s_tag == 0x0117 && (s_type == 3 || s_type == 4) {
+            strip_byte_counts = read_uint_array(bytes, tiff_start, s_pos, s_type, s_count, is_le);
+        }
+    }
+
+    // Retain JPEG thumbnail/preview image data if present in SubIFD
+    if jpeg_offset >= 8 && jpeg_length > 0 {
+        if let Some(j_start) = tiff_start.checked_add(jpeg_offset) {
+            if let Some(j_end) = j_start.checked_add(jpeg_length) {
+                if j_start >= tiff_start + 8 && j_end <= bytes.len() {
+                    retained_ranges.push((j_start, j_end));
+                }
+            }
+        }
+    }
+
+    // Retain strip image data if present in SubIFD
+    let strip_count = strip_offsets.len().min(strip_byte_counts.len());
+    for s in 0..strip_count {
+        let s_off = strip_offsets[s];
+        let s_len = strip_byte_counts[s];
+        if s_off >= 8 && s_len > 0 {
+            if let Some(s_start) = tiff_start.checked_add(s_off) {
+                if let Some(s_end) = s_start.checked_add(s_len) {
+                    if s_start >= tiff_start + 8 && s_end <= bytes.len() {
+                        retained_ranges.push((s_start, s_end));
+                    }
+                }
+            }
+        }
+    }
+
+    // Follow chained next-IFD pointer if present
+    let next_ptr_offset = (sub_entries.checked_mul(12))
+        .and_then(|entries_len| sub_offset.checked_add(2 + entries_len));
+    if let Some(next_ptr_pos) = next_ptr_offset {
+        if next_ptr_pos + 4 <= bytes.len() {
+            let next_rel = read_u32(bytes, next_ptr_pos) as usize;
+            if next_rel >= 8 {
+                retain_sub_ifd_tree(
+                    bytes,
+                    tiff_start,
+                    next_rel,
                     is_le,
                     visited,
                     retained_ranges,
@@ -834,7 +910,8 @@ fn update_app1_exif_for_export(bytes: &mut [u8], width: u32, height: u32, orient
     }
     let entries = read_u16(bytes, ifd0_offset) as usize;
     let mut exif_sub_ifd_offset = 0;
-    let mut visited_sub_ifds: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut visited_sub_ifds: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    visited_sub_ifds.insert(first_ifd_rel, 0);
 
     let mut retained_ranges: Vec<(usize, usize)> = Vec::new();
     retained_ranges.push((0, tiff_start + 8));
@@ -1625,11 +1702,12 @@ mod tests {
 
     #[test]
     fn test_update_app1_exif_preserves_sub_ifd_overlap() {
-        let mut app1 = vec![0u8; 180];
+        let total_len = 180;
+        let mut app1 = vec![0u8; total_len];
         app1[0] = 0xff;
         app1[1] = 0xe1;
-        app1[2] = 0x00;
-        app1[3] = 178;
+        let marker_len = (total_len - 2) as u16;
+        app1[2..4].copy_from_slice(&marker_len.to_be_bytes());
         app1[4..10].copy_from_slice(b"Exif\0\0");
 
         let tiff_start = 10;
@@ -1638,7 +1716,7 @@ mod tests {
         app1[tiff_start + 4..tiff_start + 8].copy_from_slice(&8u32.to_le_bytes());
 
         // IFD0 at rel 8 (len 2 + 1*12 + 4 = 18 -> rel 8..26):
-        // 1 entry: 0x014a (SubIFDs) pointing to rel 36
+        // 1 entry: 0x014a (SubIFDs) pointing to SubIFD1 at rel 36
         let ifd0 = tiff_start + 8;
         app1[ifd0..ifd0 + 2].copy_from_slice(&1u16.to_le_bytes());
         let e0 = ifd0 + 2;
@@ -1647,22 +1725,34 @@ mod tests {
         app1[e0 + 4..e0 + 8].copy_from_slice(&1u32.to_le_bytes()); // count 1
         app1[e0 + 8..e0 + 12].copy_from_slice(&36u32.to_le_bytes()); // rel 36
 
-        // IFD0 next pointer: IFD1 at rel 80
-        app1[e0 + 12..e0 + 16].copy_from_slice(&80u32.to_le_bytes());
+        // IFD0 next pointer: IFD1 at rel 100
+        app1[e0 + 12..e0 + 16].copy_from_slice(&100u32.to_le_bytes());
 
-        // SubIFD at rel 36 (len 2 + 1*12 + 4 = 18 -> rel 36..54):
+        // SubIFD1 at rel 36 (len 2 + 1*12 + 4 = 18 -> rel 36..54):
+        // 1 entry: 0x014a (SubIFDs) pointing to Child SubIFD2 at rel 58
+        let sub_ifd1 = tiff_start + 36;
+        app1[sub_ifd1..sub_ifd1 + 2].copy_from_slice(&1u16.to_le_bytes());
+        let sub1_e0 = sub_ifd1 + 2;
+        app1[sub1_e0..sub1_e0 + 2].copy_from_slice(&0x014au16.to_le_bytes()); // nested SubIFDs
+        app1[sub1_e0 + 2..sub1_e0 + 4].copy_from_slice(&4u16.to_le_bytes()); // LONG
+        app1[sub1_e0 + 4..sub1_e0 + 8].copy_from_slice(&1u32.to_le_bytes()); // count 1
+        app1[sub1_e0 + 8..sub1_e0 + 12].copy_from_slice(&58u32.to_le_bytes()); // rel 58
+        app1[sub1_e0 + 12..sub1_e0 + 16].copy_from_slice(&0u32.to_le_bytes());
+
+        // Child SubIFD2 at rel 58 (len 2 + 1*12 + 4 = 18 -> rel 58..76):
+        // Lies within IFD1 thumbnail candidate range rel 30..82
         // 1 entry: 0x0100 (ImageWidth) SHORT value 1920
-        let sub_ifd = tiff_start + 36;
-        app1[sub_ifd..sub_ifd + 2].copy_from_slice(&1u16.to_le_bytes());
-        let sub_e0 = sub_ifd + 2;
-        app1[sub_e0..sub_e0 + 2].copy_from_slice(&0x0100u16.to_le_bytes());
-        app1[sub_e0 + 2..sub_e0 + 4].copy_from_slice(&3u16.to_le_bytes()); // SHORT
-        app1[sub_e0 + 4..sub_e0 + 8].copy_from_slice(&1u32.to_le_bytes());
-        app1[sub_e0 + 8..sub_e0 + 10].copy_from_slice(&1920u16.to_le_bytes());
-        app1[sub_e0 + 12..sub_e0 + 16].copy_from_slice(&0u32.to_le_bytes());
+        let child_ifd2 = tiff_start + 58;
+        app1[child_ifd2..child_ifd2 + 2].copy_from_slice(&1u16.to_le_bytes());
+        let child2_e0 = child_ifd2 + 2;
+        app1[child2_e0..child2_e0 + 2].copy_from_slice(&0x0100u16.to_le_bytes());
+        app1[child2_e0 + 2..child2_e0 + 4].copy_from_slice(&3u16.to_le_bytes()); // SHORT
+        app1[child2_e0 + 4..child2_e0 + 8].copy_from_slice(&1u32.to_le_bytes());
+        app1[child2_e0 + 8..child2_e0 + 10].copy_from_slice(&1920u16.to_le_bytes());
+        app1[child2_e0 + 12..child2_e0 + 16].copy_from_slice(&0u32.to_le_bytes());
 
-        // IFD1 at rel 80 with thumbnail candidate covering rel 30..60 (overlaps SubIFD at rel 36..54)
-        let ifd1 = tiff_start + 80;
+        // IFD1 at rel 100 with thumbnail candidate covering rel 30..82 (overlaps SubIFD1 and Child SubIFD2)
+        let ifd1 = tiff_start + 100;
         app1[ifd1..ifd1 + 2].copy_from_slice(&2u16.to_le_bytes());
         let ifd1_e0 = ifd1 + 2;
         app1[ifd1_e0..ifd1_e0 + 2].copy_from_slice(&0x0201u16.to_le_bytes());
@@ -1674,30 +1764,137 @@ mod tests {
         app1[ifd1_e1..ifd1_e1 + 2].copy_from_slice(&0x0202u16.to_le_bytes());
         app1[ifd1_e1 + 2..ifd1_e1 + 4].copy_from_slice(&4u16.to_le_bytes());
         app1[ifd1_e1 + 4..ifd1_e1 + 8].copy_from_slice(&1u32.to_le_bytes());
-        app1[ifd1_e1 + 8..ifd1_e1 + 12].copy_from_slice(&30u32.to_le_bytes()); // len 30 -> rel 30..60
+        app1[ifd1_e1 + 8..ifd1_e1 + 12].copy_from_slice(&52u32.to_le_bytes()); // len 52 -> rel 30..82
         app1[ifd1_e1 + 12..ifd1_e1 + 16].copy_from_slice(&0u32.to_le_bytes());
 
         // Fill gap rel 30..36 with 0xAA
         app1[tiff_start + 30..tiff_start + 36].fill(0xaa);
-        // Fill gap rel 54..60 with 0xBB
-        app1[tiff_start + 54..tiff_start + 60].fill(0xbb);
+        // Fill gap rel 54..58 with 0xCC
+        app1[tiff_start + 54..tiff_start + 58].fill(0xcc);
+        // Fill gap rel 76..82 with 0xBB
+        app1[tiff_start + 76..tiff_start + 82].fill(0xbb);
 
         update_app1_exif_for_export(&mut app1, 1000, 1000, 1);
 
-        // SubIFD directory and entry must remain intact
-        assert_eq!(&app1[sub_e0..sub_e0 + 2], &0x0100u16.to_le_bytes());
-        assert_eq!(&app1[sub_e0 + 8..sub_e0 + 10], &1920u16.to_le_bytes());
+        // SubIFD1 directory and entry must remain intact
+        assert_eq!(&app1[sub1_e0..sub1_e0 + 2], &0x014au16.to_le_bytes());
+        assert_eq!(&app1[sub1_e0 + 8..sub1_e0 + 12], &58u32.to_le_bytes());
 
-        // Disjoint gaps must be zeroed
+        // Child SubIFD2 directory and entry must remain intact (verifies nested SubIFD traversal)
+        assert_eq!(&app1[child2_e0..child2_e0 + 2], &0x0100u16.to_le_bytes());
+        assert_eq!(&app1[child2_e0 + 8..child2_e0 + 10], &1920u16.to_le_bytes());
+
+        // Disjoint gaps outside retained directories must be zeroed
         for b in &app1[tiff_start + 30..tiff_start + 36] {
             assert_eq!(*b, 0x00);
         }
-        for b in &app1[tiff_start + 54..tiff_start + 60] {
+        for b in &app1[tiff_start + 54..tiff_start + 58] {
+            assert_eq!(*b, 0x00);
+        }
+        for b in &app1[tiff_start + 76..tiff_start + 82] {
             assert_eq!(*b, 0x00);
         }
 
         // IFD1 pointer zeroed
         assert_eq!(&app1[e0 + 12..e0 + 16], &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn test_update_app1_exif_sub_ifd_chained_next_and_strips() {
+        let total_len = 160;
+        let mut app1 = vec![0u8; total_len];
+        app1[0] = 0xff;
+        app1[1] = 0xe1;
+        let marker_len = (total_len - 2) as u16;
+        app1[2..4].copy_from_slice(&marker_len.to_be_bytes());
+        app1[4..10].copy_from_slice(b"Exif\0\0");
+
+        let tiff_start = 10;
+        app1[tiff_start..tiff_start + 2].copy_from_slice(b"II");
+        app1[tiff_start + 2..tiff_start + 4].copy_from_slice(&42u16.to_le_bytes());
+        app1[tiff_start + 4..tiff_start + 8].copy_from_slice(&8u32.to_le_bytes());
+
+        // IFD0 at rel 8 (len 18 -> rel 8..26):
+        // 1 entry: 0x014a (SubIFDs) pointing to SubIFD1 at rel 26
+        let ifd0 = tiff_start + 8;
+        app1[ifd0..ifd0 + 2].copy_from_slice(&1u16.to_le_bytes());
+        let e0 = ifd0 + 2;
+        app1[e0..e0 + 2].copy_from_slice(&0x014au16.to_le_bytes());
+        app1[e0 + 2..e0 + 4].copy_from_slice(&4u16.to_le_bytes());
+        app1[e0 + 4..e0 + 8].copy_from_slice(&1u32.to_le_bytes());
+        app1[e0 + 8..e0 + 12].copy_from_slice(&26u32.to_le_bytes()); // rel 26
+        app1[e0 + 12..e0 + 16].copy_from_slice(&110u32.to_le_bytes()); // IFD1 at rel 110
+
+        // SubIFD1 at rel 26 (len 2 + 2*12 + 4 = 30 -> rel 26..56):
+        // Entry 0: 0x0111 (StripOffsets) LONG count 1, value 70
+        // Entry 1: 0x0117 (StripByteCounts) LONG count 1, value 10 (data at rel 70..80)
+        // Next pointer: chained to SubIFD2 at rel 56
+        let sub1 = tiff_start + 26;
+        app1[sub1..sub1 + 2].copy_from_slice(&2u16.to_le_bytes());
+        let sub1_e0 = sub1 + 2;
+        app1[sub1_e0..sub1_e0 + 2].copy_from_slice(&0x0111u16.to_le_bytes());
+        app1[sub1_e0 + 2..sub1_e0 + 4].copy_from_slice(&4u16.to_le_bytes());
+        app1[sub1_e0 + 4..sub1_e0 + 8].copy_from_slice(&1u32.to_le_bytes());
+        app1[sub1_e0 + 8..sub1_e0 + 12].copy_from_slice(&70u32.to_le_bytes()); // strip at rel 70
+
+        let sub1_e1 = sub1_e0 + 12;
+        app1[sub1_e1..sub1_e1 + 2].copy_from_slice(&0x0117u16.to_le_bytes());
+        app1[sub1_e1 + 2..sub1_e1 + 4].copy_from_slice(&4u16.to_le_bytes());
+        app1[sub1_e1 + 4..sub1_e1 + 8].copy_from_slice(&1u32.to_le_bytes());
+        app1[sub1_e1 + 8..sub1_e1 + 12].copy_from_slice(&10u32.to_le_bytes()); // strip len 10 -> rel 70..80
+
+        // SubIFD1 next IFD pointer -> SubIFD2 at rel 56
+        app1[sub1_e1 + 12..sub1_e1 + 16].copy_from_slice(&56u32.to_le_bytes());
+
+        // Chained SubIFD2 at rel 56 (len 2 + 1*12 + 4 = 18 -> rel 56..74):
+        // Entry 0: 0x0100 (ImageWidth) SHORT value 800
+        let sub2 = tiff_start + 56;
+        app1[sub2..sub2 + 2].copy_from_slice(&1u16.to_le_bytes());
+        let sub2_e0 = sub2 + 2;
+        app1[sub2_e0..sub2_e0 + 2].copy_from_slice(&0x0100u16.to_le_bytes());
+        app1[sub2_e0 + 2..sub2_e0 + 4].copy_from_slice(&3u16.to_le_bytes());
+        app1[sub2_e0 + 4..sub2_e0 + 8].copy_from_slice(&1u32.to_le_bytes());
+        app1[sub2_e0 + 8..sub2_e0 + 10].copy_from_slice(&800u16.to_le_bytes());
+        app1[sub2_e0 + 12..sub2_e0 + 16].copy_from_slice(&0u32.to_le_bytes());
+
+        // Put pattern in strip data rel 70..80
+        app1[tiff_start + 70..tiff_start + 80].fill(0x55);
+
+        // IFD1 at rel 110: thumbnail candidate covering rel 50..90
+        // Overlaps SubIFD1 next ptr (50..56), SubIFD2 (56..74), and strip data (70..80)
+        let ifd1 = tiff_start + 110;
+        app1[ifd1..ifd1 + 2].copy_from_slice(&2u16.to_le_bytes());
+        let ifd1_e0 = ifd1 + 2;
+        app1[ifd1_e0..ifd1_e0 + 2].copy_from_slice(&0x0201u16.to_le_bytes());
+        app1[ifd1_e0 + 2..ifd1_e0 + 4].copy_from_slice(&4u16.to_le_bytes());
+        app1[ifd1_e0 + 4..ifd1_e0 + 8].copy_from_slice(&1u32.to_le_bytes());
+        app1[ifd1_e0 + 8..ifd1_e0 + 12].copy_from_slice(&50u32.to_le_bytes()); // rel 50
+
+        let ifd1_e1 = ifd1_e0 + 12;
+        app1[ifd1_e1..ifd1_e1 + 2].copy_from_slice(&0x0202u16.to_le_bytes());
+        app1[ifd1_e1 + 2..ifd1_e1 + 4].copy_from_slice(&4u16.to_le_bytes());
+        app1[ifd1_e1 + 4..ifd1_e1 + 8].copy_from_slice(&1u32.to_le_bytes());
+        app1[ifd1_e1 + 8..ifd1_e1 + 12].copy_from_slice(&40u32.to_le_bytes()); // len 40 -> rel 50..90
+        app1[ifd1_e1 + 12..ifd1_e1 + 16].copy_from_slice(&0u32.to_le_bytes());
+
+        // Fill gap rel 80..90 with 0xEE
+        app1[tiff_start + 80..tiff_start + 90].fill(0xee);
+
+        update_app1_exif_for_export(&mut app1, 1000, 1000, 1);
+
+        // Chained SubIFD2 entry must remain intact
+        assert_eq!(&app1[sub2_e0..sub2_e0 + 2], &0x0100u16.to_le_bytes());
+        assert_eq!(&app1[sub2_e0 + 8..sub2_e0 + 10], &800u16.to_le_bytes());
+
+        // SubIFD strip data at rel 70..80 must remain intact
+        for b in &app1[tiff_start + 70..tiff_start + 80] {
+            assert_eq!(*b, 0x55);
+        }
+
+        // Gap outside retained ranges rel 80..90 must be zeroed
+        for b in &app1[tiff_start + 80..tiff_start + 90] {
+            assert_eq!(*b, 0x00);
+        }
     }
 
     #[test]

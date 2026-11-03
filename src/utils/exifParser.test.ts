@@ -766,6 +766,8 @@ test('injectApp1ExifIntoJpegBlob preserves valid in-bounds GPS directory and ent
   // Verify GPS directory preserved despite thumbnail overlap
   assert.equal(viewInj.getUint16(2 + gpsPos, true), 1);
   assert.equal(viewInj.getUint16(2 + gpsEntry0, true), 0x0001);
+  assert.equal(viewInj.getUint16(2 + gpsEntry0 + 2, true), 2);
+  assert.equal(viewInj.getUint32(2 + gpsEntry0 + 4, true), 2);
   assert.equal(injected[2 + gpsEntry0 + 8], 0x4e); // 'N'
   // Verify thumbnail gap outside GPS directory was cleared
   assert.equal(injected[2 + tiffStart + 44], 0x00);
