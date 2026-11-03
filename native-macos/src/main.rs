@@ -706,9 +706,9 @@ fn retain_sub_ifd_tree(
     visited: &mut std::collections::HashSet<usize>,
     retained_ranges: &mut Vec<(usize, usize)>,
     candidate_ranges: &mut Vec<(usize, usize)>,
-) {
+) -> bool {
     if root_sub_rel < 8 {
-        return;
+        return true;
     }
     let mut worklist = vec![root_sub_rel];
 
@@ -728,8 +728,11 @@ fn retain_sub_ifd_tree(
     };
 
     while let Some(sub_rel) = worklist.pop() {
-        if sub_rel < 8 || !visited.insert(sub_rel) || visited.len() > 256 {
+        if sub_rel < 8 || !visited.insert(sub_rel) {
             continue;
+        }
+        if visited.len() > 256 {
+            return false;
         }
         let sub_offset = tiff_start + sub_rel;
         if sub_offset < tiff_start + 8 || sub_offset + 2 > bytes.len() {
@@ -737,11 +740,19 @@ fn retain_sub_ifd_tree(
         }
 
         let sub_entries = read_u16(bytes, sub_offset) as usize;
-        let sub_end = (sub_offset + 2 + sub_entries.saturating_mul(12) + 4).min(bytes.len());
+        let Some(table_len) = sub_entries.saturating_mul(12).checked_add(6) else {
+            continue;
+        };
+        let Some(sub_end) = sub_offset.checked_add(table_len) else {
+            continue;
+        };
+        if sub_end > bytes.len() {
+            continue;
+        }
         retained_ranges.push((sub_offset, sub_end));
 
-        let mut jpeg_offset = 0;
-        let mut jpeg_length = 0;
+        let mut jpeg_offsets: Vec<usize> = Vec::new();
+        let mut jpeg_lengths: Vec<usize> = Vec::new();
         let mut strip_offsets: Vec<usize> = Vec::new();
         let mut strip_byte_counts: Vec<usize> = Vec::new();
 
@@ -754,7 +765,7 @@ fn retain_sub_ifd_tree(
             let s_type = read_u16(bytes, s_pos + 2);
             let s_count = read_u32(bytes, s_pos + 4) as usize;
             let s_bytes = s_count.saturating_mul(get_tiff_type_size(s_type));
-            if s_tag != 0x0201 && s_tag != 0x0202 && s_bytes > 4 {
+            if s_tag != 0x0201 && s_tag != 0x0202 && s_tag != 0x0111 && s_tag != 0x0117 && s_bytes > 4 {
                 let s_val_rel = read_u32(bytes, s_pos + 8) as usize;
                 if s_val_rel >= 8 {
                     let s_val_start = tiff_start + s_val_rel;
@@ -784,40 +795,45 @@ fn retain_sub_ifd_tree(
 
             // SubIFD image data / preview tags
             if s_tag == 0x0201 && (s_type == 3 || s_type == 4) {
-                let arr = read_uint_array(bytes, tiff_start, s_pos, s_type, s_count, is_le);
-                if let Some(&off) = arr.first() {
-                    jpeg_offset = off;
-                }
+                jpeg_offsets = read_uint_array(bytes, tiff_start, s_pos, s_type, s_count, is_le);
                 // Zero tag reference so exported image doesn't point to cleared preview
                 bytes[s_pos + 4..s_pos + 8].copy_from_slice(&[0, 0, 0, 0]);
                 bytes[s_pos + 8..s_pos + 12].copy_from_slice(&[0, 0, 0, 0]);
             } else if s_tag == 0x0202 && (s_type == 3 || s_type == 4) {
-                let arr = read_uint_array(bytes, tiff_start, s_pos, s_type, s_count, is_le);
-                if let Some(&len) = arr.first() {
-                    jpeg_length = len;
-                }
+                jpeg_lengths = read_uint_array(bytes, tiff_start, s_pos, s_type, s_count, is_le);
                 // Zero tag reference
                 bytes[s_pos + 4..s_pos + 8].copy_from_slice(&[0, 0, 0, 0]);
                 bytes[s_pos + 8..s_pos + 12].copy_from_slice(&[0, 0, 0, 0]);
             } else if s_tag == 0x0111 && (s_type == 3 || s_type == 4) {
                 strip_offsets = read_uint_array(bytes, tiff_start, s_pos, s_type, s_count, is_le);
+                // Zero tag reference so exported image doesn't point to cleared strip data
+                bytes[s_pos + 4..s_pos + 8].copy_from_slice(&[0, 0, 0, 0]);
+                bytes[s_pos + 8..s_pos + 12].copy_from_slice(&[0, 0, 0, 0]);
             } else if s_tag == 0x0117 && (s_type == 3 || s_type == 4) {
                 strip_byte_counts = read_uint_array(bytes, tiff_start, s_pos, s_type, s_count, is_le);
+                // Zero tag reference
+                bytes[s_pos + 4..s_pos + 8].copy_from_slice(&[0, 0, 0, 0]);
+                bytes[s_pos + 8..s_pos + 12].copy_from_slice(&[0, 0, 0, 0]);
             }
         }
 
         // SubIFD JPEG preview: add to candidate_ranges for clearing, do NOT retain
-        if jpeg_offset >= 8 && jpeg_length > 0 {
-            if let Some(j_start) = tiff_start.checked_add(jpeg_offset) {
-                if let Some(j_end) = j_start.checked_add(jpeg_length) {
-                    if j_start >= tiff_start + 8 {
-                        candidate_ranges.push((j_start, j_end));
+        let jpeg_count = jpeg_offsets.len().min(jpeg_lengths.len());
+        for j in 0..jpeg_count {
+            let j_off = jpeg_offsets[j];
+            let j_len = jpeg_lengths[j];
+            if j_off >= 8 && j_len > 0 {
+                if let Some(j_start) = tiff_start.checked_add(j_off) {
+                    if let Some(j_end) = j_start.checked_add(j_len) {
+                        if j_start >= tiff_start + 8 {
+                            candidate_ranges.push((j_start, j_end));
+                        }
                     }
                 }
             }
         }
 
-        // Retain strip raw image data
+        // SubIFD strip image data: add to candidate_ranges for clearing, do NOT retain
         let strip_count = strip_offsets.len().min(strip_byte_counts.len());
         for s in 0..strip_count {
             let s_off = strip_offsets[s];
@@ -825,8 +841,8 @@ fn retain_sub_ifd_tree(
             if s_off >= 8 && s_len > 0 {
                 if let Some(s_start) = tiff_start.checked_add(s_off) {
                     if let Some(s_end) = s_start.checked_add(s_len) {
-                        if s_start >= tiff_start + 8 && s_end <= bytes.len() {
-                            retained_ranges.push((s_start, s_end));
+                        if s_start >= tiff_start + 8 {
+                            candidate_ranges.push((s_start, s_end));
                         }
                     }
                 }
@@ -845,6 +861,7 @@ fn retain_sub_ifd_tree(
             }
         }
     }
+    true
 }
 
 /// Updates EXIF APP1 metadata block for export:
@@ -853,7 +870,7 @@ fn retain_sub_ifd_tree(
 ///   PixelYDimension (0xA003) in ExifSubIFD to match the encoded output dimensions.
 /// - Clears IFD1 thumbnail byte ranges (JPEG & strips) if non-overlapping with retained TIFF data,
 ///   and zeros the IFD1 next-pointer.
-fn update_app1_exif_for_export(bytes: &mut [u8], width: u32, height: u32, orientation: u32) {
+fn update_app1_exif_for_export(bytes: &mut [u8], width: u32, height: u32, orientation: u32) -> bool {
     let tiff_start = if bytes.len() >= 6 && &bytes[0..6] == b"Exif\0\0" {
         6
     } else if bytes.len() >= 10 && &bytes[4..10] == b"Exif\0\0" {
@@ -862,12 +879,12 @@ fn update_app1_exif_for_export(bytes: &mut [u8], width: u32, height: u32, orient
         0
     };
     if bytes.len() < tiff_start + 8 {
-        return;
+        return false;
     }
     let is_le = match &bytes[tiff_start..tiff_start + 2] {
         b"II" => true,
         b"MM" => false,
-        _ => return,
+        _ => return false,
     };
     let read_u16 = |buf: &[u8], offset: usize| -> u16 {
         if is_le {
@@ -899,7 +916,7 @@ fn update_app1_exif_for_export(bytes: &mut [u8], width: u32, height: u32, orient
     let first_ifd_rel = read_u32(bytes, tiff_start + 4) as usize;
     let ifd0_offset = tiff_start + first_ifd_rel;
     if ifd0_offset + 2 > bytes.len() {
-        return;
+        return false;
     }
     let entries = read_u16(bytes, ifd0_offset) as usize;
     let mut exif_sub_ifd_offset = 0;
@@ -963,7 +980,6 @@ fn update_app1_exif_for_export(bytes: &mut [u8], width: u32, height: u32, orient
             };
             if sub_rel >= 8 {
                 exif_sub_ifd_offset = tiff_start + sub_rel;
-                visited_sub_ifds.insert(sub_rel);
             }
         }
 
@@ -1014,7 +1030,7 @@ fn update_app1_exif_for_export(bytes: &mut [u8], width: u32, height: u32, orient
                 is_le,
             );
             for sub_rel in sub_ifd_offsets {
-                retain_sub_ifd_tree(
+                if !retain_sub_ifd_tree(
                     bytes,
                     tiff_start,
                     sub_rel,
@@ -1022,7 +1038,9 @@ fn update_app1_exif_for_export(bytes: &mut [u8], width: u32, height: u32, orient
                     &mut visited_sub_ifds,
                     &mut retained_ranges,
                     &mut candidate_ranges,
-                );
+                ) {
+                    return false;
+                }
             }
         }
     }
@@ -1173,6 +1191,7 @@ fn update_app1_exif_for_export(bytes: &mut [u8], width: u32, height: u32, orient
             clear_disjoint_portions(bytes, cand_start, clamped_end, &retained_ranges);
         }
     }
+    true
 }
 
 /// Encodes JPEG and losslessly injects original EXIF APP1 metadata block if enabled.
@@ -1191,15 +1210,16 @@ pub fn save_jpeg_preserving_exif(
 
     if cfg.preserve_exif {
         if let Some(mut raw_exif) = exif.raw_app1_bytes.clone() {
-            update_app1_exif_for_export(&mut raw_exif, img.width(), img.height(), exif.orientation);
-            if let Ok(mut parsed_jpeg) = Jpeg::from_bytes(jpeg_buf.clone().into()) {
-                parsed_jpeg.set_exif(Some(raw_exif.into()));
-                let out_file = File::create(dest).map_err(|e| e.to_string())?;
-                parsed_jpeg
-                    .encoder()
-                    .write_to(out_file)
-                    .map_err(|e| format!("EXIF write error: {e}"))?;
-                return Ok(());
+            if update_app1_exif_for_export(&mut raw_exif, img.width(), img.height(), exif.orientation) {
+                if let Ok(mut parsed_jpeg) = Jpeg::from_bytes(jpeg_buf.clone().into()) {
+                    parsed_jpeg.set_exif(Some(raw_exif.into()));
+                    let out_file = File::create(dest).map_err(|e| e.to_string())?;
+                    parsed_jpeg
+                        .encoder()
+                        .write_to(out_file)
+                        .map_err(|e| format!("EXIF write error: {e}"))?;
+                    return Ok(());
+                }
             }
         }
     }
@@ -1884,9 +1904,13 @@ mod tests {
         // SubIFD2 next-IFD terminator must remain zero
         assert_eq!(&app1[sub2_e0 + 12..sub2_e0 + 16], &[0, 0, 0, 0]);
 
-        // SubIFD strip data at rel 74..84 must remain intact
+        // SubIFD strip tag references must be zeroed
+        assert_eq!(&app1[sub1_e0 + 4..sub1_e0 + 12], &[0; 8]);
+        assert_eq!(&app1[sub1_e1 + 4..sub1_e1 + 12], &[0; 8]);
+
+        // SubIFD strip data at rel 74..84 must be cleared to 0
         for b in &app1[tiff_start + 74..tiff_start + 84] {
-            assert_eq!(*b, 0x55);
+            assert_eq!(*b, 0x00);
         }
 
         // Gap outside retained ranges rel 84..94 must be zeroed
@@ -2086,5 +2110,180 @@ mod tests {
         // Invalid raw margins exceeding sensor bounds should error
         assert!(compute_raw_crop_margins(100, 100, [60, 0, 50, 0], 50, 50).is_err());
         assert!(compute_raw_crop_margins(100, 100, [0, 60, 0, 50], 50, 50).is_err());
+    }
+
+    #[test]
+    fn test_update_app1_exif_rejects_truncated_sub_ifd_table() {
+        let total_len = 80;
+        let mut app1 = vec![0u8; total_len];
+        app1[0] = 0xff;
+        app1[1] = 0xe1;
+        let marker_len = (total_len - 2) as u16;
+        app1[2..4].copy_from_slice(&marker_len.to_be_bytes());
+        app1[4..10].copy_from_slice(b"Exif\0\0");
+
+        let tiff_start = 10;
+        app1[tiff_start..tiff_start + 2].copy_from_slice(b"II");
+        app1[tiff_start + 2..tiff_start + 4].copy_from_slice(&42u16.to_le_bytes());
+        app1[tiff_start + 4..tiff_start + 8].copy_from_slice(&8u32.to_le_bytes());
+
+        // IFD0 at rel 8 (len 18 -> rel 8..26)
+        let ifd0 = tiff_start + 8;
+        app1[ifd0..ifd0 + 2].copy_from_slice(&1u16.to_le_bytes());
+        let e0 = ifd0 + 2;
+        app1[e0..e0 + 2].copy_from_slice(&0x014au16.to_le_bytes());
+        app1[e0 + 2..e0 + 4].copy_from_slice(&4u16.to_le_bytes());
+        app1[e0 + 4..e0 + 8].copy_from_slice(&1u32.to_le_bytes());
+        app1[e0 + 8..e0 + 12].copy_from_slice(&26u32.to_le_bytes()); // SubIFD at rel 26
+        app1[e0 + 12..e0 + 16].copy_from_slice(&40u32.to_le_bytes()); // IFD1 at rel 40
+
+        // SubIFD at rel 26: claims 20 entries (2 + 20*12 + 4 = 246 bytes), but total_len is only 80!
+        let sub = tiff_start + 26;
+        app1[sub..sub + 2].copy_from_slice(&20u16.to_le_bytes());
+
+        // Fill bytes at rel 28..38 with dummy pattern 0x77
+        app1[sub + 2..sub + 12].fill(0x77);
+
+        // IFD1 at rel 40: candidate range covering rel 26..38 (overlapping truncated SubIFD)
+        let ifd1 = tiff_start + 40;
+        app1[ifd1..ifd1 + 2].copy_from_slice(&2u16.to_le_bytes());
+        let ifd1_e0 = ifd1 + 2;
+        app1[ifd1_e0..ifd1_e0 + 2].copy_from_slice(&0x0201u16.to_le_bytes());
+        app1[ifd1_e0 + 2..ifd1_e0 + 4].copy_from_slice(&4u16.to_le_bytes());
+        app1[ifd1_e0 + 4..ifd1_e0 + 8].copy_from_slice(&1u32.to_le_bytes());
+        app1[ifd1_e0 + 8..ifd1_e0 + 12].copy_from_slice(&26u32.to_le_bytes()); // rel 26
+
+        let ifd1_e1 = ifd1_e0 + 12;
+        app1[ifd1_e1..ifd1_e1 + 2].copy_from_slice(&0x0202u16.to_le_bytes());
+        app1[ifd1_e1 + 2..ifd1_e1 + 4].copy_from_slice(&4u16.to_le_bytes());
+        app1[ifd1_e1 + 4..ifd1_e1 + 8].copy_from_slice(&1u32.to_le_bytes());
+        app1[ifd1_e1 + 8..ifd1_e1 + 12].copy_from_slice(&12u32.to_le_bytes()); // len 12 -> rel 26..38
+        app1[ifd1_e1 + 12..ifd1_e1 + 16].copy_from_slice(&0u32.to_le_bytes());
+
+        assert!(update_app1_exif_for_export(&mut app1, 1000, 1000, 1));
+
+        // Truncated SubIFD table was rejected and NOT retained, so candidate bytes at rel 26..38 must be zeroed!
+        for b in &app1[sub..sub + 12] {
+            assert_eq!(*b, 0x00);
+        }
+    }
+
+    #[test]
+    fn test_update_app1_exif_multi_jpeg_preview_clearing() {
+        let total_len = 160;
+        let mut app1 = vec![0u8; total_len];
+        app1[0] = 0xff;
+        app1[1] = 0xe1;
+        let marker_len = (total_len - 2) as u16;
+        app1[2..4].copy_from_slice(&marker_len.to_be_bytes());
+        app1[4..10].copy_from_slice(b"Exif\0\0");
+
+        let tiff_start = 10;
+        app1[tiff_start..tiff_start + 2].copy_from_slice(b"II");
+        app1[tiff_start + 2..tiff_start + 4].copy_from_slice(&42u16.to_le_bytes());
+        app1[tiff_start + 4..tiff_start + 8].copy_from_slice(&8u32.to_le_bytes());
+
+        // IFD0 at rel 8 pointing to SubIFD at rel 26
+        let ifd0 = tiff_start + 8;
+        app1[ifd0..ifd0 + 2].copy_from_slice(&1u16.to_le_bytes());
+        let e0 = ifd0 + 2;
+        app1[e0..e0 + 2].copy_from_slice(&0x014au16.to_le_bytes());
+        app1[e0 + 2..e0 + 4].copy_from_slice(&4u16.to_le_bytes());
+        app1[e0 + 4..e0 + 8].copy_from_slice(&1u32.to_le_bytes());
+        app1[e0 + 8..e0 + 12].copy_from_slice(&26u32.to_le_bytes());
+        app1[e0 + 12..e0 + 16].copy_from_slice(&0u32.to_le_bytes());
+
+        // SubIFD at rel 26 (len 2 + 2*12 + 4 = 30 -> rel 26..56)
+        // Entry 0: 0x0201 (JPEGInterchangeFormat) LONG count 2, offset table at rel 56
+        // Entry 1: 0x0202 (JPEGInterchangeFormatLength) LONG count 2, length table at rel 64
+        let sub = tiff_start + 26;
+        app1[sub..sub + 2].copy_from_slice(&2u16.to_le_bytes());
+        let sub_e0 = sub + 2;
+        app1[sub_e0..sub_e0 + 2].copy_from_slice(&0x0201u16.to_le_bytes());
+        app1[sub_e0 + 2..sub_e0 + 4].copy_from_slice(&4u16.to_le_bytes());
+        app1[sub_e0 + 4..sub_e0 + 8].copy_from_slice(&2u32.to_le_bytes());
+        app1[sub_e0 + 8..sub_e0 + 12].copy_from_slice(&56u32.to_le_bytes()); // table at rel 56
+
+        let sub_e1 = sub_e0 + 12;
+        app1[sub_e1..sub_e1 + 2].copy_from_slice(&0x0202u16.to_le_bytes());
+        app1[sub_e1 + 2..sub_e1 + 4].copy_from_slice(&4u16.to_le_bytes());
+        app1[sub_e1 + 4..sub_e1 + 8].copy_from_slice(&2u32.to_le_bytes());
+        app1[sub_e1 + 8..sub_e1 + 12].copy_from_slice(&64u32.to_le_bytes()); // table at rel 64
+        app1[sub_e1 + 12..sub_e1 + 16].copy_from_slice(&0u32.to_le_bytes());
+
+        // Offsets table at rel 56: [72, 86]
+        app1[tiff_start + 56..tiff_start + 60].copy_from_slice(&72u32.to_le_bytes());
+        app1[tiff_start + 60..tiff_start + 64].copy_from_slice(&86u32.to_le_bytes());
+
+        // Lengths table at rel 64: [10, 10]
+        app1[tiff_start + 64..tiff_start + 68].copy_from_slice(&10u32.to_le_bytes());
+        app1[tiff_start + 68..tiff_start + 72].copy_from_slice(&10u32.to_le_bytes());
+
+        // Fill preview slice 1 (rel 72..82) and preview slice 2 (rel 86..96)
+        app1[tiff_start + 72..tiff_start + 82].fill(0x11);
+        app1[tiff_start + 86..tiff_start + 96].fill(0x22);
+
+        assert!(update_app1_exif_for_export(&mut app1, 1000, 1000, 1));
+
+        // Both preview slices must be cleared to 0
+        for b in &app1[tiff_start + 72..tiff_start + 82] {
+            assert_eq!(*b, 0x00);
+        }
+        for b in &app1[tiff_start + 86..tiff_start + 96] {
+            assert_eq!(*b, 0x00);
+        }
+
+        // Tag references must be zeroed
+        assert_eq!(&app1[sub_e0 + 4..sub_e0 + 12], &[0; 8]);
+        assert_eq!(&app1[sub_e1 + 4..sub_e1 + 12], &[0; 8]);
+    }
+
+    #[test]
+    fn test_update_app1_exif_fails_when_directory_limit_exceeded() {
+        // Construct a file with 260 SubIFDs in a chain
+        let num_ifds = 260;
+        let total_len = 10 + 8 + 18 + num_ifds * 18 + 100;
+        let mut app1 = vec![0u8; total_len];
+        app1[0] = 0xff;
+        app1[1] = 0xe1;
+        let marker_len = (total_len - 2) as u16;
+        app1[2..4].copy_from_slice(&marker_len.to_be_bytes());
+        app1[4..10].copy_from_slice(b"Exif\0\0");
+
+        let tiff_start = 10;
+        app1[tiff_start..tiff_start + 2].copy_from_slice(b"II");
+        app1[tiff_start + 2..tiff_start + 4].copy_from_slice(&42u16.to_le_bytes());
+        app1[tiff_start + 4..tiff_start + 8].copy_from_slice(&8u32.to_le_bytes());
+
+        // IFD0 at rel 8 pointing to SubIFD 0 at rel 26
+        let ifd0 = tiff_start + 8;
+        app1[ifd0..ifd0 + 2].copy_from_slice(&1u16.to_le_bytes());
+        let e0 = ifd0 + 2;
+        app1[e0..e0 + 2].copy_from_slice(&0x014au16.to_le_bytes());
+        app1[e0 + 2..e0 + 4].copy_from_slice(&4u16.to_le_bytes());
+        app1[e0 + 4..e0 + 8].copy_from_slice(&1u32.to_le_bytes());
+        app1[e0 + 8..e0 + 12].copy_from_slice(&26u32.to_le_bytes());
+        app1[e0 + 12..e0 + 16].copy_from_slice(&0u32.to_le_bytes());
+
+        // Chain 260 SubIFDs
+        for i in 0..num_ifds {
+            let cur_rel = 26 + i * 18;
+            let cur = tiff_start + cur_rel;
+            app1[cur..cur + 2].copy_from_slice(&1u16.to_le_bytes());
+            let entry = cur + 2;
+            app1[entry..entry + 2].copy_from_slice(&0x0100u16.to_le_bytes());
+            app1[entry + 2..entry + 4].copy_from_slice(&3u16.to_le_bytes());
+            app1[entry + 4..entry + 8].copy_from_slice(&1u32.to_le_bytes());
+            app1[entry + 8..entry + 10].copy_from_slice(&100u16.to_le_bytes());
+            if i + 1 < num_ifds {
+                let next_rel = (cur_rel + 18) as u32;
+                app1[entry + 12..entry + 16].copy_from_slice(&next_rel.to_le_bytes());
+            } else {
+                app1[entry + 12..entry + 16].copy_from_slice(&0u32.to_le_bytes());
+            }
+        }
+
+        // Limit of 256 visited directories must cause update_app1_exif_for_export to return false
+        assert!(!update_app1_exif_for_export(&mut app1, 1000, 1000, 1));
     }
 }
