@@ -1224,8 +1224,10 @@ fn update_app1_exif_for_export(bytes: &mut [u8], width: u32, height: u32, orient
                     candidate_ranges.push((tiff_start + jpeg_offset, tiff_start + jpeg_offset + jpeg_length));
                 }
 
-                let strip_count = strip_offsets.len().min(strip_byte_counts.len());
-                for s in 0..strip_count {
+                if strip_offsets.len() != strip_byte_counts.len() {
+                    return false;
+                }
+                for s in 0..strip_offsets.len() {
                     let s_off = strip_offsets[s];
                     let s_len = strip_byte_counts[s];
                     if s_off > 0 && s_len > 0 {
@@ -1261,24 +1263,32 @@ pub fn save_jpeg_preserving_exif(
         .encode_image(&rgb)
         .map_err(|e| format!("JPEG encode error: {e}"))?;
 
+    let parent = dest.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
+    let unique_nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp_path = parent.join(format!(".plumbline.{}.{unique_nanos}.tmp", std::process::id()));
+    let existing_perms = std::fs::metadata(dest).ok().map(|m| m.permissions());
+
     if cfg.preserve_exif {
         if let Some(mut raw_exif) = exif.raw_app1_bytes.clone() {
             if !update_app1_exif_for_export(&mut raw_exif, img.width(), img.height(), exif.orientation) {
                 return Err("Failed to update EXIF metadata for export".into());
             }
+            let exif_payload = if raw_exif.len() >= 6 && &raw_exif[0..6] == b"Exif\0\0" {
+                &raw_exif[6..]
+            } else if raw_exif.len() >= 10 && &raw_exif[4..10] == b"Exif\0\0" {
+                &raw_exif[10..]
+            } else {
+                &raw_exif[..]
+            };
             let mut parsed_jpeg = Jpeg::from_bytes(jpeg_buf.clone().into())
                 .map_err(|e| format!("JPEG parse error: {e}"))?;
-            parsed_jpeg.set_exif(Some(raw_exif.into()));
+            parsed_jpeg.set_exif(Some(exif_payload.to_vec().into()));
 
-            let parent = dest.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
-            let file_stem = dest.file_name().and_then(|n| n.to_str()).unwrap_or("output.jpg");
-            let unique_nanos = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0);
-            let tmp_path = parent.join(format!(".{file_stem}.{}.{unique_nanos}.tmp", std::process::id()));
-
-            let out_file = File::create(&tmp_path).map_err(|e| e.to_string())?;
+            let out_file = File::create(&tmp_path)
+                .map_err(|e| format!("Failed to create temporary file in {}: {e}", parent.display()))?;
             if let Err(e) = parsed_jpeg.encoder().write_to(&out_file) {
                 let _ = std::fs::remove_file(&tmp_path);
                 return Err(format!("EXIF write error: {e}"));
@@ -1289,6 +1299,13 @@ pub fn save_jpeg_preserving_exif(
             }
             drop(out_file);
 
+            if let Some(perms) = existing_perms {
+                if let Err(e) = std::fs::set_permissions(&tmp_path, perms) {
+                    let _ = std::fs::remove_file(&tmp_path);
+                    return Err(format!("File permissions error: {e}"));
+                }
+            }
+
             std::fs::rename(&tmp_path, dest).map_err(|e| {
                 let _ = std::fs::remove_file(&tmp_path);
                 format!("File rename error: {e}")
@@ -1297,7 +1314,29 @@ pub fn save_jpeg_preserving_exif(
         }
     }
 
-    std::fs::write(dest, &jpeg_buf).map_err(|e| format!("File write error: {e}"))
+    let mut out_file = File::create(&tmp_path)
+        .map_err(|e| format!("Failed to create temporary file in {}: {e}", parent.display()))?;
+    if let Err(e) = std::io::Write::write_all(&mut out_file, &jpeg_buf) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(format!("File write error: {e}"));
+    }
+    if let Err(e) = out_file.sync_all() {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(format!("File sync error: {e}"));
+    }
+    drop(out_file);
+
+    if let Some(perms) = existing_perms {
+        if let Err(e) = std::fs::set_permissions(&tmp_path, perms) {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(format!("File permissions error: {e}"));
+        }
+    }
+
+    std::fs::rename(&tmp_path, dest).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp_path);
+        format!("File rename error: {e}")
+    })
 }
 
 // ============================================================================
@@ -2683,63 +2722,7 @@ mod tests {
         assert_eq!(&app1[sub_e1 + 4..sub_e1 + 12], &[0; 8]);
     }
 
-    #[test]
-    fn test_save_jpeg_preserving_exif_fails_on_exif_update_failure() {
-        let img = RgbaImage::new(10, 10);
-        let mut exif = ExifSummary::default();
-        // Malformed EXIF where 0x0201 and 0x0202 counts differ (update_app1_exif_for_export returns false)
-        let total_len = 160;
-        let mut app1 = vec![0u8; total_len];
-        app1[0] = 0xff;
-        app1[1] = 0xe1;
-        let marker_len = (total_len - 2) as u16;
-        app1[2..4].copy_from_slice(&marker_len.to_be_bytes());
-        app1[4..10].copy_from_slice(b"Exif\0\0");
-        let tiff_start = 10;
-        app1[tiff_start..tiff_start + 2].copy_from_slice(b"II");
-        app1[tiff_start + 2..tiff_start + 4].copy_from_slice(&42u16.to_le_bytes());
-        app1[tiff_start + 4..tiff_start + 8].copy_from_slice(&8u32.to_le_bytes());
-        let ifd0 = tiff_start + 8;
-        app1[ifd0..ifd0 + 2].copy_from_slice(&1u16.to_le_bytes());
-        let e0 = ifd0 + 2;
-        app1[e0..e0 + 2].copy_from_slice(&0x014au16.to_le_bytes());
-        app1[e0 + 2..e0 + 4].copy_from_slice(&4u16.to_le_bytes());
-        app1[e0 + 4..e0 + 8].copy_from_slice(&1u32.to_le_bytes());
-        app1[e0 + 8..e0 + 12].copy_from_slice(&26u32.to_le_bytes());
-        let sub = tiff_start + 26;
-        app1[sub..sub + 2].copy_from_slice(&2u16.to_le_bytes());
-        let sub_e0 = sub + 2;
-        app1[sub_e0..sub_e0 + 2].copy_from_slice(&0x0201u16.to_le_bytes());
-        app1[sub_e0 + 2..sub_e0 + 4].copy_from_slice(&4u16.to_le_bytes());
-        app1[sub_e0 + 4..sub_e0 + 8].copy_from_slice(&2u32.to_le_bytes()); // count 2
-        app1[sub_e0 + 8..sub_e0 + 12].copy_from_slice(&56u32.to_le_bytes());
-        let sub_e1 = sub_e0 + 12;
-        app1[sub_e1..sub_e1 + 2].copy_from_slice(&0x0202u16.to_le_bytes());
-        app1[sub_e1 + 2..sub_e1 + 4].copy_from_slice(&4u16.to_le_bytes());
-        app1[sub_e1 + 4..sub_e1 + 8].copy_from_slice(&1u32.to_le_bytes()); // count 1 (mismatch)
-        app1[sub_e1 + 8..sub_e1 + 12].copy_from_slice(&10u32.to_le_bytes());
-
-        exif.raw_app1_bytes = Some(app1);
-
-        let mut cfg = ProcessConfig::default();
-        cfg.preserve_exif = true;
-
-        let dest = std::env::temp_dir().join("test_save_jpeg_preserving_exif_err.jpg");
-        if dest.exists() {
-            let _ = std::fs::remove_file(&dest);
-        }
-
-        let res = save_jpeg_preserving_exif(&img, &exif, &cfg, &dest);
-        assert!(res.is_err());
-        assert!(!dest.exists());
-    }
-
-    #[test]
-    fn test_save_jpeg_preserving_exif_succeeds_and_updates_metadata() {
-        let img = RgbaImage::from_pixel(32, 24, Rgba([200, 100, 50, 255]));
-        let mut exif = ExifSummary::default();
-        exif.orientation = 6; // Source had 90° CW orientation, should be reset to 1 on export
-
+    fn build_valid_test_app1() -> Vec<u8> {
         // Construct valid raw_app1_bytes (Exif\0\0 + TIFF header + IFD0 + ExifSubIFD)
         let mut app1 = vec![0u8; 160];
         app1[0..6].copy_from_slice(b"Exif\0\0");
@@ -2805,12 +2788,85 @@ mod tests {
         app1[s1 + 8..s1 + 12].copy_from_slice(&100u32.to_le_bytes());
         app1[s1 + 12..s1 + 16].copy_from_slice(&0u32.to_le_bytes());
 
+        app1
+    }
+
+    #[test]
+    fn test_save_jpeg_preserving_exif_fails_on_exif_update_failure() {
+        let img = RgbaImage::new(10, 10);
+        let mut exif = ExifSummary::default();
+        // Malformed EXIF where 0x0201 and 0x0202 counts differ (update_app1_exif_for_export returns false)
+        let total_len = 160;
+        let mut app1 = vec![0u8; total_len];
+        app1[0] = 0xff;
+        app1[1] = 0xe1;
+        let marker_len = (total_len - 2) as u16;
+        app1[2..4].copy_from_slice(&marker_len.to_be_bytes());
+        app1[4..10].copy_from_slice(b"Exif\0\0");
+        let tiff_start = 10;
+        app1[tiff_start..tiff_start + 2].copy_from_slice(b"II");
+        app1[tiff_start + 2..tiff_start + 4].copy_from_slice(&42u16.to_le_bytes());
+        app1[tiff_start + 4..tiff_start + 8].copy_from_slice(&8u32.to_le_bytes());
+        let ifd0 = tiff_start + 8;
+        app1[ifd0..ifd0 + 2].copy_from_slice(&1u16.to_le_bytes());
+        let e0 = ifd0 + 2;
+        app1[e0..e0 + 2].copy_from_slice(&0x014au16.to_le_bytes());
+        app1[e0 + 2..e0 + 4].copy_from_slice(&4u16.to_le_bytes());
+        app1[e0 + 4..e0 + 8].copy_from_slice(&1u32.to_le_bytes());
+        app1[e0 + 8..e0 + 12].copy_from_slice(&26u32.to_le_bytes());
+        let sub = tiff_start + 26;
+        app1[sub..sub + 2].copy_from_slice(&2u16.to_le_bytes());
+        let sub_e0 = sub + 2;
+        app1[sub_e0..sub_e0 + 2].copy_from_slice(&0x0201u16.to_le_bytes());
+        app1[sub_e0 + 2..sub_e0 + 4].copy_from_slice(&4u16.to_le_bytes());
+        app1[sub_e0 + 4..sub_e0 + 8].copy_from_slice(&2u32.to_le_bytes()); // count 2
+        app1[sub_e0 + 8..sub_e0 + 12].copy_from_slice(&56u32.to_le_bytes());
+        let sub_e1 = sub_e0 + 12;
+        app1[sub_e1..sub_e1 + 2].copy_from_slice(&0x0202u16.to_le_bytes());
+        app1[sub_e1 + 2..sub_e1 + 4].copy_from_slice(&4u16.to_le_bytes());
+        app1[sub_e1 + 4..sub_e1 + 8].copy_from_slice(&1u32.to_le_bytes()); // count 1 (mismatch)
+        app1[sub_e1 + 8..sub_e1 + 12].copy_from_slice(&10u32.to_le_bytes());
+
         exif.raw_app1_bytes = Some(app1);
 
         let mut cfg = ProcessConfig::default();
         cfg.preserve_exif = true;
 
-        let dest = std::env::temp_dir().join("test_save_jpeg_preserving_exif_ok.jpg");
+        let unique_nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dest = std::env::temp_dir().join(format!(
+            "test_save_jpeg_preserving_exif_err_{}_{unique_nanos}.jpg",
+            std::process::id()
+        ));
+        if dest.exists() {
+            let _ = std::fs::remove_file(&dest);
+        }
+
+        let res = save_jpeg_preserving_exif(&img, &exif, &cfg, &dest);
+        assert!(res.is_err());
+        assert!(!dest.exists());
+    }
+
+    #[test]
+    fn test_save_jpeg_preserving_exif_succeeds_and_updates_metadata() {
+        let img = RgbaImage::from_pixel(32, 24, Rgba([200, 100, 50, 255]));
+        let mut exif = ExifSummary::default();
+        exif.orientation = 6; // Source had 90° CW orientation, should be reset to 1 on export
+        exif.raw_app1_bytes = Some(build_valid_test_app1());
+
+        let mut cfg = ProcessConfig::default();
+        cfg.preserve_exif = true;
+
+        let unique_nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dest = std::env::temp_dir().join(format!(
+            "test_save_jpeg_preserving_exif_ok_{}_{unique_nanos}.jpg",
+            std::process::id()
+        ));
         if dest.exists() {
             let _ = std::fs::remove_file(&dest);
         }
@@ -2840,5 +2896,96 @@ mod tests {
         assert_eq!(u32::from_le_bytes(saved_exif[saved_s1 + 8..saved_s1 + 12].try_into().unwrap()), 24);
 
         let _ = std::fs::remove_file(&dest);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_save_jpeg_preserving_exif_readonly_dir_leaves_dest_unchanged() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let is_root = std::process::Command::new("id")
+            .arg("-u")
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim() == "0")
+            .unwrap_or(false);
+        if is_root {
+            return;
+        }
+
+        let unique_nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let test_dir = std::env::temp_dir().join(format!(
+            "test_save_jpeg_readonly_dir_{}_{unique_nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&test_dir).expect("Failed to create test directory");
+        let dest = test_dir.join("existing_dest.jpg");
+        let original_bytes = b"ORIGINAL_JPEG_SENTINEL_BYTES";
+        std::fs::write(&dest, original_bytes).expect("Failed to write initial destination file");
+
+        let img = RgbaImage::from_pixel(32, 24, Rgba([200, 100, 50, 255]));
+        let mut exif = ExifSummary::default();
+        exif.orientation = 6;
+        exif.raw_app1_bytes = Some(build_valid_test_app1());
+
+        let mut cfg = ProcessConfig::default();
+        cfg.preserve_exif = true;
+
+        std::fs::set_permissions(&test_dir, std::fs::Permissions::from_mode(0o555))
+            .expect("Failed to set directory read-only");
+
+        let res = save_jpeg_preserving_exif(&img, &exif, &cfg, &dest);
+
+        let _ = std::fs::set_permissions(&test_dir, std::fs::Permissions::from_mode(0o755));
+
+        assert!(res.is_err(), "Expected save_jpeg_preserving_exif to fail in read-only directory");
+        let current_bytes = std::fs::read(&dest).expect("Failed to read destination file after failed save");
+        assert_eq!(current_bytes, original_bytes);
+
+        let _ = std::fs::remove_file(&dest);
+        let _ = std::fs::remove_dir_all(&test_dir);
+    }
+
+    #[test]
+    fn test_update_app1_exif_rejects_mismatched_ifd1_strip_tables() {
+        let mut app1 = vec![0u8; 160];
+        app1[0..6].copy_from_slice(b"Exif\0\0");
+        let tiff_start = 6;
+        app1[tiff_start..tiff_start + 2].copy_from_slice(b"II");
+        app1[tiff_start + 2..tiff_start + 4].copy_from_slice(&42u16.to_le_bytes());
+        app1[tiff_start + 4..tiff_start + 8].copy_from_slice(&8u32.to_le_bytes());
+
+        // IFD0 at rel 8 (1 entry + next IFD pointer to IFD1 at rel 26)
+        let ifd0 = tiff_start + 8;
+        app1[ifd0..ifd0 + 2].copy_from_slice(&1u16.to_le_bytes());
+        let e0 = ifd0 + 2;
+        app1[e0..e0 + 2].copy_from_slice(&0x0100u16.to_le_bytes());
+        app1[e0 + 2..e0 + 4].copy_from_slice(&4u16.to_le_bytes());
+        app1[e0 + 4..e0 + 8].copy_from_slice(&1u32.to_le_bytes());
+        app1[e0 + 8..e0 + 12].copy_from_slice(&100u32.to_le_bytes());
+        app1[e0 + 12..e0 + 16].copy_from_slice(&26u32.to_le_bytes()); // IFD1 at rel 26
+
+        // IFD1 at rel 26 with mismatched StripOffsets (count 2) and StripByteCounts (count 1)
+        let ifd1 = tiff_start + 26;
+        app1[ifd1..ifd1 + 2].copy_from_slice(&2u16.to_le_bytes());
+        let ie0 = ifd1 + 2;
+        app1[ie0..ie0 + 2].copy_from_slice(&0x0111u16.to_le_bytes()); // StripOffsets
+        app1[ie0 + 2..ie0 + 4].copy_from_slice(&4u16.to_le_bytes()); // LONG
+        app1[ie0 + 4..ie0 + 8].copy_from_slice(&2u32.to_le_bytes()); // count 2
+        app1[ie0 + 8..ie0 + 12].copy_from_slice(&60u32.to_le_bytes()); // offset array at rel 60
+        app1[tiff_start + 60..tiff_start + 64].copy_from_slice(&100u32.to_le_bytes());
+        app1[tiff_start + 64..tiff_start + 68].copy_from_slice(&110u32.to_le_bytes());
+
+        let ie1 = ie0 + 12;
+        app1[ie1..ie1 + 2].copy_from_slice(&0x0117u16.to_le_bytes()); // StripByteCounts
+        app1[ie1 + 2..ie1 + 4].copy_from_slice(&4u16.to_le_bytes()); // LONG
+        app1[ie1 + 4..ie1 + 8].copy_from_slice(&1u32.to_le_bytes()); // count 1 (mismatch)
+        app1[ie1 + 8..ie1 + 12].copy_from_slice(&10u32.to_le_bytes());
+
+        assert!(!update_app1_exif_for_export(&mut app1, 32, 24, 1));
     }
 }
