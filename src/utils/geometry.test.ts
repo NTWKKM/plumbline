@@ -291,6 +291,12 @@ test('computeInscribedCrop enforces symmetric center parity and supports targetA
   verifyCornersInside(2000, 1400, 3.2, res);
   verifyCornersInside(2000, 1400, 4.0, sq);
   verifyCornersInside(2001, 1400, 4.0, mixedSq);
+
+  // Small mixed-parity source dimensions (5 odd, 4 even) regression test
+  const smallSq = computeInscribedCrop(5, 4, 4.0, true, 1.0);
+  assert.equal(smallSq.width, smallSq.height, 'Small square crop must remain strictly 1:1');
+  assert.ok(smallSq.width >= 1 && smallSq.width <= 4);
+  verifyCornersInside(5, 4, 4.0, smallSq);
 });
 
 test('analyzeAutoCorrection and applyAutoCorrectionToRgba optimize underexposed low-contrast image with color cast', () => {

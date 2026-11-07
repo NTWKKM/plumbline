@@ -202,7 +202,7 @@ export function computeInscribedCrop(
       // For square crops, width and height must remain strictly equal
       let side = Math.min(cropW, cropH);
       if (safeW % 2 === safeH % 2) {
-        if (side > 4 && (safeW - side) % 2 !== 0) {
+        if (side > 1 && (safeW - side) % 2 !== 0) {
           side -= 1;
         }
       }
@@ -231,15 +231,15 @@ export function computeInscribedCrop(
         return false;
       };
 
-      while (side > 4 && isCornerOutside(side)) {
+      while (side > 1 && isCornerOutside(side)) {
         side -= 1;
       }
 
       cropW = side;
       cropH = side;
     } else {
-      if (cropW > 4 && (safeW - cropW) % 2 !== 0) cropW -= 1;
-      if (cropH > 4 && (safeH - cropH) % 2 !== 0) cropH -= 1;
+      if (cropW > 1 && (safeW - cropW) % 2 !== 0) cropW -= 1;
+      if (cropH > 1 && (safeH - cropH) % 2 !== 0) cropH -= 1;
     }
   }
 
