@@ -16,6 +16,7 @@ import {
   FrameLayout,
   LevelingAnalysis,
   PipelineConfig,
+  formatSignedDegrees,
 } from '../utils/geometry';
 import { BACKGROUND_COLOR_PRESETS } from '../utils/samplePhotos';
 
@@ -113,13 +114,13 @@ export const InspectorSidebar: React.FC<InspectorSidebarProps> = ({
           <div className="min-w-0">
             <div className="text-zinc-400 truncate">Detected Tilt</div>
             <div className="mt-0.5 font-medium text-zinc-100 tabular-nums truncate" data-testid="detected-tilt-val">
-              {analysis.detectedTiltDeg > 0 ? `+${analysis.detectedTiltDeg.toFixed(2)}°` : `${analysis.detectedTiltDeg.toFixed(2)}°`}
+              {formatSignedDegrees(analysis.detectedTiltDeg, 2)}
             </div>
           </div>
           <div className="min-w-0">
             <div className="text-zinc-400 truncate">Correction</div>
             <div className="mt-0.5 font-medium text-blue-400 tabular-nums truncate" data-testid="applied-rotation-val">
-              {totalRotationDeg > 0 ? `+${totalRotationDeg.toFixed(2)}°` : `${totalRotationDeg.toFixed(2)}°`}
+              {formatSignedDegrees(totalRotationDeg, 2)}
             </div>
           </div>
           <div className="min-w-0">
@@ -137,7 +138,7 @@ export const InspectorSidebar: React.FC<InspectorSidebarProps> = ({
               Test Camera Sensor Tilt
             </label>
             <span className="text-zinc-200 tabular-nums">
-              {simulatedTiltDeg > 0 ? `+${simulatedTiltDeg.toFixed(1)}°` : `${simulatedTiltDeg.toFixed(1)}°`}
+              {formatSignedDegrees(simulatedTiltDeg, 1)}
             </span>
           </div>
           <input
@@ -159,9 +160,7 @@ export const InspectorSidebar: React.FC<InspectorSidebarProps> = ({
               Manual Fine-Tune Angle
             </label>
             <span className="text-zinc-200 tabular-nums">
-              {config.manualAngleOffsetDeg > 0
-                ? `+${config.manualAngleOffsetDeg.toFixed(2)}°`
-                : `${config.manualAngleOffsetDeg.toFixed(2)}°`}
+              {formatSignedDegrees(config.manualAngleOffsetDeg, 2)}
             </span>
           </div>
           <input
@@ -198,6 +197,26 @@ export const InspectorSidebar: React.FC<InspectorSidebarProps> = ({
               className="h-4 w-4 accent-blue-600 rounded cursor-pointer shrink-0"
             />
           </div>
+
+          {config.autoCropEnabled && (
+            <div className="mt-1.5 flex items-center justify-between gap-2">
+              <label htmlFor="toggle-preserve-crop-aspect" className="text-xs text-zinc-400 cursor-pointer truncate">
+                Preserve Source Aspect Ratio
+              </label>
+              <input
+                id="toggle-preserve-crop-aspect"
+                type="checkbox"
+                checked={config.preserveAspectRatioInCrop}
+                onChange={(e) =>
+                  onChangeConfig((prev) => ({
+                    ...prev,
+                    preserveAspectRatioInCrop: e.target.checked,
+                  }))
+                }
+                className="h-3.5 w-3.5 accent-blue-600 rounded cursor-pointer shrink-0"
+              />
+            </div>
+          )}
 
           <div className="mt-1.5 flex items-center justify-between gap-2 text-xs text-zinc-400">
             <span className="shrink-0">Inscribed Bounds</span>

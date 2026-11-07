@@ -14,9 +14,13 @@ import {
 import {
   AutoCorrectAnalysis,
   CropRect,
+  DEFAULT_AUTO_CORRECT_ANALYSIS,
+  DEFAULT_LEVELING_ANALYSIS,
   FrameLayout,
   LevelingAnalysis,
   PipelineConfig,
+  PipelineTelemetryUpdate,
+  formatSignedDegrees,
 } from './utils/geometry';
 import { INITIAL_SAMPLE_PHOTOS, StudioPhotoItem } from './utils/samplePhotos';
 
@@ -49,23 +53,10 @@ export default function App() {
   const [exportBanner, setExportBanner] = useState<string | null>(null);
   const [exportError, setExportError] = useState<string | null>(null);
 
-  const [analysis, setAnalysis] = useState<LevelingAnalysis>({
-    detectedTiltDeg: 0,
-    appliedRotationDeg: 0,
-    confidence: 0,
-    strongEdgeCount: 0,
-  });
-  const [autoCorrect, setAutoCorrect] = useState<AutoCorrectAnalysis>({
-    exposureEv: 0,
-    contrast: 10,
-    shadows: 0,
-    highlights: 0,
-    wbTempShift: 0,
-    wbTintShift: 0,
-    blackPoint: 0,
-    whitePoint: 255,
-    dynamicRangeStops: 8.0,
-  });
+  const [analysis, setAnalysis] = useState<LevelingAnalysis>(DEFAULT_LEVELING_ANALYSIS);
+  const [autoCorrect, setAutoCorrect] = useState<AutoCorrectAnalysis>(
+    DEFAULT_AUTO_CORRECT_ANALYSIS
+  );
   const [cropRect, setCropRect] = useState<CropRect>({
     x: 0,
     y: 0,
@@ -97,22 +88,13 @@ export default function App() {
 
   const activePhoto = photos.find((p) => p.id === selectedId) || photos[0];
 
-  const handleAnalysisUpdate = useCallback(
-    (
-      newAnalysis: LevelingAnalysis,
-      newCrop: CropRect,
-      newLayout: FrameLayout,
-      newSourceSize: { width: number; height: number },
-      newAutoCorrect?: AutoCorrectAnalysis
-    ) => {
-      setAnalysis(newAnalysis);
-      setCropRect(newCrop);
-      setFrameLayout(newLayout);
-      setSourceSize(newSourceSize);
-      if (newAutoCorrect) setAutoCorrect(newAutoCorrect);
-    },
-    []
-  );
+  const handleAnalysisUpdate = useCallback((telemetry: PipelineTelemetryUpdate) => {
+    setAnalysis(telemetry.analysis);
+    setCropRect(telemetry.crop);
+    setFrameLayout(telemetry.layout);
+    setSourceSize(telemetry.sourceSize);
+    setAutoCorrect(telemetry.autoCorrect);
+  }, []);
 
   const handleChangeSimulatedTilt = (deg: number) => {
     setPhotos((prev) =>
@@ -254,46 +236,14 @@ export default function App() {
           </span>
         </div>
 
-        {/* Zone 2: Desktop Workspace Nav / Mobile Tabs */}
-        {/* Desktop Nav */}
-        <nav aria-label="Primary Workspace Views" className="hidden lg:flex items-center gap-5 text-xs font-medium text-zinc-400">
-          <button
-            type="button"
-            onClick={() => setViewMode('framed')}
-            className={`hover:text-zinc-100 transition-colors whitespace-nowrap shrink-0 ${
-              viewMode === 'framed' ? 'text-zinc-100 font-semibold underline underline-offset-4' : ''
-            }`}
-          >
-            Framed Canvas
-          </button>
-          <button
-            type="button"
-            onClick={() => setViewMode('split')}
-            className={`hover:text-zinc-100 transition-colors whitespace-nowrap shrink-0 ${
-              viewMode === 'split' ? 'text-zinc-100 font-semibold underline underline-offset-4' : ''
-            }`}
-          >
-            Before / After
-          </button>
-          <button
-            type="button"
-            onClick={() => setViewMode('geometry')}
-            className={`hover:text-zinc-100 transition-colors whitespace-nowrap shrink-0 ${
-              viewMode === 'geometry' ? 'text-zinc-100 font-semibold underline underline-offset-4' : ''
-            }`}
-          >
-            Inscribed Crop
-          </button>
-          <button
-            type="button"
-            onClick={() => setViewMode('original')}
-            className={`hover:text-zinc-100 transition-colors whitespace-nowrap shrink-0 ${
-              viewMode === 'original' ? 'text-zinc-100 font-semibold underline underline-offset-4' : ''
-            }`}
-          >
-            Original Sensor
-          </button>
-        </nav>
+        {/* Zone 2: Active Photo Telemetry (Desktop) / Section Switcher Tabs (Mobile < 1024px) */}
+        <div className="hidden lg:flex items-center gap-2 text-xs text-zinc-400 min-w-0">
+          <span className="font-medium text-zinc-200 truncate max-w-xs">{activePhoto.title}</span>
+          <span aria-hidden="true" className="text-zinc-600">·</span>
+          <span className="tabular-nums whitespace-nowrap">
+            {sourceSize.width} × {sourceSize.height} px
+          </span>
+        </div>
 
         {/* Mobile View Switcher Tabs (Only visible on screens < 1024px) */}
         <div className="flex lg:hidden items-center rounded-lg bg-zinc-900 p-0.5 border border-zinc-800 text-xs shrink-0">
@@ -395,9 +345,7 @@ export default function App() {
                     <div className="mt-1 flex items-center justify-between gap-1 text-[11px] text-zinc-400 tabular-nums">
                       <span className="truncate min-w-0">{item.fileName}</span>
                       <span className="shrink-0 text-zinc-500">
-                        {item.simulatedSensorTiltDeg > 0
-                          ? `+${item.simulatedSensorTiltDeg.toFixed(1)}°`
-                          : `${item.simulatedSensorTiltDeg.toFixed(1)}°`}
+                        {formatSignedDegrees(item.simulatedSensorTiltDeg, 1)}
                       </span>
                     </div>
                   </div>
@@ -415,10 +363,10 @@ export default function App() {
           }`}
         >
           {/* Workspace Secondary Toolbar */}
-          <div className="flex flex-wrap items-center justify-between gap-2 border-b border-zinc-800/80 bg-[#111114]/60 px-4 py-2">
-            {/* View Mode Segmented Control */}
+          <div className="flex flex-wrap items-center justify-between gap-2 border-b border-zinc-800/80 bg-[#111114]/60 px-4 py-2 min-w-0">
+            {/* View Mode Segmented Control (Scrollable on narrow mobile viewports < 420px) */}
             <div
-              className="flex items-center gap-0.5 rounded-lg bg-zinc-900 p-1 border border-zinc-800"
+              className="flex max-w-full overflow-x-auto items-center gap-0.5 rounded-lg bg-zinc-900 p-1 border border-zinc-800"
               role="group"
               aria-label="Canvas Inspection Mode"
             >
@@ -588,7 +536,7 @@ export default function App() {
             </div>
             <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
               <span>
-                Horizon Tilt: {analysis.detectedTiltDeg > 0 ? `+${analysis.detectedTiltDeg.toFixed(2)}°` : `${analysis.detectedTiltDeg.toFixed(2)}°`}
+                Horizon Tilt: {formatSignedDegrees(analysis.detectedTiltDeg, 2)}
               </span>
               <span aria-hidden="true" className="text-zinc-600">·</span>
               <span>

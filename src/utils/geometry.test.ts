@@ -224,6 +224,27 @@ test('detectHorizonTiltFromGrayscale recovers sub-degree vertical architectural 
   );
   assert.equal(analysis.appliedRotationDeg, Number((-analysis.detectedTiltDeg).toFixed(2)));
   assert.ok(analysis.confidence >= 0.75);
+
+  // Off-center vertical architectural facade edge tilted at +1.85°
+  const vertGray = new Float32Array(w * h);
+  const trueVertTiltDeg = 1.85;
+  const vertSlope = Math.tan((trueVertTiltDeg * Math.PI) / 180);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      // Off-center vertical line at x ≈ 0.30 * w where dx = x0 - (y - cy) * tan(theta)
+      const wallX = w * 0.30 - (y - h * 0.5) * vertSlope;
+      const dist = x - wallX;
+      const blend = Math.max(0, Math.min(1, 0.5 + dist * 0.8));
+      vertGray[y * w + x] = 220 * (1 - blend) + 40 * blend;
+    }
+  }
+
+  const vertAnalysis = detectHorizonTiltFromGrayscale(vertGray, w, h, 15.0);
+  assert.ok(
+    Math.abs(vertAnalysis.detectedTiltDeg - trueVertTiltDeg) <= 0.08,
+    `Expected vertical tilt ${trueVertTiltDeg}°, got ${vertAnalysis.detectedTiltDeg}°`
+  );
+  assert.ok(vertAnalysis.confidence >= 0.7);
 });
 
 test('computeInscribedCrop enforces symmetric center parity and supports targetAspectRatio override', () => {

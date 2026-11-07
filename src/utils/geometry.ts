@@ -75,7 +75,42 @@ export interface AutoCorrectAnalysis {
   dynamicRangeStops: number;
 }
 
+export interface PipelineTelemetryUpdate {
+  analysis: LevelingAnalysis;
+  crop: CropRect;
+  layout: FrameLayout;
+  sourceSize: { width: number; height: number };
+  autoCorrect: AutoCorrectAnalysis;
+}
+
+export const DEFAULT_LEVELING_ANALYSIS: LevelingAnalysis = {
+  detectedTiltDeg: 0,
+  appliedRotationDeg: 0,
+  confidence: 0,
+  strongEdgeCount: 0,
+};
+
+export const DEFAULT_AUTO_CORRECT_ANALYSIS: AutoCorrectAnalysis = {
+  exposureEv: 0,
+  contrast: 10,
+  shadows: 0,
+  highlights: 0,
+  wbTempShift: 0,
+  wbTintShift: 0,
+  blackPoint: 0,
+  whitePoint: 255,
+  dynamicRangeStops: 8.0,
+};
+
 export const MAX_AUTO_ANGLE_LIMIT_DEG = 15.0;
+
+/**
+ * Formats a signed degree value with an explicit '+' for positive numbers.
+ */
+export function formatSignedDegrees(deg: number, decimals = 2): string {
+  const fixed = deg.toFixed(decimals);
+  return deg > 0 ? `+${fixed}°` : `${fixed}°`;
+}
 
 /**
  * Clamp a number between min and max.
@@ -235,20 +270,23 @@ export function detectHorizonTiltFromGrayscale(
   const edges: EdgePoint[] = [];
   const magThreshold = 40.0;
 
+  // Shared 1D parabolic sub-pixel ridge interpolator
+  const refineSubPixelOffset = (mPrev: number, mCurr: number, mNext: number): number => {
+    const denom = 2 * (2 * mCurr - mPrev - mNext);
+    return denom > 1e-5 ? clamp((mNext - mPrev) / denom, -0.5, 0.5) : 0;
+  };
+
   // Per-Column Top-2 vertical gradient ridges (for horizontal/tilted horizon lines)
   const yMin = Math.max(2, Math.floor(height * 0.08));
   const yMax = Math.min(height - 3, Math.ceil(height * 0.92));
 
-  const refineSubPixelY = (x: number, y: number): number => {
-    const mPrev = Math.abs(gyBuf[(y - 1) * width + x]);
-    const mCurr = Math.abs(gyBuf[y * width + x]);
-    const mNext = Math.abs(gyBuf[(y + 1) * width + x]);
-    const denom = 2 * (2 * mCurr - mPrev - mNext);
-    if (denom > 1e-5) {
-      return y + clamp((mNext - mPrev) / denom, -0.5, 0.5);
-    }
-    return y;
-  };
+  const refineSubPixelY = (x: number, y: number): number =>
+    y +
+    refineSubPixelOffset(
+      Math.abs(gyBuf[(y - 1) * width + x]),
+      Math.abs(gyBuf[y * width + x]),
+      Math.abs(gyBuf[(y + 1) * width + x])
+    );
 
   for (let x = 2; x < width - 2; x++) {
     let bestY1 = -1;
@@ -301,16 +339,13 @@ export function detectHorizonTiltFromGrayscale(
   const xMin = Math.max(2, Math.floor(width * 0.08));
   const xMax = Math.min(width - 3, Math.ceil(width * 0.92));
 
-  const refineSubPixelX = (x: number, y: number): number => {
-    const mPrev = Math.abs(gxBuf[y * width + (x - 1)]);
-    const mCurr = Math.abs(gxBuf[y * width + x]);
-    const mNext = Math.abs(gxBuf[y * width + (x + 1)]);
-    const denom = 2 * (2 * mCurr - mPrev - mNext);
-    if (denom > 1e-5) {
-      return x + clamp((mNext - mPrev) / denom, -0.5, 0.5);
-    }
-    return x;
-  };
+  const refineSubPixelX = (x: number, y: number): number =>
+    x +
+    refineSubPixelOffset(
+      Math.abs(gxBuf[y * width + (x - 1)]),
+      Math.abs(gxBuf[y * width + x]),
+      Math.abs(gxBuf[y * width + (x + 1)])
+    );
 
   for (let y = 2; y < height - 2; y++) {
     let bestX1 = -1;
@@ -431,22 +466,22 @@ export function detectHorizonTiltFromGrayscale(
     let bestVertRho = 0;
     let bestVertPolarity: 1 | -1 = 1;
 
+    const kernel4 = (acc: Float64Array, r: number): number =>
+      0.5 * (acc[r - 1] + acc[r + 2]) + (acc[r] + acc[r + 1]);
+
     for (let r = 1; r < diag - 2; r++) {
       // Phase-invariant 2-pixel (4 half-bin) kernel
-      const hp =
-        0.5 * (hAccPos[r - 1] + hAccPos[r + 2]) + (hAccPos[r] + hAccPos[r + 1]);
-      const hn =
-        0.5 * (hAccNeg[r - 1] + hAccNeg[r + 2]) + (hAccNeg[r] + hAccNeg[r + 1]);
-      const vp =
-        0.5 * (vAccPos[r - 1] + vAccPos[r + 2]) + (vAccPos[r] + vAccPos[r + 1]);
-      const vn =
-        0.5 * (vAccNeg[r - 1] + vAccNeg[r + 2]) + (vAccNeg[r] + vAccNeg[r + 1]);
+      const hp = kernel4(hAccPos, r);
+      const hn = kernel4(hAccNeg, r);
+      const vp = kernel4(vAccPos, r);
+      const vn = kernel4(vAccNeg, r);
+      const rhoVal = (r + 0.5 - rhoOffset) / rhoScale;
 
       if (hp > 0) {
         energy += hp * hp * hp;
         if (hp > bestHorizSupport) {
           bestHorizSupport = hp;
-          bestHorizRho = (r + 0.5 - rhoOffset) / rhoScale;
+          bestHorizRho = rhoVal;
           bestHorizPolarity = 1;
         }
       }
@@ -454,7 +489,7 @@ export function detectHorizonTiltFromGrayscale(
         energy += hn * hn * hn;
         if (hn > bestHorizSupport) {
           bestHorizSupport = hn;
-          bestHorizRho = (r + 0.5 - rhoOffset) / rhoScale;
+          bestHorizRho = rhoVal;
           bestHorizPolarity = -1;
         }
       }
@@ -462,7 +497,7 @@ export function detectHorizonTiltFromGrayscale(
         energy += vp * vp * vp;
         if (vp > bestVertSupport) {
           bestVertSupport = vp;
-          bestVertRho = (r + 0.5 - rhoOffset) / rhoScale;
+          bestVertRho = rhoVal;
           bestVertPolarity = 1;
         }
       }
@@ -470,7 +505,7 @@ export function detectHorizonTiltFromGrayscale(
         energy += vn * vn * vn;
         if (vn > bestVertSupport) {
           bestVertSupport = vn;
-          bestVertRho = (r + 0.5 - rhoOffset) / rhoScale;
+          bestVertRho = rhoVal;
           bestVertPolarity = -1;
         }
       }
@@ -570,7 +605,9 @@ export function detectHorizonTiltFromGrayscale(
 
   if (inliers.length >= 12) {
     let slope = Math.tan(rad0);
-    let intercept = targetRho / Math.max(0.5, cos0);
+    // Horizontal: dy*cos0 - dx*sin0 = targetRho -> v = tan(rad0)*u + targetRho/cos0
+    // Vertical:   dx*cos0 + dy*sin0 = targetRho (with u=dy, v=-dx) -> v = tan(rad0)*u - targetRho/cos0
+    let intercept = (useHoriz ? targetRho : -targetRho) / Math.max(0.5, cos0);
 
     for (let iter = 0; iter < 3; iter++) {
       let sumW = 0;

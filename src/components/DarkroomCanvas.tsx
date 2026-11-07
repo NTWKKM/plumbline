@@ -1,10 +1,11 @@
 import React, { useEffect, useRef, useState } from 'react';
 import {
   AutoCorrectAnalysis,
-  CropRect,
-  FrameLayout,
+  DEFAULT_AUTO_CORRECT_ANALYSIS,
+  DEFAULT_LEVELING_ANALYSIS,
   LevelingAnalysis,
   PipelineConfig,
+  PipelineTelemetryUpdate,
   analyzeAutoCorrection,
   applyAutoCorrectionToRgba,
   computeFrameLayout,
@@ -12,6 +13,7 @@ import {
   computeSplitDividerX,
   detectHorizonTiltFromGrayscale,
   formatExifSummaryLine,
+  formatSignedDegrees,
   getScaledDimensionsWithinBudget,
 } from '../utils/geometry';
 import { StudioPhotoItem } from '../utils/samplePhotos';
@@ -25,13 +27,7 @@ interface DarkroomCanvasProps {
   splitPercent: number;
   onSplitPercentChange: (pct: number) => void;
   showHorizonGrid: boolean;
-  onAnalysisUpdate: (
-    analysis: LevelingAnalysis,
-    crop: CropRect,
-    layout: FrameLayout,
-    sourceSize: { width: number; height: number },
-    autoCorrect?: AutoCorrectAnalysis
-  ) => void;
+  onAnalysisUpdate: (telemetry: PipelineTelemetryUpdate) => void;
   canvasRef: React.RefObject<HTMLCanvasElement | null>;
   onImageLoaded?: (loaded: boolean) => void;
   exportCanvasRef?: React.MutableRefObject<(() => HTMLCanvasElement | null) | null>;
@@ -50,23 +46,10 @@ export const DarkroomCanvas: React.FC<DarkroomCanvasProps> = ({
   exportCanvasRef,
 }) => {
   const [sensorCanvas, setSensorCanvas] = useState<HTMLCanvasElement | null>(null);
-  const [analysis, setAnalysis] = useState<LevelingAnalysis>({
-    detectedTiltDeg: 0,
-    appliedRotationDeg: 0,
-    confidence: 0,
-    strongEdgeCount: 0,
-  });
-  const [autoCorrect, setAutoCorrect] = useState<AutoCorrectAnalysis>({
-    exposureEv: 0,
-    contrast: 10,
-    shadows: 0,
-    highlights: 0,
-    wbTempShift: 0,
-    wbTintShift: 0,
-    blackPoint: 0,
-    whitePoint: 255,
-    dynamicRangeStops: 8.0,
-  });
+  const [analysis, setAnalysis] = useState<LevelingAnalysis>(DEFAULT_LEVELING_ANALYSIS);
+  const [autoCorrect, setAutoCorrect] = useState<AutoCorrectAnalysis>(
+    DEFAULT_AUTO_CORRECT_ANALYSIS
+  );
   const [loadError, setLoadError] = useState<string | null>(null);
   const [isDraggingSplit, setIsDraggingSplit] = useState<boolean>(false);
 
@@ -128,23 +111,8 @@ export const DarkroomCanvas: React.FC<DarkroomCanvasProps> = ({
       detectCanvas.width = dw;
       detectCanvas.height = dh;
       const dCtx = detectCanvas.getContext('2d');
-      let detected: LevelingAnalysis = {
-        detectedTiltDeg: 0,
-        appliedRotationDeg: 0,
-        confidence: 0,
-        strongEdgeCount: 0,
-      };
-      let autoCorr: AutoCorrectAnalysis = {
-        exposureEv: 0,
-        contrast: 10,
-        shadows: 0,
-        highlights: 0,
-        wbTempShift: 0,
-        wbTintShift: 0,
-        blackPoint: 0,
-        whitePoint: 255,
-        dynamicRangeStops: 8.0,
-      };
+      let detected: LevelingAnalysis = DEFAULT_LEVELING_ANALYSIS;
+      let autoCorr: AutoCorrectAnalysis = DEFAULT_AUTO_CORRECT_ANALYSIS;
 
       if (dCtx) {
         dCtx.drawImage(offscreen, 0, 0, dw, dh);
@@ -231,7 +199,13 @@ export const DarkroomCanvas: React.FC<DarkroomCanvasProps> = ({
       config.pixelAreaBudget
     );
 
-    callbackRef.current(analysis, crop, layout, { width: srcW, height: srcH }, autoCorrect);
+    callbackRef.current({
+      analysis,
+      crop,
+      layout,
+      sourceSize: { width: srcW, height: srcH },
+      autoCorrect,
+    });
 
     // Create rotated intermediate canvas
     const rotCanvas = document.createElement('canvas');
@@ -470,17 +444,11 @@ export const DarkroomCanvas: React.FC<DarkroomCanvasProps> = ({
 
       const isCompactBadge = layout.canvasWidth < 800;
       const beforeText = isCompactBadge
-        ? `BEFORE (${analysis.detectedTiltDeg > 0 ? `+${analysis.detectedTiltDeg.toFixed(1)}°` : `${analysis.detectedTiltDeg.toFixed(1)}°`})`
-        : `BEFORE · UN-LEVELED (${
-            analysis.detectedTiltDeg > 0
-              ? `+${analysis.detectedTiltDeg.toFixed(2)}°`
-              : `${analysis.detectedTiltDeg.toFixed(2)}°`
-          })`;
+        ? `BEFORE (${formatSignedDegrees(analysis.detectedTiltDeg, 1)})`
+        : `BEFORE · UN-LEVELED (${formatSignedDegrees(analysis.detectedTiltDeg, 2)})`;
       const afterText = isCompactBadge
-        ? `AFTER (${totalRotDeg > 0 ? `+${totalRotDeg.toFixed(1)}°` : `${totalRotDeg.toFixed(1)}°`})`
-        : `AFTER · LEVELED & FRAMED (${
-            totalRotDeg > 0 ? `+${totalRotDeg.toFixed(2)}°` : `${totalRotDeg.toFixed(2)}°`
-          })`;
+        ? `AFTER (${formatSignedDegrees(totalRotDeg, 1)})`
+        : `AFTER · LEVELED & FRAMED (${formatSignedDegrees(totalRotDeg, 2)})`;
 
       const beforeW = ctx.measureText(beforeText).width + padX * 2;
       const afterW = ctx.measureText(afterText).width + padX * 2;
