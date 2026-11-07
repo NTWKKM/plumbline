@@ -205,7 +205,7 @@ export default function App() {
   };
 
   return (
-    <div className="flex min-h-[100dvh] lg:h-[100dvh] lg:overflow-hidden flex-col bg-[#09090b] text-zinc-100">
+    <div className="flex h-[100dvh] overflow-hidden flex-col bg-[#09090b] text-zinc-100">
       {/* Hidden File Input for Supported Image Formats */}
       <input
         ref={fileInputRef}
@@ -217,9 +217,9 @@ export default function App() {
       />
 
       {/* 3-Zone Responsive Header */}
-      <header className="flex items-center justify-between gap-3 sm:gap-6 border-b border-zinc-800/80 bg-[#121215] px-4 sm:px-6 py-2.5 sm:py-3 shrink-0">
+      <header className="flex items-center justify-between gap-1.5 sm:gap-6 border-b border-zinc-800/80 bg-[#121215] px-2.5 sm:px-6 py-2 sm:py-3 shrink-0">
         {/* Zone 1: Wordmark & Studio badge */}
-        <div className="flex items-center gap-2.5 shrink-0">
+        <div className="flex items-center gap-2 shrink-0">
           <a
             href="#workspace"
             onClick={(e) => {
@@ -227,7 +227,7 @@ export default function App() {
               setViewMode('framed');
               setMobileTab('canvas');
             }}
-            className="font-display text-base sm:text-lg font-bold tracking-tight text-zinc-100 whitespace-nowrap"
+            className="font-display text-sm sm:text-lg font-bold tracking-tight text-zinc-100 whitespace-nowrap"
           >
             Plumb_Line
           </a>
@@ -246,11 +246,11 @@ export default function App() {
         </div>
 
         {/* Mobile View Switcher Tabs (Only visible on screens < 1024px) */}
-        <div className="flex lg:hidden items-center rounded-lg bg-zinc-900 p-0.5 border border-zinc-800 text-xs shrink-0">
+        <div className="flex lg:hidden items-center rounded-lg bg-zinc-900 p-0.5 border border-zinc-800 text-[11px] sm:text-xs shrink-0">
           <button
             type="button"
             onClick={() => setMobileTab('canvas')}
-            className={`rounded-md px-2.5 py-1 font-medium transition-colors ${
+            className={`rounded-md px-2 py-1 sm:px-2.5 font-medium transition-colors ${
               mobileTab === 'canvas' ? 'bg-zinc-800 text-white' : 'text-zinc-400 hover:text-zinc-200'
             }`}
           >
@@ -259,7 +259,7 @@ export default function App() {
           <button
             type="button"
             onClick={() => setMobileTab('adjust')}
-            className={`rounded-md px-2.5 py-1 font-medium transition-colors ${
+            className={`rounded-md px-2 py-1 sm:px-2.5 font-medium transition-colors ${
               mobileTab === 'adjust' ? 'bg-zinc-800 text-white' : 'text-zinc-400 hover:text-zinc-200'
             }`}
           >
@@ -268,7 +268,7 @@ export default function App() {
           <button
             type="button"
             onClick={() => setMobileTab('queue')}
-            className={`rounded-md px-2.5 py-1 font-medium transition-colors ${
+            className={`rounded-md px-2 py-1 sm:px-2.5 font-medium transition-colors ${
               mobileTab === 'queue' ? 'bg-zinc-800 text-white' : 'text-zinc-400 hover:text-zinc-200'
             }`}
           >
@@ -281,7 +281,7 @@ export default function App() {
           <button
             type="button"
             onClick={() => fileInputRef.current?.click()}
-            className="flex items-center gap-1.5 rounded-lg bg-zinc-100 hover:bg-white text-zinc-950 px-3 py-1.5 sm:px-3.5 sm:py-2 text-xs font-semibold transition-colors whitespace-nowrap shrink-0"
+            className="flex items-center gap-1.5 rounded-lg bg-zinc-100 hover:bg-white text-zinc-950 px-2.5 py-1.5 sm:px-3.5 sm:py-2 text-xs font-semibold transition-colors whitespace-nowrap shrink-0"
           >
             <ImagePlus className="h-3.5 w-3.5" />
             <span className="hidden sm:inline">Import Photo</span>
@@ -501,7 +501,7 @@ export default function App() {
           )}
 
           {/* Canvas Stage */}
-          <div className="flex-1 min-h-[300px] lg:min-h-0 flex items-center justify-center overflow-hidden p-2 sm:p-4">
+          <div className="flex-1 min-h-0 flex items-center justify-center overflow-hidden p-2 sm:p-4">
             <DarkroomCanvas
               key={activePhoto.id}
               photo={activePhoto}

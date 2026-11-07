@@ -343,6 +343,20 @@ test('analyzeAutoCorrection handles fully transparent images and ignores transpa
   const mixedCorr = analyzeAutoCorrection(mixed, w, h);
   // Midtone 128 should NOT be over-brightened as if it were dark
   assert.ok(Math.abs(mixedCorr.exposureEv) < 0.2, `Expected neutral EV around 0, got ${mixedCorr.exposureEv}`);
+
+  // Verify applyAutoCorrectionToRgba leaves transparent alpha pixels strictly untouched
+  applyAutoCorrectionToRgba(mixed, w, h, mixedCorr, 100);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const idx = (y * w + x) * 4;
+      if (x < 8 || x >= 24 || y < 8 || y >= 24) {
+        assert.equal(mixed[idx + 3], 0);
+        assert.equal(mixed[idx], 0);
+        assert.equal(mixed[idx + 1], 0);
+        assert.equal(mixed[idx + 2], 0);
+      }
+    }
+  }
 });
 
 

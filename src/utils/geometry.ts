@@ -1113,6 +1113,9 @@ export function applyAutoCorrectionToRgba(
 
   const end = totalPixels * 4;
   for (let i = 0; i < end; i += 4) {
+    // Preserve transparent pixels (e.g. uncropped rotation wedges or PNG cutouts)
+    if (rgbaData[i + 3] === 0) continue;
+
     const r = rgbaData[i];
     const g = rgbaData[i + 1];
     const b = rgbaData[i + 2];
