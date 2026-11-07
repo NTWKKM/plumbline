@@ -217,7 +217,7 @@ export default function App() {
       />
 
       {/* 3-Zone Responsive Header */}
-      <header className="flex items-center justify-between gap-1.5 sm:gap-6 border-b border-zinc-800/80 bg-[#121215] px-2.5 sm:px-6 py-2 sm:py-3 shrink-0">
+      <header className="flex flex-wrap items-center justify-between gap-x-2 gap-y-1.5 sm:gap-6 border-b border-zinc-800/80 bg-[#121215] px-2.5 sm:px-6 py-2 sm:py-3 shrink-0">
         {/* Zone 1: Wordmark & Studio badge */}
         <div className="flex items-center gap-2 shrink-0">
           <a
@@ -246,11 +246,11 @@ export default function App() {
         </div>
 
         {/* Mobile View Switcher Tabs (Only visible on screens < 1024px) */}
-        <div className="flex lg:hidden items-center rounded-lg bg-zinc-900 p-0.5 border border-zinc-800 text-[11px] sm:text-xs shrink-0">
+        <div className="flex lg:hidden items-center rounded-lg bg-zinc-900 p-0.5 border border-zinc-800 text-[11px] sm:text-xs shrink min-w-0">
           <button
             type="button"
             onClick={() => setMobileTab('canvas')}
-            className={`rounded-md px-2 py-1 sm:px-2.5 font-medium transition-colors ${
+            className={`rounded-md px-2 py-1 sm:px-2.5 font-medium transition-colors whitespace-nowrap ${
               mobileTab === 'canvas' ? 'bg-zinc-800 text-white' : 'text-zinc-400 hover:text-zinc-200'
             }`}
           >
@@ -259,7 +259,7 @@ export default function App() {
           <button
             type="button"
             onClick={() => setMobileTab('adjust')}
-            className={`rounded-md px-2 py-1 sm:px-2.5 font-medium transition-colors ${
+            className={`rounded-md px-2 py-1 sm:px-2.5 font-medium transition-colors whitespace-nowrap ${
               mobileTab === 'adjust' ? 'bg-zinc-800 text-white' : 'text-zinc-400 hover:text-zinc-200'
             }`}
           >
@@ -268,7 +268,7 @@ export default function App() {
           <button
             type="button"
             onClick={() => setMobileTab('queue')}
-            className={`rounded-md px-2 py-1 sm:px-2.5 font-medium transition-colors ${
+            className={`rounded-md px-2 py-1 sm:px-2.5 font-medium transition-colors whitespace-nowrap ${
               mobileTab === 'queue' ? 'bg-zinc-800 text-white' : 'text-zinc-400 hover:text-zinc-200'
             }`}
           >

@@ -60,6 +60,7 @@ export const DarkroomCanvas: React.FC<DarkroomCanvasProps> = ({
 
   // Cache processed full-resolution rotCanvas and framed output across interactive split drags
   const pipelineCacheRef = useRef<{
+    sensorCanvas: HTMLCanvasElement;
     cacheKey: string;
     crop: CropRect;
     layout: FrameLayout;
@@ -217,7 +218,11 @@ export const DarkroomCanvas: React.FC<DarkroomCanvasProps> = ({
       photo.exif.focalLength,
     ].join('|');
 
-    if (!pipelineCacheRef.current || pipelineCacheRef.current.cacheKey !== pipelineKey) {
+    if (
+      !pipelineCacheRef.current ||
+      pipelineCacheRef.current.sensorCanvas !== sensorCanvas ||
+      pipelineCacheRef.current.cacheKey !== pipelineKey
+    ) {
       const crop = config.autoCropEnabled
         ? computeInscribedCrop(srcW, srcH, totalRotDeg, config.preserveAspectRatioInCrop)
         : {
@@ -341,6 +346,7 @@ export const DarkroomCanvas: React.FC<DarkroomCanvasProps> = ({
       }
 
       pipelineCacheRef.current = {
+        sensorCanvas,
         cacheKey: pipelineKey,
         crop,
         layout,

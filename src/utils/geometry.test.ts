@@ -262,6 +262,35 @@ test('computeInscribedCrop enforces symmetric center parity and supports targetA
   const mixedSq = computeInscribedCrop(2001, 1400, 4.0, true, 1.0);
   assert.equal(mixedSq.width, mixedSq.height, 'Square crop must remain 1:1 on mixed parity source');
   assert.ok(mixedSq.width > 1100 && mixedSq.width < 1400);
+
+  // Verify all four crop corners inverse-rotated into source coordinates lie within source bounds
+  const verifyCornersInside = (w: number, h: number, angleDeg: number, crop: { x: number; y: number; width: number; height: number }) => {
+    const rad = (Math.abs(angleDeg) * Math.PI) / 180;
+    const cosA = Math.cos(rad);
+    const sinA = Math.sin(rad);
+    const cx = w / 2;
+    const cy = h / 2;
+    const corners = [
+      [crop.x, crop.y],
+      [crop.x + crop.width, crop.y],
+      [crop.x, crop.y + crop.height],
+      [crop.x + crop.width, crop.y + crop.height],
+    ];
+    for (const [px, py] of corners) {
+      const dx = px - cx;
+      const dy = py - cy;
+      const rx = dx * cosA + dy * sinA + cx;
+      const ry = -dx * sinA + dy * cosA + cy;
+      assert.ok(
+        rx >= -1e-4 && rx <= w + 1e-4 && ry >= -1e-4 && ry <= h + 1e-4,
+        `Corner (${px}, ${py}) inverse-rotated to (${rx.toFixed(3)}, ${ry.toFixed(3)}) bleeds outside source ${w}x${h}`
+      );
+    }
+  };
+
+  verifyCornersInside(2000, 1400, 3.2, res);
+  verifyCornersInside(2000, 1400, 4.0, sq);
+  verifyCornersInside(2001, 1400, 4.0, mixedSq);
 });
 
 test('analyzeAutoCorrection and applyAutoCorrectionToRgba optimize underexposed low-contrast image with color cast', () => {
@@ -335,11 +364,18 @@ test('analyzeAutoCorrection handles fully transparent images and ignores transpa
         mixed[idx + 2] = 128;
         mixed[idx + 3] = 255;
       } else {
-        // Transparent border
+        // Seed transparent border with nonzero RGB values to test alpha-zero preservation
+        mixed[idx] = 42;
+        mixed[idx + 1] = 84;
+        mixed[idx + 2] = 126;
         mixed[idx + 3] = 0;
       }
     }
   }
+
+  // Snapshot before correction to ensure transparent bytes remain untouched
+  const snapshotBefore = new Uint8ClampedArray(mixed);
+
   const mixedCorr = analyzeAutoCorrection(mixed, w, h);
   // Midtone 128 should NOT be over-brightened as if it were dark
   assert.ok(Math.abs(mixedCorr.exposureEv) < 0.2, `Expected neutral EV around 0, got ${mixedCorr.exposureEv}`);
@@ -350,10 +386,10 @@ test('analyzeAutoCorrection handles fully transparent images and ignores transpa
     for (let x = 0; x < w; x++) {
       const idx = (y * w + x) * 4;
       if (x < 8 || x >= 24 || y < 8 || y >= 24) {
-        assert.equal(mixed[idx + 3], 0);
-        assert.equal(mixed[idx], 0);
-        assert.equal(mixed[idx + 1], 0);
-        assert.equal(mixed[idx + 2], 0);
+        assert.equal(mixed[idx], snapshotBefore[idx], 'Red channel of transparent pixel must be unchanged');
+        assert.equal(mixed[idx + 1], snapshotBefore[idx + 1], 'Green channel of transparent pixel must be unchanged');
+        assert.equal(mixed[idx + 2], snapshotBefore[idx + 2], 'Blue channel of transparent pixel must be unchanged');
+        assert.equal(mixed[idx + 3], 0, 'Alpha channel of transparent pixel must remain zero');
       }
     }
   }

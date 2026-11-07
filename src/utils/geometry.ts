@@ -206,6 +206,35 @@ export function computeInscribedCrop(
           side -= 1;
         }
       }
+
+      // Check if any corner bleeds outside the source bounds due to 0.5px center offset on mixed-parity dimensions
+      const cx = safeW / 2;
+      const cy = safeH / 2;
+      const isCornerOutside = (s: number): boolean => {
+        const x = Math.floor((safeW - s) / 2);
+        const y = Math.floor((safeH - s) / 2);
+        const corners = [
+          [x, y],
+          [x + s, y],
+          [x, y + s],
+          [x + s, y + s],
+        ];
+        for (const [px, py] of corners) {
+          const dx = px - cx;
+          const dy = py - cy;
+          const rx = dx * cosA + dy * sinA + cx;
+          const ry = -dx * sinA + dy * cosA + cy;
+          if (rx < -1e-4 || rx > safeW + 1e-4 || ry < -1e-4 || ry > safeH + 1e-4) {
+            return true;
+          }
+        }
+        return false;
+      };
+
+      while (side > 4 && isCornerOutside(side)) {
+        side -= 1;
+      }
+
       cropW = side;
       cropH = side;
     } else {
@@ -980,6 +1009,35 @@ export function analyzeAutoCorrection(
         midG += g;
         midB += b;
         midCount++;
+      }
+    }
+  }
+
+  // If strided sampling encountered only transparent pixels, check unsampled pixels for any visible content
+  if (sampleCount === 0 && stride > 1) {
+    for (let p = 0; p < totalPixels; p++) {
+      if (p % stride === 0) continue; // already checked in first pass
+      const idx = p * 4;
+      const a = rgbaData[idx + 3];
+      if (a === 0) continue;
+
+      const r = rgbaData[idx];
+      const g = rgbaData[idx + 1];
+      const b = rgbaData[idx + 2];
+
+      const y = clamp(Math.round(0.2126 * r + 0.7152 * g + 0.0722 * b), 0, 255);
+      lumaHist[y]++;
+      sampleCount++;
+
+      if (y >= 32 && y <= 220) {
+        const maxC = Math.max(r, g, b);
+        const minC = Math.min(r, g, b);
+        if (maxC - minC < 110) {
+          midR += r;
+          midG += g;
+          midB += b;
+          midCount++;
+        }
       }
     }
   }
