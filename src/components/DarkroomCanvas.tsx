@@ -424,14 +424,19 @@ export const DarkroomCanvas: React.FC<DarkroomCanvasProps> = ({
       const sideMargin = Math.max(18, Math.round(layout.canvasWidth * 0.022));
       const badgeY = Math.max(18, Math.round(layout.canvasHeight * 0.025));
 
-      const beforeText = `BEFORE · UN-LEVELED (${
-        analysis.detectedTiltDeg > 0
-          ? `+${analysis.detectedTiltDeg.toFixed(2)}°`
-          : `${analysis.detectedTiltDeg.toFixed(2)}°`
-      })`;
-      const afterText = `AFTER · LEVELED & FRAMED (${
-        totalRotDeg > 0 ? `+${totalRotDeg.toFixed(2)}°` : `${totalRotDeg.toFixed(2)}°`
-      })`;
+      const isCompactBadge = layout.canvasWidth < 800;
+      const beforeText = isCompactBadge
+        ? `BEFORE (${analysis.detectedTiltDeg > 0 ? `+${analysis.detectedTiltDeg.toFixed(1)}°` : `${analysis.detectedTiltDeg.toFixed(1)}°`})`
+        : `BEFORE · UN-LEVELED (${
+            analysis.detectedTiltDeg > 0
+              ? `+${analysis.detectedTiltDeg.toFixed(2)}°`
+              : `${analysis.detectedTiltDeg.toFixed(2)}°`
+          })`;
+      const afterText = isCompactBadge
+        ? `AFTER (${totalRotDeg > 0 ? `+${totalRotDeg.toFixed(1)}°` : `${totalRotDeg.toFixed(1)}°`})`
+        : `AFTER · LEVELED & FRAMED (${
+            totalRotDeg > 0 ? `+${totalRotDeg.toFixed(2)}°` : `${totalRotDeg.toFixed(2)}°`
+          })`;
 
       const beforeW = ctx.measureText(beforeText).width + padX * 2;
       const afterW = ctx.measureText(afterText).width + padX * 2;
@@ -579,7 +584,7 @@ export const DarkroomCanvas: React.FC<DarkroomCanvasProps> = ({
         onPointerUp={handlePointerUp}
         onPointerCancel={handlePointerCancel}
         onLostPointerCapture={handleLostPointerCapture}
-        className={`max-h-full max-w-full object-contain shadow-2xl transition-opacity duration-150 ${
+        className={`max-h-full max-w-full object-contain ring-1 ring-zinc-800/80 transition-opacity duration-150 ${
           viewMode === 'split' ? 'cursor-ew-resize select-none touch-none' : ''
         }`}
       />
