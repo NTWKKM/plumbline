@@ -257,6 +257,11 @@ test('computeInscribedCrop enforces symmetric center parity and supports targetA
   const sq = computeInscribedCrop(2000, 1400, 4.0, true, 1.0);
   assert.equal(sq.width, sq.height);
   assert.ok(sq.width > 1100 && sq.width < 1400);
+
+  // Mixed parity source dimensions (2001 odd, 1400 even) preserves square crop
+  const mixedSq = computeInscribedCrop(2001, 1400, 4.0, true, 1.0);
+  assert.equal(mixedSq.width, mixedSq.height, 'Square crop must remain 1:1 on mixed parity source');
+  assert.ok(mixedSq.width > 1100 && mixedSq.width < 1400);
 });
 
 test('analyzeAutoCorrection and applyAutoCorrectionToRgba optimize underexposed low-contrast image with color cast', () => {
@@ -279,17 +284,65 @@ test('analyzeAutoCorrection and applyAutoCorrectionToRgba optimize underexposed 
   assert.ok(corr.contrast >= 12, `Expected contrast boost >= 12, got ${corr.contrast}`);
   assert.ok(corr.wbTempShift > 0, `Expected warm WB shift to neutralize blue cast, got ${corr.wbTempShift}`);
 
-  const beforeMidR = rgba[(32 * w + 32) * 4];
-  const beforeMidB = rgba[(32 * w + 32) * 4 + 2];
+  // Test zero, intermediate (50%), and full (100%) strength using separate copies
+  const rgbaOriginal = new Uint8ClampedArray(rgba);
+  const rgbaZero = new Uint8ClampedArray(rgba);
+  const rgbaHalf = new Uint8ClampedArray(rgba);
+  const rgbaFull = new Uint8ClampedArray(rgba);
 
-  applyAutoCorrectionToRgba(rgba, w, h, corr, 100);
+  applyAutoCorrectionToRgba(rgbaZero, w, h, corr, 0);
+  assert.deepEqual(rgbaZero, rgbaOriginal, 'Zero strength must leave all bytes unchanged');
 
-  const afterMidR = rgba[(32 * w + 32) * 4];
-  const afterMidB = rgba[(32 * w + 32) * 4 + 2];
+  applyAutoCorrectionToRgba(rgbaHalf, w, h, corr, 50);
+  applyAutoCorrectionToRgba(rgbaFull, w, h, corr, 100);
+
+  const testIdx = (32 * w + 32) * 4;
+  const origR = rgbaOriginal[testIdx];
+  const halfR = rgbaHalf[testIdx];
+  const fullR = rgbaFull[testIdx];
+
+  assert.ok(halfR > origR, 'Intermediate strength must brighten midtones');
+  assert.ok(fullR > halfR, 'Full strength must brighten more than intermediate');
+  assert.notDeepEqual(rgbaHalf, rgbaOriginal);
+  assert.notDeepEqual(rgbaHalf, rgbaFull);
 
   // Midtones should be brightened and the R-to-B cast gap reduced
+  const afterMidR = rgbaFull[testIdx];
+  const afterMidB = rgbaFull[testIdx + 2];
+  const beforeMidR = rgbaOriginal[testIdx];
+  const beforeMidB = rgbaOriginal[testIdx + 2];
   assert.ok(afterMidR > beforeMidR);
   assert.ok(Math.abs(afterMidB - afterMidR) < Math.abs(beforeMidB - beforeMidR));
+});
+
+test('analyzeAutoCorrection handles fully transparent images and ignores transparent alpha pixels', () => {
+  const w = 32;
+  const h = 32;
+  const transparent = new Uint8ClampedArray(w * h * 4);
+  const neutralCorr = analyzeAutoCorrection(transparent, w, h);
+  assert.equal(neutralCorr.exposureEv, 0);
+  assert.equal(neutralCorr.contrast, 10);
+  assert.equal(neutralCorr.shadows, 0);
+
+  // Mixed transparent margin: image subject is well-exposed, outer margin is transparent
+  const mixed = new Uint8ClampedArray(w * h * 4);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const idx = (y * w + x) * 4;
+      if (x >= 8 && x < 24 && y >= 8 && y < 24) {
+        mixed[idx] = 128;
+        mixed[idx + 1] = 128;
+        mixed[idx + 2] = 128;
+        mixed[idx + 3] = 255;
+      } else {
+        // Transparent border
+        mixed[idx + 3] = 0;
+      }
+    }
+  }
+  const mixedCorr = analyzeAutoCorrection(mixed, w, h);
+  // Midtone 128 should NOT be over-brightened as if it were dark
+  assert.ok(Math.abs(mixedCorr.exposureEv) < 0.2, `Expected neutral EV around 0, got ${mixedCorr.exposureEv}`);
 });
 
 

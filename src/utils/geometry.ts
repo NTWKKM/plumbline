@@ -198,8 +198,20 @@ export function computeInscribedCrop(
   // Enforce symmetric center parity when rotated so (safeW - cropW) and (safeH - cropH) are even integers,
   // preventing 0.5px off-center drift and anti-aliased corner bleed
   if (rad >= 1e-5) {
-    if (cropW > 4 && (safeW - cropW) % 2 !== 0) cropW -= 1;
-    if (cropH > 4 && (safeH - cropH) % 2 !== 0) cropH -= 1;
+    if (hasCustomRatio && Math.abs(targetAspectRatio! - 1) < 1e-4) {
+      // For square crops, width and height must remain strictly equal
+      let side = Math.min(cropW, cropH);
+      if (safeW % 2 === safeH % 2) {
+        if (side > 4 && (safeW - side) % 2 !== 0) {
+          side -= 1;
+        }
+      }
+      cropW = side;
+      cropH = side;
+    } else {
+      if (cropW > 4 && (safeW - cropW) % 2 !== 0) cropW -= 1;
+      if (cropH > 4 && (safeH - cropH) % 2 !== 0) cropH -= 1;
+    }
   }
 
   const scaleFactor = Number(Math.min(cropW / safeW, cropH / safeH).toFixed(4));
@@ -946,6 +958,10 @@ export function analyzeAutoCorrection(
 
   for (let p = 0; p < totalPixels; p += stride) {
     const idx = p * 4;
+    const a = rgbaData[idx + 3];
+    // Skip fully transparent samples so PNG transparent borders do not skew histogram
+    if (a === 0) continue;
+
     const r = rgbaData[idx];
     const g = rgbaData[idx + 1];
     const b = rgbaData[idx + 2];
@@ -966,6 +982,21 @@ export function analyzeAutoCorrection(
         midCount++;
       }
     }
+  }
+
+  // If image contains only transparent or zero visible pixels, return neutral defaults
+  if (sampleCount === 0) {
+    return {
+      exposureEv: 0,
+      contrast: 10,
+      shadows: 0,
+      highlights: 0,
+      wbTempShift: 0,
+      wbTintShift: 0,
+      blackPoint: 0,
+      whitePoint: 255,
+      dynamicRangeStops: 8.0,
+    };
   }
 
   const findPercentile = (fraction: number): number => {

@@ -230,7 +230,7 @@ export const DarkroomCanvas: React.FC<DarkroomCanvasProps> = ({
 
     // Apply luminance-preserving Filmic Auto-Correct & White Balance neutralization if enabled
     const corrStrength = config.autoCorrectStrength ?? 75;
-    if (config.autoCorrectEnabled && corrStrength > 0 && crop.width > 0 && crop.height > 0) {
+    if ((config.autoCorrectEnabled ?? true) && corrStrength > 0 && crop.width > 0 && crop.height > 0) {
       const croppedData = rCtx.getImageData(crop.x, crop.y, crop.width, crop.height);
       applyAutoCorrectionToRgba(
         croppedData.data,
