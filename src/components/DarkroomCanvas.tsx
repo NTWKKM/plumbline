@@ -1,9 +1,12 @@
 import React, { useEffect, useRef, useState } from 'react';
 import {
+  AutoCorrectAnalysis,
   CropRect,
   FrameLayout,
   LevelingAnalysis,
   PipelineConfig,
+  analyzeAutoCorrection,
+  applyAutoCorrectionToRgba,
   computeFrameLayout,
   computeInscribedCrop,
   computeSplitDividerX,
@@ -26,7 +29,8 @@ interface DarkroomCanvasProps {
     analysis: LevelingAnalysis,
     crop: CropRect,
     layout: FrameLayout,
-    sourceSize: { width: number; height: number }
+    sourceSize: { width: number; height: number },
+    autoCorrect?: AutoCorrectAnalysis
   ) => void;
   canvasRef: React.RefObject<HTMLCanvasElement | null>;
   onImageLoaded?: (loaded: boolean) => void;
@@ -51,6 +55,17 @@ export const DarkroomCanvas: React.FC<DarkroomCanvasProps> = ({
     appliedRotationDeg: 0,
     confidence: 0,
     strongEdgeCount: 0,
+  });
+  const [autoCorrect, setAutoCorrect] = useState<AutoCorrectAnalysis>({
+    exposureEv: 0,
+    contrast: 10,
+    shadows: 0,
+    highlights: 0,
+    wbTempShift: 0,
+    wbTintShift: 0,
+    blackPoint: 0,
+    whitePoint: 255,
+    dynamicRangeStops: 8.0,
   });
   const [loadError, setLoadError] = useState<string | null>(null);
   const [isDraggingSplit, setIsDraggingSplit] = useState<boolean>(false);
@@ -104,8 +119,8 @@ export const DarkroomCanvas: React.FC<DarkroomCanvasProps> = ({
       ctx.drawImage(img, -scaledW / 2, -scaledH / 2, scaledW, scaledH);
       ctx.restore();
 
-      // Downscale to <= 480px on longest side for fast, deterministic horizon detection
-      const detectScale = Math.min(1, 480 / Math.max(offscreen.width, offscreen.height));
+      // Downscale to <= 640px on longest side for sub-0.01° Scharr/Radon/IRLS horizon detection & Auto-Correct analysis
+      const detectScale = Math.min(1, 640 / Math.max(offscreen.width, offscreen.height));
       const dw = Math.max(16, Math.round(offscreen.width * detectScale));
       const dh = Math.max(16, Math.round(offscreen.height * detectScale));
 
@@ -119,6 +134,17 @@ export const DarkroomCanvas: React.FC<DarkroomCanvasProps> = ({
         confidence: 0,
         strongEdgeCount: 0,
       };
+      let autoCorr: AutoCorrectAnalysis = {
+        exposureEv: 0,
+        contrast: 10,
+        shadows: 0,
+        highlights: 0,
+        wbTempShift: 0,
+        wbTintShift: 0,
+        blackPoint: 0,
+        whitePoint: 255,
+        dynamicRangeStops: 8.0,
+      };
 
       if (dCtx) {
         dCtx.drawImage(offscreen, 0, 0, dw, dh);
@@ -131,10 +157,12 @@ export const DarkroomCanvas: React.FC<DarkroomCanvasProps> = ({
           );
         }
         detected = detectHorizonTiltFromGrayscale(gray, dw, dh, config.maxAutoAngleDeg);
+        autoCorr = analyzeAutoCorrection(imgData, dw, dh);
       }
 
       setSensorCanvas(offscreen);
       setAnalysis(detected);
+      setAutoCorrect(autoCorr);
     };
 
     img.onerror = () => {
@@ -203,7 +231,7 @@ export const DarkroomCanvas: React.FC<DarkroomCanvasProps> = ({
       config.pixelAreaBudget
     );
 
-    callbackRef.current(analysis, crop, layout, { width: srcW, height: srcH });
+    callbackRef.current(analysis, crop, layout, { width: srcW, height: srcH }, autoCorrect);
 
     // Create rotated intermediate canvas
     const rotCanvas = document.createElement('canvas');
@@ -219,10 +247,26 @@ export const DarkroomCanvas: React.FC<DarkroomCanvasProps> = ({
     rCtx.fillStyle = config.backgroundColor;
     rCtx.fillRect(0, 0, srcW, srcH);
     rCtx.save();
+    rCtx.imageSmoothingEnabled = true;
+    rCtx.imageSmoothingQuality = 'high';
     rCtx.translate(srcW / 2, srcH / 2);
     rCtx.rotate((totalRotDeg * Math.PI) / 180);
     rCtx.drawImage(sensorCanvas, -srcW / 2, -srcH / 2);
     rCtx.restore();
+
+    // Apply luminance-preserving Filmic Auto-Correct & White Balance neutralization if enabled
+    const corrStrength = config.autoCorrectStrength ?? 75;
+    if (config.autoCorrectEnabled && corrStrength > 0 && crop.width > 0 && crop.height > 0) {
+      const croppedData = rCtx.getImageData(crop.x, crop.y, crop.width, crop.height);
+      applyAutoCorrectionToRgba(
+        croppedData.data,
+        crop.width,
+        crop.height,
+        autoCorrect,
+        corrStrength
+      );
+      rCtx.putImageData(croppedData, crop.x, crop.y);
+    }
 
     const drawProcessedFrame = (targetCtx: CanvasRenderingContext2D) => {
       // 1. Fill border background
@@ -506,6 +550,7 @@ export const DarkroomCanvas: React.FC<DarkroomCanvasProps> = ({
   }, [
     sensorCanvas,
     analysis,
+    autoCorrect,
     config,
     viewMode,
     splitPercent,

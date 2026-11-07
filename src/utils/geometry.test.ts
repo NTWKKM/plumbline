@@ -8,6 +8,8 @@ import {
   computeSplitDividerX,
   computePixelAreaScale,
   getScaledDimensionsWithinBudget,
+  analyzeAutoCorrection,
+  applyAutoCorrectionToRgba,
 } from './geometry';
 
 test('computeInscribedCrop returns full image dimensions when rotation angle is 0', () => {
@@ -197,4 +199,76 @@ test('computeFrameLayout respects opt-in pixelAreaBudget while preserving MAX_CA
   assert.equal(defaultLayout.canvasWidth, 8192);
   assert.equal(defaultLayout.canvasHeight, 8192);
 });
+
+test('detectHorizonTiltFromGrayscale recovers sub-degree vertical architectural tilt and subtle negative horizon tilt', () => {
+  const w = 240;
+  const h = 180;
+  const gray = new Float32Array(w * h);
+  const trueTiltDeg = -2.35;
+  const slope = Math.tan((trueTiltDeg * Math.PI) / 180);
+
+  // Smooth anti-aliased horizon at -2.35°
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const horizonY = h * 0.45 + (x - w * 0.5) * slope;
+      const dist = y - horizonY;
+      const blend = Math.max(0, Math.min(1, 0.5 + dist * 0.8));
+      gray[y * w + x] = 230 * (1 - blend) + 35 * blend;
+    }
+  }
+
+  const analysis = detectHorizonTiltFromGrayscale(gray, w, h, 15.0);
+  assert.ok(
+    Math.abs(analysis.detectedTiltDeg - trueTiltDeg) <= 0.08,
+    `Expected ${trueTiltDeg}°, got ${analysis.detectedTiltDeg}°`
+  );
+  assert.equal(analysis.appliedRotationDeg, Number((-analysis.detectedTiltDeg).toFixed(2)));
+  assert.ok(analysis.confidence >= 0.75);
+});
+
+test('computeInscribedCrop enforces symmetric center parity and supports targetAspectRatio override', () => {
+  const res = computeInscribedCrop(2000, 1400, 3.2, true);
+  // Left margin must equal right margin exactly (zero 0.5px drift)
+  assert.equal(res.x, 2000 - (res.x + res.width));
+  assert.equal(res.y, 1400 - (res.y + res.height));
+
+  // Target 1:1 square inscribed crop inside rotated 2000x1400
+  const sq = computeInscribedCrop(2000, 1400, 4.0, true, 1.0);
+  assert.equal(sq.width, sq.height);
+  assert.ok(sq.width > 1100 && sq.width < 1400);
+});
+
+test('analyzeAutoCorrection and applyAutoCorrectionToRgba optimize underexposed low-contrast image with color cast', () => {
+  const w = 64;
+  const h = 64;
+  const rgba = new Uint8ClampedArray(w * h * 4);
+
+  // Create a dim, low-contrast image with a cool blue cast (R < G < B)
+  for (let i = 0; i < w * h; i++) {
+    const t = (i % w) / (w - 1);
+    const base = Math.round(35 + t * 90); // Luma range ~[35, 125] (underexposed & compressed)
+    rgba[i * 4] = Math.max(0, base - 12);     // R (cool deficit)
+    rgba[i * 4 + 1] = base;                   // G
+    rgba[i * 4 + 2] = Math.min(255, base + 14); // B (blue cast)
+    rgba[i * 4 + 3] = 255;
+  }
+
+  const corr = analyzeAutoCorrection(rgba, w, h);
+  assert.ok(corr.exposureEv > 0.1, `Expected positive EV boost, got ${corr.exposureEv}`);
+  assert.ok(corr.contrast >= 12, `Expected contrast boost >= 12, got ${corr.contrast}`);
+  assert.ok(corr.wbTempShift > 0, `Expected warm WB shift to neutralize blue cast, got ${corr.wbTempShift}`);
+
+  const beforeMidR = rgba[(32 * w + 32) * 4];
+  const beforeMidB = rgba[(32 * w + 32) * 4 + 2];
+
+  applyAutoCorrectionToRgba(rgba, w, h, corr, 100);
+
+  const afterMidR = rgba[(32 * w + 32) * 4];
+  const afterMidB = rgba[(32 * w + 32) * 4 + 2];
+
+  // Midtones should be brightened and the R-to-B cast gap reduced
+  assert.ok(afterMidR > beforeMidR);
+  assert.ok(Math.abs(afterMidB - afterMidR) < Math.abs(beforeMidB - beforeMidR));
+});
+
 

@@ -45,6 +45,8 @@ export interface PipelineConfig {
   manualAngleOffsetDeg: number;
   autoCropEnabled: boolean;
   preserveAspectRatioInCrop: boolean;
+  autoCorrectEnabled?: boolean;
+  autoCorrectStrength?: number; // 0 to 100
   aspectPreset: AspectRatioPreset;
   paddingPercent: number; // 0 to 35
   backgroundColor: string; // Hex color e.g. #FFFFFF
@@ -61,6 +63,18 @@ export interface LevelingAnalysis {
   strongEdgeCount: number;
 }
 
+export interface AutoCorrectAnalysis {
+  exposureEv: number; // -1.2 to +1.2 EV
+  contrast: number; // 0 to 35
+  shadows: number; // 0 to 45
+  highlights: number; // -45 to 0
+  wbTempShift: number; // -25 to +25 (warm/cool neutralization)
+  wbTintShift: number; // -20 to +20 (green/magenta neutralization)
+  blackPoint: number; // 0 to 255
+  whitePoint: number; // 0 to 255
+  dynamicRangeStops: number;
+}
+
 export const MAX_AUTO_ANGLE_LIMIT_DEG = 15.0;
 
 /**
@@ -73,27 +87,37 @@ export function clamp(val: number, min: number, max: number): number {
 /**
  * Computes the Largest Axis-Aligned Inscribed Rectangle inside an image of size (width x height)
  * rotated by `angleDeg` degrees, eliminating all empty corner triangles.
+ * Supports preserving the source aspect ratio, unconstrained maximum-area rectangle,
+ * or an explicit target aspect ratio, with center-parity alignment to prevent 0.5px corner bleed.
  */
 export function computeInscribedCrop(
   width: number,
   height: number,
   angleDeg: number,
-  preserveAspect = true
+  preserveAspect = true,
+  targetAspectRatio?: number
 ): CropRect {
   if (width <= 0 || height <= 0) {
     return { x: 0, y: 0, width: 0, height: 0, scaleFactor: 1, areaRetainedPercent: 100 };
   }
 
+  const safeW = Math.round(width);
+  const safeH = Math.round(height);
   const rad = (Math.abs(angleDeg) * Math.PI) / 180;
   const sinA = Math.sin(rad);
   const cosA = Math.cos(rad);
 
-  if (rad < 1e-5) {
+  const hasCustomRatio =
+    typeof targetAspectRatio === 'number' &&
+    Number.isFinite(targetAspectRatio) &&
+    targetAspectRatio > 0;
+
+  if (rad < 1e-5 && !hasCustomRatio) {
     return {
       x: 0,
       y: 0,
-      width: Math.round(width),
-      height: Math.round(height),
+      width: safeW,
+      height: safeH,
       scaleFactor: 1,
       areaRetainedPercent: 100,
     };
@@ -102,20 +126,27 @@ export function computeInscribedCrop(
   let cropW: number;
   let cropH: number;
 
-  if (preserveAspect) {
+  if (hasCustomRatio) {
+    const ratio = targetAspectRatio!;
+    const maxHFromW = safeW / (ratio * cosA + sinA);
+    const maxHFromH = safeH / (ratio * sinA + cosA);
+    const maxH = Math.min(maxHFromW, maxHFromH);
+    cropW = Math.max(1, Math.floor(maxH * ratio));
+    cropH = Math.max(1, Math.floor(maxH));
+  } else if (preserveAspect) {
     // Tightest scale factor `s` such that (s*W, s*H) fits inside rotated (W, H)
-    const sWidth = width / (width * cosA + height * sinA);
-    const sHeight = height / (width * sinA + height * cosA);
+    const sWidth = safeW / (safeW * cosA + safeH * sinA);
+    const sHeight = safeH / (safeW * sinA + safeH * cosA);
     const s = Math.min(sWidth, sHeight);
-    cropW = Math.max(1, Math.floor(width * s));
-    cropH = Math.max(1, Math.floor(height * s));
+    cropW = Math.max(1, Math.floor(safeW * s));
+    cropH = Math.max(1, Math.floor(safeH * s));
   } else {
     // Maximum-area axis-aligned inscribed rectangle (non-fixed aspect ratio)
-    const shortSide = Math.min(width, height);
-    const longSide = Math.max(width, height);
+    const shortSide = Math.min(safeW, safeH);
+    const longSide = Math.max(safeW, safeH);
     if (shortSide <= 2 * sinA * cosA * longSide || Math.abs(cosA * cosA - sinA * sinA) < 1e-5) {
       const halfAngle = 0.5 * shortSide;
-      if (width >= height) {
+      if (safeW >= safeH) {
         cropW = Math.max(1, Math.floor(halfAngle / sinA));
         cropH = Math.max(1, Math.floor(halfAngle / cosA));
       } else {
@@ -124,17 +155,24 @@ export function computeInscribedCrop(
       }
     } else {
       const cos2A = cosA * cosA - sinA * sinA;
-      cropW = Math.max(1, Math.floor((width * cosA - height * sinA) / cos2A));
-      cropH = Math.max(1, Math.floor((height * cosA - width * sinA) / cos2A));
+      cropW = Math.max(1, Math.floor((safeW * cosA - safeH * sinA) / cos2A));
+      cropH = Math.max(1, Math.floor((safeH * cosA - safeW * sinA) / cos2A));
     }
   }
 
-  const scaleFactor = Number((cropW / width).toFixed(4));
-  const areaRetainedPercent = Number((((cropW * cropH) / (width * height)) * 100).toFixed(1));
+  // Enforce symmetric center parity when rotated so (safeW - cropW) and (safeH - cropH) are even integers,
+  // preventing 0.5px off-center drift and anti-aliased corner bleed
+  if (rad >= 1e-5) {
+    if (cropW > 4 && (safeW - cropW) % 2 !== 0) cropW -= 1;
+    if (cropH > 4 && (safeH - cropH) % 2 !== 0) cropH -= 1;
+  }
+
+  const scaleFactor = Number(Math.min(cropW / safeW, cropH / safeH).toFixed(4));
+  const areaRetainedPercent = Number((((cropW * cropH) / (safeW * safeH)) * 100).toFixed(1));
 
   return {
-    x: Math.floor((width - cropW) / 2),
-    y: Math.floor((height - cropH) / 2),
+    x: Math.floor((safeW - cropW) / 2),
+    y: Math.floor((safeH - cropH) / 2),
     width: cropW,
     height: cropH,
     scaleFactor,
@@ -144,10 +182,11 @@ export function computeInscribedCrop(
 
 /**
  * Detects dominant horizon and vertical architectural tilt using:
- * 1. 3x3 Sobel gradient extraction.
+ * 1. Rotationally invariant 3x3 Scharr gradient extraction.
  * 2. Per-Column (horizontal horizon) and Per-Row (vertical facade) Top-2 Non-Maximum Suppression (NMS)
- *    with clamped weights so high-contrast rocky/foliage texture cannot overwhelm a crisp straight horizon.
- * 3. Radon / Hough colinearity accumulator energy maximization over [-maxAngleDeg, +maxAngleDeg] at 0.1° resolution.
+ *    with 1D parabolic sub-pixel ridge localization and gradient polarity separation.
+ * 3. Bilinearly splatted Radon / Hough colinearity accumulator with 2-stage coarse-to-fine
+ *    (0.1° -> 0.01°) angular refinement and spatial coherency gating.
  */
 export function detectHorizonTiltFromGrayscale(
   gray: Uint8Array | Float32Array,
@@ -163,6 +202,7 @@ export function detectHorizonTiltFromGrayscale(
   const gxBuf = new Float32Array(width * height);
   const gyBuf = new Float32Array(width * height);
 
+  // Rotationally invariant 3x3 Scharr operator normalized by 1/4 to match Sobel scale
   for (let y = 1; y < height - 1; y++) {
     const rowPrev = (y - 1) * width;
     const rowCurr = y * width;
@@ -177,8 +217,8 @@ export function detectHorizonTiltFromGrayscale(
       const p21 = gray[rowNext + x];
       const p22 = gray[rowNext + x + 1];
 
-      gxBuf[rowCurr + x] = -p00 + p02 - 2 * p10 + 2 * p12 - p20 + p22;
-      gyBuf[rowCurr + x] = -p00 - 2 * p01 - p02 + p20 + 2 * p21 + p22;
+      gxBuf[rowCurr + x] = (-3 * p00 + 3 * p02 - 10 * p10 + 10 * p12 - 3 * p20 + 3 * p22) * 0.25;
+      gyBuf[rowCurr + x] = (-3 * p00 - 10 * p01 - 3 * p02 + 3 * p20 + 10 * p21 + 3 * p22) * 0.25;
     }
   }
 
@@ -186,17 +226,29 @@ export function detectHorizonTiltFromGrayscale(
     dx: number;
     dy: number;
     weight: number;
+    polarity: 1 | -1;
     isHorizontal: boolean;
   }
 
-  const cx = width * 0.5;
-  const cy = height * 0.5;
+  const cx = (width - 1) * 0.5;
+  const cy = (height - 1) * 0.5;
   const edges: EdgePoint[] = [];
   const magThreshold = 40.0;
 
   // Per-Column Top-2 vertical gradient ridges (for horizontal/tilted horizon lines)
   const yMin = Math.max(2, Math.floor(height * 0.08));
   const yMax = Math.min(height - 3, Math.ceil(height * 0.92));
+
+  const refineSubPixelY = (x: number, y: number): number => {
+    const mPrev = Math.abs(gyBuf[(y - 1) * width + x]);
+    const mCurr = Math.abs(gyBuf[y * width + x]);
+    const mNext = Math.abs(gyBuf[(y + 1) * width + x]);
+    const denom = 2 * (2 * mCurr - mPrev - mNext);
+    if (denom > 1e-5) {
+      return y + clamp((mNext - mPrev) / denom, -0.5, 0.5);
+    }
+    return y;
+  };
 
   for (let x = 2; x < width - 2; x++) {
     let bestY1 = -1;
@@ -224,18 +276,22 @@ export function detectHorizonTiltFromGrayscale(
     }
 
     if (bestY1 >= 0) {
+      const subY1 = refineSubPixelY(x, bestY1);
       edges.push({
         dx: x - cx,
-        dy: bestY1 - cy,
+        dy: subY1 - cy,
         weight: Math.min(bestVal1, 140.0),
+        polarity: gyBuf[bestY1 * width + x] >= 0 ? 1 : -1,
         isHorizontal: true,
       });
     }
     if (bestY2 >= 0) {
+      const subY2 = refineSubPixelY(x, bestY2);
       edges.push({
         dx: x - cx,
-        dy: bestY2 - cy,
+        dy: subY2 - cy,
         weight: Math.min(bestVal2, 110.0) * 0.7,
+        polarity: gyBuf[bestY2 * width + x] >= 0 ? 1 : -1,
         isHorizontal: true,
       });
     }
@@ -244,6 +300,17 @@ export function detectHorizonTiltFromGrayscale(
   // Per-Row Top-2 horizontal gradient ridges (for vertical architectural lines)
   const xMin = Math.max(2, Math.floor(width * 0.08));
   const xMax = Math.min(width - 3, Math.ceil(width * 0.92));
+
+  const refineSubPixelX = (x: number, y: number): number => {
+    const mPrev = Math.abs(gxBuf[y * width + (x - 1)]);
+    const mCurr = Math.abs(gxBuf[y * width + x]);
+    const mNext = Math.abs(gxBuf[y * width + (x + 1)]);
+    const denom = 2 * (2 * mCurr - mPrev - mNext);
+    if (denom > 1e-5) {
+      return x + clamp((mNext - mPrev) / denom, -0.5, 0.5);
+    }
+    return x;
+  };
 
   for (let y = 2; y < height - 2; y++) {
     let bestX1 = -1;
@@ -270,18 +337,22 @@ export function detectHorizonTiltFromGrayscale(
     }
 
     if (bestX1 >= 0) {
+      const subX1 = refineSubPixelX(bestX1, y);
       edges.push({
-        dx: bestX1 - cx,
+        dx: subX1 - cx,
         dy: y - cy,
         weight: Math.min(bestVal1, 140.0) * 0.85,
+        polarity: gxBuf[y * width + bestX1] >= 0 ? 1 : -1,
         isHorizontal: false,
       });
     }
     if (bestX2 >= 0) {
+      const subX2 = refineSubPixelX(bestX2, y);
       edges.push({
-        dx: bestX2 - cx,
+        dx: subX2 - cx,
         dy: y - cy,
         weight: Math.min(bestVal2, 110.0) * 0.6,
+        polarity: gxBuf[y * width + bestX2] >= 0 ? 1 : -1,
         isHorizontal: false,
       });
     }
@@ -292,76 +363,266 @@ export function detectHorizonTiltFromGrayscale(
     return { detectedTiltDeg: 0, appliedRotationDeg: 0, confidence: 0, strongEdgeCount };
   }
 
+  // Use 0.5-pixel oversampled rho bins with 3-bin sliding sum so line energy is phase-invariant
+  const rhoScale = 2;
+  const diag = (Math.ceil(Math.hypot(width, height)) + 6) * rhoScale;
+  const rhoOffset = diag >> 1;
+  const hAccPos = new Float64Array(diag);
+  const hAccNeg = new Float64Array(diag);
+  const vAccPos = new Float64Array(diag);
+  const vAccNeg = new Float64Array(diag);
+
+  interface AngleEvalResult {
+    energy: number;
+    maxSupport: number;
+    bestHorizRho: number;
+    bestHorizPolarity: 1 | -1;
+    bestHorizSupport: number;
+    bestVertRho: number;
+    bestVertPolarity: 1 | -1;
+    bestVertSupport: number;
+  }
+
+  const evaluateAngle = (angleDeg: number): AngleEvalResult => {
+    const rad = (angleDeg * Math.PI) / 180;
+    const sinA = Math.sin(rad);
+    const cosA = Math.cos(rad);
+
+    hAccPos.fill(0);
+    hAccNeg.fill(0);
+    vAccPos.fill(0);
+    vAccNeg.fill(0);
+
+    for (let i = 0; i < edges.length; i++) {
+      const pt = edges[i];
+      const rho =
+        (pt.isHorizontal ? pt.dy * cosA - pt.dx * sinA : pt.dx * cosA + pt.dy * sinA) * rhoScale +
+        rhoOffset;
+      const r0 = Math.floor(rho);
+      if (r0 >= 0 && r0 + 1 < diag) {
+        const frac = rho - r0;
+        const w0 = pt.weight * (1 - frac);
+        const w1 = pt.weight * frac;
+        if (pt.isHorizontal) {
+          if (pt.polarity > 0) {
+            hAccPos[r0] += w0;
+            hAccPos[r0 + 1] += w1;
+          } else {
+            hAccNeg[r0] += w0;
+            hAccNeg[r0 + 1] += w1;
+          }
+        } else {
+          if (pt.polarity > 0) {
+            vAccPos[r0] += w0;
+            vAccPos[r0 + 1] += w1;
+          } else {
+            vAccNeg[r0] += w0;
+            vAccNeg[r0 + 1] += w1;
+          }
+        }
+      }
+    }
+
+    let energy = 0;
+    let bestHorizSupport = 0;
+    let bestHorizRho = 0;
+    let bestHorizPolarity: 1 | -1 = 1;
+    let bestVertSupport = 0;
+    let bestVertRho = 0;
+    let bestVertPolarity: 1 | -1 = 1;
+
+    for (let r = 1; r < diag - 2; r++) {
+      // Phase-invariant 2-pixel (4 half-bin) kernel
+      const hp =
+        0.5 * (hAccPos[r - 1] + hAccPos[r + 2]) + (hAccPos[r] + hAccPos[r + 1]);
+      const hn =
+        0.5 * (hAccNeg[r - 1] + hAccNeg[r + 2]) + (hAccNeg[r] + hAccNeg[r + 1]);
+      const vp =
+        0.5 * (vAccPos[r - 1] + vAccPos[r + 2]) + (vAccPos[r] + vAccPos[r + 1]);
+      const vn =
+        0.5 * (vAccNeg[r - 1] + vAccNeg[r + 2]) + (vAccNeg[r] + vAccNeg[r + 1]);
+
+      if (hp > 0) {
+        energy += hp * hp * hp;
+        if (hp > bestHorizSupport) {
+          bestHorizSupport = hp;
+          bestHorizRho = (r + 0.5 - rhoOffset) / rhoScale;
+          bestHorizPolarity = 1;
+        }
+      }
+      if (hn > 0) {
+        energy += hn * hn * hn;
+        if (hn > bestHorizSupport) {
+          bestHorizSupport = hn;
+          bestHorizRho = (r + 0.5 - rhoOffset) / rhoScale;
+          bestHorizPolarity = -1;
+        }
+      }
+      if (vp > 0) {
+        energy += vp * vp * vp;
+        if (vp > bestVertSupport) {
+          bestVertSupport = vp;
+          bestVertRho = (r + 0.5 - rhoOffset) / rhoScale;
+          bestVertPolarity = 1;
+        }
+      }
+      if (vn > 0) {
+        energy += vn * vn * vn;
+        if (vn > bestVertSupport) {
+          bestVertSupport = vn;
+          bestVertRho = (r + 0.5 - rhoOffset) / rhoScale;
+          bestVertPolarity = -1;
+        }
+      }
+    }
+
+    return {
+      energy,
+      maxSupport: Math.max(bestHorizSupport, bestVertSupport),
+      bestHorizRho,
+      bestHorizPolarity,
+      bestHorizSupport,
+      bestVertRho,
+      bestVertPolarity,
+      bestVertSupport,
+    };
+  };
+
+  // Stage 1: Coarse scan at 0.1° resolution across [-limit, +limit]
   const binStep = 0.1;
   const halfBins = Math.round(limit / binStep);
   const numBins = halfBins * 2 + 1;
   const energyByAngle = new Float64Array(numBins);
 
-  const diag = Math.ceil(Math.hypot(width, height)) + 4;
-  const rhoOffset = diag >> 1;
-  const hAcc = new Float64Array(diag);
-  const vAcc = new Float64Array(diag);
-
   let maxEnergy = -1;
   let totalEnergy = 0;
   let bestBin = halfBins;
+  let bestSupport = 0;
 
   for (let b = 0; b < numBins; b++) {
     const angleDeg = b * binStep - limit;
-    const rad = (angleDeg * Math.PI) / 180;
-    const sinA = Math.sin(rad);
-    const cosA = Math.cos(rad);
+    const res = evaluateAngle(angleDeg);
+    energyByAngle[b] = res.energy;
+    totalEnergy += res.energy;
+    if (res.energy > maxEnergy) {
+      maxEnergy = res.energy;
+      bestBin = b;
+      bestSupport = res.maxSupport;
+    }
+  }
 
-    hAcc.fill(0);
-    vAcc.fill(0);
+  // Stage 2: Fine sub-degree scan at 0.02° resolution around the coarse winner
+  const coarseWinnerDeg = bestBin * binStep - limit;
+  const fineStep = 0.02;
+  const fineRadiusBins = 12; // ±0.24°
+  const fineCount = fineRadiusBins * 2 + 1;
+  const fineEnergies = new Float64Array(fineCount);
+  let bestFineIdx = fineRadiusBins;
+  let bestFineEnergy = -1;
+  let bestEval = evaluateAngle(coarseWinnerDeg);
 
-    for (let i = 0; i < edges.length; i++) {
-      const pt = edges[i];
-      if (pt.isHorizontal) {
-        const rho = Math.round(pt.dy * cosA - pt.dx * sinA) + rhoOffset;
-        if (rho >= 0 && rho < diag) {
-          hAcc[rho] += pt.weight;
-        }
-      } else {
-        const rho = Math.round(pt.dx * cosA + pt.dy * sinA) + rhoOffset;
-        if (rho >= 0 && rho < diag) {
-          vAcc[rho] += pt.weight;
-        }
+  for (let f = 0; f < fineCount; f++) {
+    const candDeg = clamp(coarseWinnerDeg + (f - fineRadiusBins) * fineStep, -limit, limit);
+    const res = evaluateAngle(candDeg);
+    fineEnergies[f] = res.energy;
+    if (res.energy > bestFineEnergy) {
+      bestFineEnergy = res.energy;
+      bestFineIdx = f;
+      bestEval = res;
+      if (res.maxSupport > bestSupport) bestSupport = res.maxSupport;
+    }
+  }
+
+  let refinedFineIdx = bestFineIdx;
+  if (bestFineIdx > 0 && bestFineIdx < fineCount - 1) {
+    const yLeft = fineEnergies[bestFineIdx - 1];
+    const yMid = fineEnergies[bestFineIdx];
+    const yRight = fineEnergies[bestFineIdx + 1];
+    const denom = 2 * (2 * yMid - yLeft - yRight);
+    if (Math.abs(denom) > 1e-6) {
+      refinedFineIdx += clamp((yRight - yLeft) / denom, -0.5, 0.5);
+    }
+  }
+
+  let rawDetectedDeg = clamp(
+    coarseWinnerDeg + (refinedFineIdx - fineRadiusBins) * fineStep,
+    -limit,
+    limit
+  );
+
+  // Stage 3: Huber Iteratively Reweighted Least Squares (IRLS) refinement on dominant line inliers
+  const rad0 = (rawDetectedDeg * Math.PI) / 180;
+  const sin0 = Math.sin(rad0);
+  const cos0 = Math.cos(rad0);
+  const useHoriz = bestEval.bestHorizSupport >= bestEval.bestVertSupport;
+  const targetRho = useHoriz ? bestEval.bestHorizRho : bestEval.bestVertRho;
+  const targetPol = useHoriz ? bestEval.bestHorizPolarity : bestEval.bestVertPolarity;
+
+  const inliers: EdgePoint[] = [];
+  for (let i = 0; i < edges.length; i++) {
+    const pt = edges[i];
+    if (pt.isHorizontal !== useHoriz || pt.polarity !== targetPol) continue;
+    const rho = useHoriz ? pt.dy * cos0 - pt.dx * sin0 : pt.dx * cos0 + pt.dy * sin0;
+    if (Math.abs(rho - targetRho) <= 2.2) {
+      inliers.push(pt);
+    }
+  }
+
+  if (inliers.length >= 12) {
+    let slope = Math.tan(rad0);
+    let intercept = targetRho / Math.max(0.5, cos0);
+
+    for (let iter = 0; iter < 3; iter++) {
+      let sumW = 0;
+      let sumX = 0;
+      let sumY = 0;
+      for (let i = 0; i < inliers.length; i++) {
+        const pt = inliers[i];
+        const u = useHoriz ? pt.dx : pt.dy;
+        const v = useHoriz ? pt.dy : -pt.dx;
+        const resid = Math.abs(v - (slope * u + intercept));
+        const huberW = resid <= 0.75 ? pt.weight : pt.weight * (0.75 / resid);
+        sumW += huberW;
+        sumX += huberW * u;
+        sumY += huberW * v;
+      }
+      if (sumW <= 1e-5) break;
+      const meanX = sumX / sumW;
+      const meanY = sumY / sumW;
+
+      let sXX = 0;
+      let sXY = 0;
+      for (let i = 0; i < inliers.length; i++) {
+        const pt = inliers[i];
+        const u = useHoriz ? pt.dx : pt.dy;
+        const v = useHoriz ? pt.dy : -pt.dx;
+        const resid = Math.abs(v - (slope * u + intercept));
+        const huberW = resid <= 0.75 ? pt.weight : pt.weight * (0.75 / resid);
+        const du = u - meanX;
+        const dv = v - meanY;
+        sXX += huberW * du * du;
+        sXY += huberW * du * dv;
+      }
+
+      if (sXX > 100) {
+        slope = sXY / sXX;
+        intercept = meanY - slope * meanX;
       }
     }
 
-    // Colinearity energy: sum of cubic-weighted peaks rewards single long straight lines
-    let energy = 0;
-    for (let r = 1; r < diag - 1; r++) {
-      const hv = hAcc[r] + 0.25 * (hAcc[r - 1] + hAcc[r + 1]);
-      const vv = vAcc[r] + 0.25 * (vAcc[r - 1] + vAcc[r + 1]);
-      if (hv > 0) energy += hv * hv * hv;
-      if (vv > 0) energy += vv * vv * vv;
-    }
-
-    energyByAngle[b] = energy;
-    totalEnergy += energy;
-    if (energy > maxEnergy) {
-      maxEnergy = energy;
-      bestBin = b;
+    const irlsDeg = (Math.atan(slope) * 180) / Math.PI;
+    if (Math.abs(irlsDeg - rawDetectedDeg) <= 0.45) {
+      rawDetectedDeg = clamp(irlsDeg, -limit, limit);
     }
   }
 
-  let refinedBin = bestBin;
-  if (bestBin > 0 && bestBin < numBins - 1) {
-    const yLeft = energyByAngle[bestBin - 1];
-    const yMid = energyByAngle[bestBin];
-    const yRight = energyByAngle[bestBin + 1];
-    const denom = 2 * (2 * yMid - yLeft - yRight);
-    if (Math.abs(denom) > 1e-6) {
-      refinedBin += clamp((yRight - yLeft) / denom, -0.5, 0.5);
-    }
-  }
+  const detectedTiltDeg = Math.abs(rawDetectedDeg) < 0.02 ? 0 : Number(rawDetectedDeg.toFixed(2));
 
-  const detectedTiltDeg = Number((refinedBin * binStep - limit).toFixed(2));
   const meanEnergy = totalEnergy / numBins;
   const peakRatio = maxEnergy > 0 ? (maxEnergy - meanEnergy) / maxEnergy : 0;
-  const confidence = clamp(Number(peakRatio.toFixed(2)), 0.0, 0.99);
+  const minCoherentSupport = Math.max(12, Math.min(width, height) * 0.16) * 80.0;
+  const coherency = clamp(bestSupport / minCoherentSupport, 0.0, 1.0);
+  const confidence = clamp(Number((peakRatio * coherency).toFixed(2)), 0.0, 0.99);
 
   // Confidence threshold: suppress erratic rotation on low-contrast/textured scenes
   const MIN_CONFIDENCE_THRESHOLD = 0.35;
@@ -608,4 +869,203 @@ export function getScaledDimensionsWithinBudget(
 
   return { width: scaledW, height: scaledH, scale };
 }
+
+/**
+ * Analyzes an RGBA image buffer to compute optimal darkroom Auto-Correct parameters:
+ * - Percentile histogram black/white anchor points (0.5% and 99.5%)
+ * - Exposure compensation (EV) targeting perceptual midtone balance with highlight headroom protection
+ * - Adaptive shadow recovery and highlight roll-off
+ * - Sigmoidal micro-contrast boost
+ * - Midtone-weighted Gray-World white balance neutralization
+ */
+export function analyzeAutoCorrection(
+  rgbaData: Uint8ClampedArray | Uint8Array,
+  width: number,
+  height: number
+): AutoCorrectAnalysis {
+  const totalPixels = Math.max(0, Math.min(width * height, Math.floor(rgbaData.length / 4)));
+  if (totalPixels < 4 || width <= 0 || height <= 0) {
+    return {
+      exposureEv: 0,
+      contrast: 0,
+      shadows: 0,
+      highlights: 0,
+      wbTempShift: 0,
+      wbTintShift: 0,
+      blackPoint: 0,
+      whitePoint: 255,
+      dynamicRangeStops: 8.0,
+    };
+  }
+
+  const lumaHist = new Uint32Array(256);
+  const stride = Math.max(1, Math.floor(totalPixels / 16384));
+  let sampleCount = 0;
+
+  let midR = 0;
+  let midG = 0;
+  let midB = 0;
+  let midCount = 0;
+
+  for (let p = 0; p < totalPixels; p += stride) {
+    const idx = p * 4;
+    const r = rgbaData[idx];
+    const g = rgbaData[idx + 1];
+    const b = rgbaData[idx + 2];
+
+    // Rec. 709 luma
+    const y = clamp(Math.round(0.2126 * r + 0.7152 * g + 0.0722 * b), 0, 255);
+    lumaHist[y]++;
+    sampleCount++;
+
+    // Sample non-clipped, moderate-saturation midtones for illuminant chromaticity estimation
+    if (y >= 32 && y <= 220) {
+      const maxC = Math.max(r, g, b);
+      const minC = Math.min(r, g, b);
+      if (maxC - minC < 110) {
+        midR += r;
+        midG += g;
+        midB += b;
+        midCount++;
+      }
+    }
+  }
+
+  const findPercentile = (fraction: number): number => {
+    const target = Math.max(1, Math.round(sampleCount * fraction));
+    let acc = 0;
+    for (let i = 0; i < 256; i++) {
+      acc += lumaHist[i];
+      if (acc >= target) return i;
+    }
+    return 255;
+  };
+
+  const p005 = findPercentile(0.005);
+  const p15 = findPercentile(0.15);
+  const p50 = findPercentile(0.5);
+  const p85 = findPercentile(0.85);
+  const p995 = findPercentile(0.995);
+
+  const blackPoint = clamp(p005, 0, 38);
+  const whitePoint = clamp(p995, 210, 255);
+  const span = Math.max(16, whitePoint - blackPoint);
+
+  const normMedian = clamp((p50 - blackPoint) / span, 0.08, 0.92);
+  let rawEv = Math.log2(0.48 / normMedian) * 0.45;
+  if (rawEv > 0 && p85 > 210) {
+    rawEv *= clamp((245 - p85) / 35, 0.15, 1.0);
+  }
+  const exposureEv = Number(clamp(rawEv, -0.85, 0.85).toFixed(2));
+
+  const contrast =
+    span < 215 ? clamp(Math.round((235 - span) * 0.24 + 8), 8, 32) : 10;
+
+  const shadows = p15 < 58 ? clamp(Math.round((58 - p15) * 0.65), 0, 38) : 0;
+  const highlights = p85 > 198 ? -clamp(Math.round((p85 - 198) * 0.65), 0, 38) : 0;
+
+  let wbTempShift = 0;
+  let wbTintShift = 0;
+  if (midCount >= 16) {
+    const avgR = midR / midCount;
+    const avgG = midG / midCount;
+    const avgB = midB / midCount;
+    const avgGray = (avgR + avgG + avgB) / 3;
+    // Damped correction to neutralize unwanted cast while preserving intentional scene mood
+    wbTempShift = clamp(Math.round((avgB - avgR) * 0.35), -18, 18);
+    wbTintShift = clamp(Math.round((avgGray - avgG) * 0.35), -14, 14);
+  }
+
+  const dynamicRangeStops = Number(
+    clamp(Math.log2(Math.max(2, p995 - p005 + 1)) * 1.42, 1.0, 11.5).toFixed(1)
+  );
+
+  return {
+    exposureEv,
+    contrast,
+    shadows,
+    highlights,
+    wbTempShift,
+    wbTintShift,
+    blackPoint,
+    whitePoint,
+    dynamicRangeStops,
+  };
+}
+
+/**
+ * Applies darkroom Auto-Correct luminance-preserving filmic tone curve, shadow/highlight recovery,
+ * micro-contrast S-curve, and midtone-weighted white balance neutralization in-place.
+ */
+export function applyAutoCorrectionToRgba(
+  rgbaData: Uint8ClampedArray | Uint8Array,
+  width: number,
+  height: number,
+  analysis: AutoCorrectAnalysis,
+  strengthPercent = 75
+): void {
+  const strength = clamp(strengthPercent, 0, 100) / 100;
+  const totalPixels = Math.max(0, Math.min(width * height, Math.floor(rgbaData.length / 4)));
+  if (strength <= 0.001 || totalPixels === 0) return;
+
+  const toneLut = new Float32Array(256);
+  const midWeightLut = new Float32Array(256);
+
+  const bp = analysis.blackPoint * 0.65;
+  const wp = 255 - (255 - analysis.whitePoint) * 0.65;
+  const range = Math.max(1, wp - bp);
+  const gamma = Math.pow(2, -analysis.exposureEv * 0.55);
+  const shadowFactor = (analysis.shadows / 100) * 0.26;
+  const highlightFactor = (analysis.highlights / 100) * 0.24;
+  const contrastFactor = (analysis.contrast / 100) * 0.52;
+
+  const rShift = (analysis.wbTempShift * 1.25 - analysis.wbTintShift * 0.35) * strength;
+  const gShift = analysis.wbTintShift * 0.85 * strength;
+  const bShift = (-analysis.wbTempShift * 1.25 - analysis.wbTintShift * 0.35) * strength;
+
+  for (let v = 0; v < 256; v++) {
+    // 1. Percentile black/white point stretch
+    let x = clamp((v - bp) / range, 0, 1);
+
+    // 2. Exposure EV gamma
+    x = Math.pow(x, gamma);
+
+    // 3. Shadow lift & highlight roll-off
+    const sLift = shadowFactor * (1 - x) * (1 - x) * Math.sqrt(x);
+    const hComp = highlightFactor * x * x * (1 - x * 0.5);
+    x = clamp(x + sLift + hComp, 0, 1);
+
+    // 4. Smooth sigmoidal micro-contrast S-curve
+    x = clamp(x - (contrastFactor * Math.sin(2 * Math.PI * x)) / (2 * Math.PI), 0, 1);
+
+    toneLut[v] = v + (x * 255 - v) * strength;
+    const normV = v / 255;
+    midWeightLut[v] = 4 * normV * (1 - normV);
+  }
+
+  const end = totalPixels * 4;
+  for (let i = 0; i < end; i += 4) {
+    const r = rgbaData[i];
+    const g = rgbaData[i + 1];
+    const b = rgbaData[i + 2];
+
+    const y = (54 * r + 183 * g + 19 * b) >> 8;
+    const targetY = toneLut[y];
+    const mw = midWeightLut[y];
+
+    // Apply midtone-weighted white balance neutralization
+    const rw = r + rShift * mw;
+    const gw = g + gShift * mw;
+    const bw = b + bShift * mw;
+    const yw = 0.2126 * rw + 0.7152 * gw + 0.0722 * bw;
+
+    // Luminance-preserving tone mapping with bounded chroma scaling
+    const chromaScale = yw > 1 ? clamp(targetY / yw, 0.65, 1.25) : 1.0;
+
+    rgbaData[i] = clamp(Math.round(targetY + (rw - yw) * chromaScale), 0, 255);
+    rgbaData[i + 1] = clamp(Math.round(targetY + (gw - yw) * chromaScale), 0, 255);
+    rgbaData[i + 2] = clamp(Math.round(targetY + (bw - yw) * chromaScale), 0, 255);
+  }
+}
+
 

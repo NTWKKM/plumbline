@@ -6,9 +6,11 @@ import {
   FileCheck,
   Frame,
   RotateCcw,
+  Sparkles,
 } from 'lucide-react';
 import {
   AspectRatioPreset,
+  AutoCorrectAnalysis,
   CropRect,
   ExifData,
   FrameLayout,
@@ -21,6 +23,7 @@ interface InspectorSidebarProps {
   config: PipelineConfig;
   onChangeConfig: (updater: (prev: PipelineConfig) => PipelineConfig) => void;
   analysis: LevelingAnalysis;
+  autoCorrect?: AutoCorrectAnalysis;
   cropRect: CropRect;
   frameLayout: FrameLayout;
   sourceSize: { width: number; height: number };
@@ -46,6 +49,7 @@ export const InspectorSidebar: React.FC<InspectorSidebarProps> = ({
   config,
   onChangeConfig,
   analysis,
+  autoCorrect,
   cropRect,
   frameLayout,
   sourceSize,
@@ -61,19 +65,21 @@ export const InspectorSidebar: React.FC<InspectorSidebarProps> = ({
   const totalRotationDeg = Number(
     ((config.autoLevelEnabled ? analysis.appliedRotationDeg : 0) + config.manualAngleOffsetDeg).toFixed(2)
   );
+  const autoCorrectEnabled = config.autoCorrectEnabled ?? true;
+  const autoCorrectStrength = config.autoCorrectStrength ?? 75;
 
   return (
     <aside
       aria-label="Image Processing Inspector"
       className={`flex shrink-0 flex-col border-t lg:border-t-0 lg:border-l border-zinc-800/90 bg-[#111114] text-zinc-100 select-none overflow-y-auto ${className || 'w-full lg:w-[356px]'}`}
     >
-      {/* Section 1: Auto-Leveling & Inscribed Auto-Crop */}
+      {/* Section 1: Auto-Leveling, Inscribed Auto-Crop & Smart Auto-Correct */}
       <section className="border-b border-zinc-800/80 px-4 py-3.5">
-        <div className="flex items-center justify-between">
-          <div className="flex items-center gap-2">
-            <Compass className="h-4 w-4 text-blue-400" />
-            <h2 className="font-display text-sm font-semibold tracking-tight text-zinc-100">
-              Horizon & Inscribed Crop
+        <div className="flex items-center justify-between gap-2">
+          <div className="flex items-center gap-2 min-w-0">
+            <Compass className="h-4 w-4 text-blue-400 shrink-0" />
+            <h2 className="font-display text-sm font-semibold tracking-tight text-zinc-100 truncate">
+              Auto-Level, Crop & Correct
             </h2>
           </div>
           <button
@@ -86,10 +92,10 @@ export const InspectorSidebar: React.FC<InspectorSidebarProps> = ({
           </button>
         </div>
 
-        {/* Sobel Auto-Level Toggle */}
-        <div className="mt-2.5 flex items-center justify-between">
-          <label htmlFor="toggle-auto-level" className="text-xs font-medium text-zinc-200 cursor-pointer">
-            Sobel Horizon Auto-Level
+        {/* Scharr + Sub-Pixel Radon + IRLS Auto-Level Toggle */}
+        <div className="mt-2.5 flex items-center justify-between gap-2">
+          <label htmlFor="toggle-auto-level" className="text-xs font-medium text-zinc-200 cursor-pointer truncate">
+            Scharr Sub-Pixel Horizon Auto-Level
           </label>
           <input
             id="toggle-auto-level"
@@ -98,7 +104,7 @@ export const InspectorSidebar: React.FC<InspectorSidebarProps> = ({
             onChange={(e) =>
               onChangeConfig((prev) => ({ ...prev, autoLevelEnabled: e.target.checked }))
             }
-            className="h-4 w-4 accent-blue-600 rounded cursor-pointer"
+            className="h-4 w-4 accent-blue-600 rounded cursor-pointer shrink-0"
           />
         </div>
 
@@ -163,7 +169,7 @@ export const InspectorSidebar: React.FC<InspectorSidebarProps> = ({
             type="range"
             min={-15}
             max={15}
-            step={0.1}
+            step={0.05}
             value={config.manualAngleOffsetDeg}
             onChange={(e) =>
               onChangeConfig((prev) => ({
@@ -177,10 +183,10 @@ export const InspectorSidebar: React.FC<InspectorSidebarProps> = ({
 
         {/* Inscribed Auto-Crop Controls */}
         <div className="mt-2.5 pt-2.5 border-t border-zinc-800/60">
-          <div className="flex items-center justify-between">
-            <label htmlFor="toggle-auto-crop" className="flex items-center gap-1.5 text-xs font-medium text-zinc-200 cursor-pointer">
-              <Crop className="h-3.5 w-3.5 text-blue-400" />
-              Auto-Crop Largest Inscribed Rect
+          <div className="flex items-center justify-between gap-2">
+            <label htmlFor="toggle-auto-crop" className="flex items-center gap-1.5 text-xs font-medium text-zinc-200 cursor-pointer min-w-0">
+              <Crop className="h-3.5 w-3.5 text-blue-400 shrink-0" />
+              <span className="truncate">Auto-Crop Largest Inscribed Rect</span>
             </label>
             <input
               id="toggle-auto-crop"
@@ -189,7 +195,7 @@ export const InspectorSidebar: React.FC<InspectorSidebarProps> = ({
               onChange={(e) =>
                 onChangeConfig((prev) => ({ ...prev, autoCropEnabled: e.target.checked }))
               }
-              className="h-4 w-4 accent-blue-600 rounded cursor-pointer"
+              className="h-4 w-4 accent-blue-600 rounded cursor-pointer shrink-0"
             />
           </div>
 
@@ -199,6 +205,64 @@ export const InspectorSidebar: React.FC<InspectorSidebarProps> = ({
               {cropRect.width} × {cropRect.height} px · {cropRect.areaRetainedPercent}% area
             </span>
           </div>
+        </div>
+
+        {/* Smart Filmic Auto-Correct (Tone, Contrast & White Balance) */}
+        <div className="mt-2.5 pt-2.5 border-t border-zinc-800/60">
+          <div className="flex items-center justify-between gap-2">
+            <label htmlFor="toggle-auto-correct" className="flex items-center gap-1.5 text-xs font-medium text-zinc-200 cursor-pointer min-w-0">
+              <Sparkles className="h-3.5 w-3.5 text-blue-400 shrink-0" />
+              <span className="truncate">Auto-Correct Tone & White Balance</span>
+            </label>
+            <input
+              id="toggle-auto-correct"
+              type="checkbox"
+              checked={autoCorrectEnabled}
+              onChange={(e) =>
+                onChangeConfig((prev) => ({ ...prev, autoCorrectEnabled: e.target.checked }))
+              }
+              className="h-4 w-4 accent-blue-600 rounded cursor-pointer shrink-0"
+            />
+          </div>
+
+          {autoCorrectEnabled && (
+            <div className="mt-2">
+              <div className="flex items-center justify-between text-xs">
+                <label htmlFor="slider-auto-correct-strength" className="text-zinc-400">
+                  Correction Intensity
+                </label>
+                <span className="text-zinc-200 tabular-nums" data-testid="auto-correct-strength-val">
+                  {autoCorrectStrength}%
+                </span>
+              </div>
+              <input
+                id="slider-auto-correct-strength"
+                type="range"
+                min={0}
+                max={100}
+                step={5}
+                value={autoCorrectStrength}
+                onChange={(e) =>
+                  onChangeConfig((prev) => ({
+                    ...prev,
+                    autoCorrectStrength: parseInt(e.target.value, 10),
+                  }))
+                }
+                className="mt-1 h-1.5 w-full cursor-pointer appearance-none rounded-lg bg-zinc-800 accent-blue-500"
+              />
+              {autoCorrect && (
+                <div className="mt-1.5 flex items-center justify-between gap-2 text-[11px] text-zinc-400 tabular-nums">
+                  <span className="truncate">
+                    EV {autoCorrect.exposureEv >= 0 ? `+${autoCorrect.exposureEv.toFixed(2)}` : autoCorrect.exposureEv.toFixed(2)}
+                  </span>
+                  <span aria-hidden="true">·</span>
+                  <span className="truncate">Contrast +{autoCorrect.contrast}</span>
+                  <span aria-hidden="true">·</span>
+                  <span className="truncate">DR {autoCorrect.dynamicRangeStops} EV</span>
+                </div>
+              )}
+            </div>
+          )}
         </div>
       </section>
 

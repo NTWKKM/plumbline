@@ -12,6 +12,7 @@ import {
   parseExifFromArrayBuffer,
 } from './utils/exifParser';
 import {
+  AutoCorrectAnalysis,
   CropRect,
   FrameLayout,
   LevelingAnalysis,
@@ -25,6 +26,8 @@ const DEFAULT_PIPELINE_CONFIG: PipelineConfig = {
   manualAngleOffsetDeg: 0,
   autoCropEnabled: true,
   preserveAspectRatioInCrop: true,
+  autoCorrectEnabled: true,
+  autoCorrectStrength: 75,
   aspectPreset: '1:1',
   paddingPercent: 10,
   backgroundColor: '#FFFFFF',
@@ -51,6 +54,17 @@ export default function App() {
     appliedRotationDeg: 0,
     confidence: 0,
     strongEdgeCount: 0,
+  });
+  const [autoCorrect, setAutoCorrect] = useState<AutoCorrectAnalysis>({
+    exposureEv: 0,
+    contrast: 10,
+    shadows: 0,
+    highlights: 0,
+    wbTempShift: 0,
+    wbTintShift: 0,
+    blackPoint: 0,
+    whitePoint: 255,
+    dynamicRangeStops: 8.0,
   });
   const [cropRect, setCropRect] = useState<CropRect>({
     x: 0,
@@ -88,12 +102,14 @@ export default function App() {
       newAnalysis: LevelingAnalysis,
       newCrop: CropRect,
       newLayout: FrameLayout,
-      newSourceSize: { width: number; height: number }
+      newSourceSize: { width: number; height: number },
+      newAutoCorrect?: AutoCorrectAnalysis
     ) => {
       setAnalysis(newAnalysis);
       setCropRect(newCrop);
       setFrameLayout(newLayout);
       setSourceSize(newSourceSize);
+      if (newAutoCorrect) setAutoCorrect(newAutoCorrect);
     },
     []
   );
@@ -591,6 +607,7 @@ export default function App() {
           config={config}
           onChangeConfig={setConfig}
           analysis={analysis}
+          autoCorrect={autoCorrect}
           cropRect={cropRect}
           frameLayout={frameLayout}
           sourceSize={sourceSize}
