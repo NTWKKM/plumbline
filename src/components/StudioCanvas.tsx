@@ -10,8 +10,10 @@ import {
   PipelineTelemetryUpdate,
   analyzeAutoCorrection,
   applyAutoCorrectionToRgba,
+  applyProjectiveKeystoneWarpToRgba,
   computeFrameLayout,
   computeInscribedCrop,
+  computeSmartInscribedCrop,
   computeSplitDividerX,
   detectHorizonTiltFromGrayscale,
   formatExifSummaryLine,
@@ -57,6 +59,13 @@ export const StudioCanvas: React.FC<StudioCanvasProps> = ({
 
   const callbackRef = useRef(onAnalysisUpdate);
   callbackRef.current = onAnalysisUpdate;
+
+  const saliencyBufferRef = useRef<{
+    gray: Uint8Array;
+    rgba: Uint8ClampedArray;
+    width: number;
+    height: number;
+  } | null>(null);
 
   // Cache processed full-resolution rotCanvas and framed output across interactive split drags
   const pipelineCacheRef = useRef<{
@@ -137,8 +146,9 @@ export const StudioCanvas: React.FC<StudioCanvasProps> = ({
             0.299 * imgData[idx] + 0.587 * imgData[idx + 1] + 0.114 * imgData[idx + 2]
           );
         }
+        saliencyBufferRef.current = { gray, rgba: imgData, width: dw, height: dh };
         detected = detectHorizonTiltFromGrayscale(gray, dw, dh, config.maxAutoAngleDeg);
-        autoCorr = analyzeAutoCorrection(imgData, dw, dh);
+        autoCorr = analyzeAutoCorrection(imgData, dw, dh, config.wbProfile ?? 'ambient');
       }
 
       setSensorCanvas(offscreen);
@@ -191,13 +201,30 @@ export const StudioCanvas: React.FC<StudioCanvasProps> = ({
 
     const autoRot = config.autoLevelEnabled ? analysis.appliedRotationDeg : 0;
     const totalRotDeg = Number((autoRot + config.manualAngleOffsetDeg).toFixed(2));
+    const autoKeystone =
+      (config.keystoneWarpEnabled ?? true) ? (analysis.appliedKeystoneDeg ?? 0) : 0;
+    const totalKeystoneDeg = Number(
+      (autoKeystone + (config.manualKeystoneDeg ?? 0)).toFixed(2)
+    );
     const corrEnabled = config.autoCorrectEnabled ?? true;
     const corrStrength = config.autoCorrectStrength ?? 75;
+    const activeWbProfile = config.wbProfile ?? 'ambient';
+
+    const sal = saliencyBufferRef.current;
+    const activeAutoCorrect =
+      sal && (autoCorrect.wbProfile ?? 'ambient') !== activeWbProfile
+        ? analyzeAutoCorrection(sal.rgba, sal.width, sal.height, activeWbProfile)
+        : autoCorrect;
+
+    if (activeAutoCorrect !== autoCorrect) {
+      setAutoCorrect(activeAutoCorrect);
+    }
 
     const pipelineKey = [
       photo.id,
       `${srcW}x${srcH}`,
       totalRotDeg,
+      totalKeystoneDeg,
       config.autoCropEnabled,
       config.preserveAspectRatioInCrop,
       config.aspectPreset,
@@ -207,12 +234,13 @@ export const StudioCanvas: React.FC<StudioCanvasProps> = ({
       config.backgroundColor,
       corrEnabled,
       corrStrength,
-      autoCorrect.exposureEv,
-      autoCorrect.contrast,
-      autoCorrect.shadows,
-      autoCorrect.highlights,
-      autoCorrect.wbTempShift,
-      autoCorrect.wbTintShift,
+      activeWbProfile,
+      activeAutoCorrect.exposureEv,
+      activeAutoCorrect.contrast,
+      activeAutoCorrect.shadows,
+      activeAutoCorrect.highlights,
+      activeAutoCorrect.wbTempShift,
+      activeAutoCorrect.wbTintShift,
       photo.exif.cameraModel,
       photo.exif.lensModel,
       photo.exif.focalLength,
@@ -224,7 +252,16 @@ export const StudioCanvas: React.FC<StudioCanvasProps> = ({
       pipelineCacheRef.current.cacheKey !== pipelineKey
     ) {
       const crop = config.autoCropEnabled
-        ? computeInscribedCrop(srcW, srcH, totalRotDeg, config.preserveAspectRatioInCrop)
+        ? computeSmartInscribedCrop(
+            srcW,
+            srcH,
+            totalRotDeg,
+            config.preserveAspectRatioInCrop,
+            undefined,
+            sal?.gray,
+            sal?.width,
+            sal?.height
+          )
         : {
             x: 0,
             y: 0,
@@ -262,16 +299,28 @@ export const StudioCanvas: React.FC<StudioCanvasProps> = ({
       rCtx.drawImage(sensorCanvas, -srcW / 2, -srcH / 2);
       rCtx.restore();
 
-      // Apply luminance-preserving Filmic Auto-Correct & White Balance neutralization if enabled
-      if (corrEnabled && corrStrength > 0 && crop.width > 0 && crop.height > 0) {
+      // Apply 2D Projective Keystone Warp and/or Ambient-Preserving Golden Hour Auto-Correct in-place
+      const needsKeystone = Math.abs(totalKeystoneDeg) >= 0.02;
+      const needsAutoCorr = corrEnabled && corrStrength > 0;
+      if ((needsKeystone || needsAutoCorr) && crop.width > 0 && crop.height > 0) {
         const croppedData = rCtx.getImageData(crop.x, crop.y, crop.width, crop.height);
-        applyAutoCorrectionToRgba(
-          croppedData.data,
-          crop.width,
-          crop.height,
-          autoCorrect,
-          corrStrength
-        );
+        if (needsKeystone) {
+          applyProjectiveKeystoneWarpToRgba(
+            croppedData.data,
+            crop.width,
+            crop.height,
+            totalKeystoneDeg
+          );
+        }
+        if (needsAutoCorr) {
+          applyAutoCorrectionToRgba(
+            croppedData.data,
+            crop.width,
+            crop.height,
+            activeAutoCorrect,
+            corrStrength
+          );
+        }
         rCtx.putImageData(croppedData, crop.x, crop.y);
       }
 
@@ -360,7 +409,7 @@ export const StudioCanvas: React.FC<StudioCanvasProps> = ({
         crop,
         layout,
         sourceSize: { width: srcW, height: srcH },
-        autoCorrect,
+        autoCorrect: activeAutoCorrect,
       });
     }
 

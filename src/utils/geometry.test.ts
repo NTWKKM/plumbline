@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   computeInscribedCrop,
+  computeSmartInscribedCrop,
   detectHorizonTiltFromGrayscale,
   computeFrameLayout,
   formatExifSummaryLine,
@@ -10,6 +11,7 @@ import {
   getScaledDimensionsWithinBudget,
   analyzeAutoCorrection,
   applyAutoCorrectionToRgba,
+  applyProjectiveKeystoneWarpToRgba,
 } from './geometry';
 
 test('computeInscribedCrop returns full image dimensions when rotation angle is 0', () => {
@@ -400,5 +402,139 @@ test('analyzeAutoCorrection handles fully transparent images and ignores transpa
     }
   }
 });
+
+test('computeSmartInscribedCrop shifts crop toward high-saliency subject when slack exists while keeping all corners inside rotated bounds', () => {
+  const w = 400;
+  const h = 300;
+  const angleDeg = 2.0;
+  const gray = new Uint8Array(w * h);
+
+  // Place high-contrast subject detail on the right third (x in [240, 320])
+  for (let y = 60; y < 240; y++) {
+    for (let x = 240; x < 320; x++) {
+      gray[y * w + x] = (x + y) % 2 === 0 ? 240 : 20;
+    }
+  }
+
+  // Request a 1:1 square crop inside 400x300 rotated by 2 deg (plenty of horizontal slack)
+  const centerCrop = computeInscribedCrop(w, h, angleDeg, true, 1.0);
+  const smartCrop = computeSmartInscribedCrop(w, h, angleDeg, true, 1.0, gray, w, h);
+
+  assert.equal(smartCrop.width, smartCrop.height);
+  assert.ok(Math.abs(smartCrop.width - centerCrop.width) <= 2);
+  assert.ok(smartCrop.x > centerCrop.x, `Expected smart crop X (${smartCrop.x}) > center crop X (${centerCrop.x})`);
+
+  // Verify all 4 corners of smartCrop remain strictly inside rotated source bounds
+  const rad = (Math.abs(angleDeg) * Math.PI) / 180;
+  const cosA = Math.cos(rad);
+  const sinA = Math.sin(rad);
+  const cx = w / 2;
+  const cy = h / 2;
+  const corners = [
+    [smartCrop.x, smartCrop.y],
+    [smartCrop.x + smartCrop.width, smartCrop.y],
+    [smartCrop.x, smartCrop.y + smartCrop.height],
+    [smartCrop.x + smartCrop.width, smartCrop.y + smartCrop.height],
+  ];
+  for (const [px, py] of corners) {
+    const dx = px - cx;
+    const dy = py - cy;
+    const rx = dx * cosA + dy * sinA + cx;
+    const ry = -dx * sinA + dy * cosA + cy;
+    assert.ok(rx >= -1e-4 && rx <= w + 1e-4 && ry >= -1e-4 && ry <= h + 1e-4);
+  }
+});
+
+test('analyzeAutoCorrection estimates Kelvin CCT and vibrance using hybrid Achromatic-Locus + Shades-of-Gray', () => {
+  const w = 64;
+  const h = 64;
+  const warmCast = new Uint8ClampedArray(w * h * 4);
+  for (let i = 0; i < w * h; i++) {
+    warmCast[i * 4] = 165; // Warm R excess
+    warmCast[i * 4 + 1] = 135; // G
+    warmCast[i * 4 + 2] = 105; // Cool B deficit
+    warmCast[i * 4 + 3] = 255;
+  }
+
+  const res = analyzeAutoCorrection(warmCast, w, h);
+  assert.ok(res.wbTempShift < 0, `Expected negative cooling WB shift for warm cast, got ${res.wbTempShift}`);
+  assert.ok((res.estimatedKelvin ?? 5500) < 4800, `Expected warm Kelvin estimate < 4800K, got ${res.estimatedKelvin}`);
+  assert.ok(typeof res.vibrance === 'number' && res.vibrance >= 0);
+});
+
+test('Ambient-Preserving Golden Hour WB retains original warm mood compared to Studio Neutral 100% WB', () => {
+  const w = 64;
+  const h = 64;
+  const goldenHour = new Uint8ClampedArray(w * h * 4);
+  for (let i = 0; i < w * h; i++) {
+    // Upper half represents bright Golden Hour sky (y ~ 180), lower half warm midtones (y ~ 125)
+    const isSky = i < (w * h) / 2;
+    goldenHour[i * 4] = isSky ? 210 : 165;     // Warm R
+    goldenHour[i * 4 + 1] = isSky ? 175 : 132; // G
+    goldenHour[i * 4 + 2] = isSky ? 130 : 96;  // B
+    goldenHour[i * 4 + 3] = 255;
+  }
+
+  const ambientCorr = analyzeAutoCorrection(goldenHour, w, h, 'ambient');
+  const neutralCorr = analyzeAutoCorrection(goldenHour, w, h, 'neutral');
+
+  assert.equal(ambientCorr.wbProfile, 'ambient');
+  assert.equal(neutralCorr.wbProfile, 'neutral');
+  assert.equal(ambientCorr.ambientWarmthRetainedPercent, 35);
+  assert.equal(neutralCorr.ambientWarmthRetainedPercent, 0);
+  // Ambient mode applies a gentler cooling shift than full Studio Neutral
+  assert.ok(
+    Math.abs(ambientCorr.wbTempShift) < Math.abs(neutralCorr.wbTempShift),
+    `Expected ambient |wbTempShift| (${ambientCorr.wbTempShift}) < neutral |wbTempShift| (${neutralCorr.wbTempShift})`
+  );
+
+  const rgbaAmbient = new Uint8ClampedArray(goldenHour);
+  const rgbaNeutral = new Uint8ClampedArray(goldenHour);
+  applyAutoCorrectionToRgba(rgbaAmbient, w, h, ambientCorr, 100);
+  applyAutoCorrectionToRgba(rgbaNeutral, w, h, neutralCorr, 100);
+
+  // Verify Golden Hour sky pixel retains higher R-B warmth in 'ambient' mode than in 'neutral' mode
+  const skyIdx = (10 * w + 32) * 4;
+  const ambientWarmthGap = rgbaAmbient[skyIdx] - rgbaAmbient[skyIdx + 2];
+  const neutralWarmthGap = rgbaNeutral[skyIdx] - rgbaNeutral[skyIdx + 2];
+  assert.ok(
+    ambientWarmthGap > neutralWarmthGap,
+    `Expected Golden Hour ambient sky warmth (${ambientWarmthGap}) > Studio Neutral sky warmth (${neutralWarmthGap})`
+  );
+});
+
+test('applyProjectiveKeystoneWarpToRgba warps converging vertical walls while remaining 100% inscribed with zero transparent wedges', () => {
+  const w = 120;
+  const h = 100;
+  const rgba = new Uint8ClampedArray(w * h * 4);
+
+  // Draw two vertical bright pillars at x = 30 and x = 90 on a dark background
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const idx = (y * w + x) * 4;
+      const isPillar = Math.abs(x - 30) <= 2 || Math.abs(x - 90) <= 2;
+      const val = isPillar ? 240 : 30;
+      rgba[idx] = val;
+      rgba[idx + 1] = val;
+      rgba[idx + 2] = val;
+      rgba[idx + 3] = 255;
+    }
+  }
+
+  const original = new Uint8ClampedArray(rgba);
+  applyProjectiveKeystoneWarpToRgba(rgba, w, h, 0);
+  assert.deepEqual(rgba, original, '0 deg keystone warp must be a no-op');
+
+  // Apply +6.0 deg keystone warp
+  applyProjectiveKeystoneWarpToRgba(rgba, w, h, 6.0);
+  assert.notDeepEqual(rgba, original, 'Non-zero keystone warp must transform pixel coordinates');
+
+  // Every single pixel must remain opaque (alpha = 255) because the projective homography is strictly inscribed
+  for (let i = 3; i < rgba.length; i += 4) {
+    assert.equal(rgba[i], 255, 'Keystone warp must remain 100% inscribed with no transparent border');
+  }
+});
+
+
 
 
