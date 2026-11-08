@@ -8,6 +8,8 @@ import {
   computeSplitDividerX,
   computePixelAreaScale,
   getScaledDimensionsWithinBudget,
+  analyzeAutoCorrection,
+  applyAutoCorrectionToRgba,
 } from './geometry';
 
 test('computeInscribedCrop returns full image dimensions when rotation angle is 0', () => {
@@ -197,4 +199,206 @@ test('computeFrameLayout respects opt-in pixelAreaBudget while preserving MAX_CA
   assert.equal(defaultLayout.canvasWidth, 8192);
   assert.equal(defaultLayout.canvasHeight, 8192);
 });
+
+test('detectHorizonTiltFromGrayscale recovers sub-degree vertical architectural tilt and subtle negative horizon tilt', () => {
+  const w = 240;
+  const h = 180;
+  const gray = new Float32Array(w * h);
+  const trueTiltDeg = -2.35;
+  const slope = Math.tan((trueTiltDeg * Math.PI) / 180);
+
+  // Smooth anti-aliased horizon at -2.35°
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const horizonY = h * 0.45 + (x - w * 0.5) * slope;
+      const dist = y - horizonY;
+      const blend = Math.max(0, Math.min(1, 0.5 + dist * 0.8));
+      gray[y * w + x] = 230 * (1 - blend) + 35 * blend;
+    }
+  }
+
+  const analysis = detectHorizonTiltFromGrayscale(gray, w, h, 15.0);
+  assert.ok(
+    Math.abs(analysis.detectedTiltDeg - trueTiltDeg) <= 0.08,
+    `Expected ${trueTiltDeg}°, got ${analysis.detectedTiltDeg}°`
+  );
+  assert.equal(analysis.appliedRotationDeg, Number((-analysis.detectedTiltDeg).toFixed(2)));
+  assert.ok(analysis.confidence >= 0.75);
+
+  // Off-center vertical architectural facade edge tilted at +1.85°
+  const vertGray = new Float32Array(w * h);
+  const trueVertTiltDeg = 1.85;
+  const vertSlope = Math.tan((trueVertTiltDeg * Math.PI) / 180);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      // Off-center vertical line at x ≈ 0.30 * w where dx = x0 - (y - cy) * tan(theta)
+      const wallX = w * 0.30 - (y - h * 0.5) * vertSlope;
+      const dist = x - wallX;
+      const blend = Math.max(0, Math.min(1, 0.5 + dist * 0.8));
+      vertGray[y * w + x] = 220 * (1 - blend) + 40 * blend;
+    }
+  }
+
+  const vertAnalysis = detectHorizonTiltFromGrayscale(vertGray, w, h, 15.0);
+  assert.ok(
+    Math.abs(vertAnalysis.detectedTiltDeg - trueVertTiltDeg) <= 0.08,
+    `Expected vertical tilt ${trueVertTiltDeg}°, got ${vertAnalysis.detectedTiltDeg}°`
+  );
+  assert.ok(vertAnalysis.confidence >= 0.7);
+});
+
+test('computeInscribedCrop enforces symmetric center parity and supports targetAspectRatio override', () => {
+  const res = computeInscribedCrop(2000, 1400, 3.2, true);
+  // Left margin must equal right margin exactly (zero 0.5px drift)
+  assert.equal(res.x, 2000 - (res.x + res.width));
+  assert.equal(res.y, 1400 - (res.y + res.height));
+
+  // Target 1:1 square inscribed crop inside rotated 2000x1400
+  const sq = computeInscribedCrop(2000, 1400, 4.0, true, 1.0);
+  assert.equal(sq.width, sq.height);
+  assert.ok(sq.width > 1100 && sq.width < 1400);
+
+  // Mixed parity source dimensions (2001 odd, 1400 even) preserves square crop
+  const mixedSq = computeInscribedCrop(2001, 1400, 4.0, true, 1.0);
+  assert.equal(mixedSq.width, mixedSq.height, 'Square crop must remain 1:1 on mixed parity source');
+  assert.ok(mixedSq.width > 1100 && mixedSq.width < 1400);
+
+  // Verify all four crop corners inverse-rotated into source coordinates lie within source bounds
+  const verifyCornersInside = (w: number, h: number, angleDeg: number, crop: { x: number; y: number; width: number; height: number }) => {
+    const rad = (Math.abs(angleDeg) * Math.PI) / 180;
+    const cosA = Math.cos(rad);
+    const sinA = Math.sin(rad);
+    const cx = w / 2;
+    const cy = h / 2;
+    const corners = [
+      [crop.x, crop.y],
+      [crop.x + crop.width, crop.y],
+      [crop.x, crop.y + crop.height],
+      [crop.x + crop.width, crop.y + crop.height],
+    ];
+    for (const [px, py] of corners) {
+      const dx = px - cx;
+      const dy = py - cy;
+      const rx = dx * cosA + dy * sinA + cx;
+      const ry = -dx * sinA + dy * cosA + cy;
+      assert.ok(
+        rx >= -1e-4 && rx <= w + 1e-4 && ry >= -1e-4 && ry <= h + 1e-4,
+        `Corner (${px}, ${py}) inverse-rotated to (${rx.toFixed(3)}, ${ry.toFixed(3)}) bleeds outside source ${w}x${h}`
+      );
+    }
+  };
+
+  verifyCornersInside(2000, 1400, 3.2, res);
+  verifyCornersInside(2000, 1400, 4.0, sq);
+  verifyCornersInside(2001, 1400, 4.0, mixedSq);
+
+  // Small mixed-parity source dimensions (5 odd, 4 even) regression test
+  const smallSq = computeInscribedCrop(5, 4, 4.0, true, 1.0);
+  assert.equal(smallSq.width, smallSq.height, 'Small square crop must remain strictly 1:1');
+  assert.ok(smallSq.width >= 1 && smallSq.width <= 4);
+  verifyCornersInside(5, 4, 4.0, smallSq);
+});
+
+test('analyzeAutoCorrection and applyAutoCorrectionToRgba optimize underexposed low-contrast image with color cast', () => {
+  const w = 64;
+  const h = 64;
+  const rgba = new Uint8ClampedArray(w * h * 4);
+
+  // Create a dim, low-contrast image with a cool blue cast (R < G < B)
+  for (let i = 0; i < w * h; i++) {
+    const t = (i % w) / (w - 1);
+    const base = Math.round(35 + t * 90); // Luma range ~[35, 125] (underexposed & compressed)
+    rgba[i * 4] = Math.max(0, base - 12);     // R (cool deficit)
+    rgba[i * 4 + 1] = base;                   // G
+    rgba[i * 4 + 2] = Math.min(255, base + 14); // B (blue cast)
+    rgba[i * 4 + 3] = 255;
+  }
+
+  const corr = analyzeAutoCorrection(rgba, w, h);
+  assert.ok(corr.exposureEv > 0.1, `Expected positive EV boost, got ${corr.exposureEv}`);
+  assert.ok(corr.contrast >= 12, `Expected contrast boost >= 12, got ${corr.contrast}`);
+  assert.ok(corr.wbTempShift > 0, `Expected warm WB shift to neutralize blue cast, got ${corr.wbTempShift}`);
+
+  // Test zero, intermediate (50%), and full (100%) strength using separate copies
+  const rgbaOriginal = new Uint8ClampedArray(rgba);
+  const rgbaZero = new Uint8ClampedArray(rgba);
+  const rgbaHalf = new Uint8ClampedArray(rgba);
+  const rgbaFull = new Uint8ClampedArray(rgba);
+
+  applyAutoCorrectionToRgba(rgbaZero, w, h, corr, 0);
+  assert.deepEqual(rgbaZero, rgbaOriginal, 'Zero strength must leave all bytes unchanged');
+
+  applyAutoCorrectionToRgba(rgbaHalf, w, h, corr, 50);
+  applyAutoCorrectionToRgba(rgbaFull, w, h, corr, 100);
+
+  const testIdx = (32 * w + 32) * 4;
+  const origR = rgbaOriginal[testIdx];
+  const halfR = rgbaHalf[testIdx];
+  const fullR = rgbaFull[testIdx];
+
+  assert.ok(halfR > origR, 'Intermediate strength must brighten midtones');
+  assert.ok(fullR > halfR, 'Full strength must brighten more than intermediate');
+  assert.notDeepEqual(rgbaHalf, rgbaOriginal);
+  assert.notDeepEqual(rgbaHalf, rgbaFull);
+
+  // Midtones should be brightened and the R-to-B cast gap reduced
+  const afterMidR = rgbaFull[testIdx];
+  const afterMidB = rgbaFull[testIdx + 2];
+  const beforeMidR = rgbaOriginal[testIdx];
+  const beforeMidB = rgbaOriginal[testIdx + 2];
+  assert.ok(afterMidR > beforeMidR);
+  assert.ok(Math.abs(afterMidB - afterMidR) < Math.abs(beforeMidB - beforeMidR));
+});
+
+test('analyzeAutoCorrection handles fully transparent images and ignores transparent alpha pixels', () => {
+  const w = 32;
+  const h = 32;
+  const transparent = new Uint8ClampedArray(w * h * 4);
+  const neutralCorr = analyzeAutoCorrection(transparent, w, h);
+  assert.equal(neutralCorr.exposureEv, 0);
+  assert.equal(neutralCorr.contrast, 10);
+  assert.equal(neutralCorr.shadows, 0);
+
+  // Mixed transparent margin: image subject is well-exposed, outer margin is transparent
+  const mixed = new Uint8ClampedArray(w * h * 4);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const idx = (y * w + x) * 4;
+      if (x >= 8 && x < 24 && y >= 8 && y < 24) {
+        mixed[idx] = 128;
+        mixed[idx + 1] = 128;
+        mixed[idx + 2] = 128;
+        mixed[idx + 3] = 255;
+      } else {
+        // Seed transparent border with nonzero RGB values to test alpha-zero preservation
+        mixed[idx] = 42;
+        mixed[idx + 1] = 84;
+        mixed[idx + 2] = 126;
+        mixed[idx + 3] = 0;
+      }
+    }
+  }
+
+  // Snapshot before correction to ensure transparent bytes remain untouched
+  const snapshotBefore = new Uint8ClampedArray(mixed);
+
+  const mixedCorr = analyzeAutoCorrection(mixed, w, h);
+  // Midtone 128 should NOT be over-brightened as if it were dark
+  assert.ok(Math.abs(mixedCorr.exposureEv) < 0.2, `Expected neutral EV around 0, got ${mixedCorr.exposureEv}`);
+
+  // Verify applyAutoCorrectionToRgba leaves transparent alpha pixels strictly untouched
+  applyAutoCorrectionToRgba(mixed, w, h, mixedCorr, 100);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const idx = (y * w + x) * 4;
+      if (x < 8 || x >= 24 || y < 8 || y >= 24) {
+        assert.equal(mixed[idx], snapshotBefore[idx], 'Red channel of transparent pixel must be unchanged');
+        assert.equal(mixed[idx + 1], snapshotBefore[idx + 1], 'Green channel of transparent pixel must be unchanged');
+        assert.equal(mixed[idx + 2], snapshotBefore[idx + 2], 'Blue channel of transparent pixel must be unchanged');
+        assert.equal(mixed[idx + 3], 0, 'Alpha channel of transparent pixel must remain zero');
+      }
+    }
+  }
+});
+
 

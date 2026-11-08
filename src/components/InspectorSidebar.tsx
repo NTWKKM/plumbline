@@ -6,14 +6,17 @@ import {
   FileCheck,
   Frame,
   RotateCcw,
+  Sparkles,
 } from 'lucide-react';
 import {
   AspectRatioPreset,
+  AutoCorrectAnalysis,
   CropRect,
   ExifData,
   FrameLayout,
   LevelingAnalysis,
   PipelineConfig,
+  formatSignedDegrees,
 } from '../utils/geometry';
 import { BACKGROUND_COLOR_PRESETS } from '../utils/samplePhotos';
 
@@ -21,6 +24,7 @@ interface InspectorSidebarProps {
   config: PipelineConfig;
   onChangeConfig: (updater: (prev: PipelineConfig) => PipelineConfig) => void;
   analysis: LevelingAnalysis;
+  autoCorrect?: AutoCorrectAnalysis;
   cropRect: CropRect;
   frameLayout: FrameLayout;
   sourceSize: { width: number; height: number };
@@ -31,6 +35,7 @@ interface InspectorSidebarProps {
   onExportJpeg: () => void;
   isExporting: boolean;
   isImageLoaded?: boolean;
+  className?: string;
 }
 
 const ASPECT_PRESETS: { value: AspectRatioPreset; label: string }[] = [
@@ -45,6 +50,7 @@ export const InspectorSidebar: React.FC<InspectorSidebarProps> = ({
   config,
   onChangeConfig,
   analysis,
+  autoCorrect,
   cropRect,
   frameLayout,
   sourceSize,
@@ -55,23 +61,26 @@ export const InspectorSidebar: React.FC<InspectorSidebarProps> = ({
   onExportJpeg,
   isExporting,
   isImageLoaded = true,
+  className = '',
 }) => {
   const totalRotationDeg = Number(
     ((config.autoLevelEnabled ? analysis.appliedRotationDeg : 0) + config.manualAngleOffsetDeg).toFixed(2)
   );
+  const autoCorrectEnabled = config.autoCorrectEnabled ?? true;
+  const autoCorrectStrength = config.autoCorrectStrength ?? 75;
 
   return (
     <aside
       aria-label="Image Processing Inspector"
-      className="flex w-full lg:w-[356px] shrink-0 flex-col border-t lg:border-t-0 lg:border-l border-zinc-800/90 bg-[#111114] text-zinc-100 select-none overflow-y-auto"
+      className={`flex shrink-0 flex-col border-t lg:border-t-0 lg:border-l border-zinc-800/90 bg-[#111114] text-zinc-100 select-none overflow-y-auto ${className || 'w-full lg:w-[356px]'}`}
     >
-      {/* Section 1: Auto-Leveling & Inscribed Auto-Crop */}
+      {/* Section 1: Auto-Leveling, Inscribed Auto-Crop & Smart Auto-Correct */}
       <section className="border-b border-zinc-800/80 px-4 py-3.5">
-        <div className="flex items-center justify-between">
-          <div className="flex items-center gap-2">
-            <Compass className="h-4 w-4 text-blue-400" />
-            <h2 className="font-display text-sm font-semibold tracking-tight text-zinc-100">
-              01. Auto-Level & Inscribed Crop
+        <div className="flex items-center justify-between gap-2">
+          <div className="flex items-center gap-2 min-w-0">
+            <Compass className="h-4 w-4 text-blue-400 shrink-0" />
+            <h2 className="font-display text-sm font-semibold tracking-tight text-zinc-100 truncate">
+              Auto-Level, Crop & Correct
             </h2>
           </div>
           <button
@@ -84,10 +93,10 @@ export const InspectorSidebar: React.FC<InspectorSidebarProps> = ({
           </button>
         </div>
 
-        {/* Sobel Auto-Level Toggle */}
-        <div className="mt-2.5 flex items-center justify-between">
-          <label htmlFor="toggle-auto-level" className="text-xs font-medium text-zinc-200 cursor-pointer">
-            Sobel Horizon Auto-Level
+        {/* Scharr + Sub-Pixel Radon + IRLS Auto-Level Toggle */}
+        <div className="mt-2.5 flex items-center justify-between gap-2">
+          <label htmlFor="toggle-auto-level" className="text-xs font-medium text-zinc-200 cursor-pointer truncate">
+            Scharr Sub-Pixel Horizon Auto-Level
           </label>
           <input
             id="toggle-auto-level"
@@ -96,27 +105,27 @@ export const InspectorSidebar: React.FC<InspectorSidebarProps> = ({
             onChange={(e) =>
               onChangeConfig((prev) => ({ ...prev, autoLevelEnabled: e.target.checked }))
             }
-            className="h-4 w-4 accent-blue-600 rounded cursor-pointer"
+            className="h-4 w-4 accent-blue-600 rounded cursor-pointer shrink-0"
           />
         </div>
 
         {/* Live Telemetry Readout (Unboxed clean text + tabular-nums) */}
         <div className="mt-2 grid grid-cols-3 gap-2 border-y border-zinc-800/80 py-2 text-xs">
-          <div>
-            <div className="text-zinc-400">Detected Tilt</div>
-            <div className="mt-0.5 font-mono font-medium text-zinc-100 tabular-nums" data-testid="detected-tilt-val">
-              {analysis.detectedTiltDeg > 0 ? `+${analysis.detectedTiltDeg.toFixed(2)}°` : `${analysis.detectedTiltDeg.toFixed(2)}°`}
+          <div className="min-w-0">
+            <div className="text-zinc-400 truncate">Detected Tilt</div>
+            <div className="mt-0.5 font-medium text-zinc-100 tabular-nums truncate" data-testid="detected-tilt-val">
+              {formatSignedDegrees(analysis.detectedTiltDeg, 2)}
             </div>
           </div>
-          <div>
-            <div className="text-zinc-400">Correction</div>
-            <div className="mt-0.5 font-mono font-medium text-blue-400 tabular-nums" data-testid="applied-rotation-val">
-              {totalRotationDeg > 0 ? `+${totalRotationDeg.toFixed(2)}°` : `${totalRotationDeg.toFixed(2)}°`}
+          <div className="min-w-0">
+            <div className="text-zinc-400 truncate">Correction</div>
+            <div className="mt-0.5 font-medium text-blue-400 tabular-nums truncate" data-testid="applied-rotation-val">
+              {formatSignedDegrees(totalRotationDeg, 2)}
             </div>
           </div>
-          <div>
-            <div className="text-zinc-400">Confidence</div>
-            <div className="mt-0.5 font-mono font-medium text-zinc-200 tabular-nums">
+          <div className="min-w-0">
+            <div className="text-zinc-400 truncate">Confidence</div>
+            <div className="mt-0.5 font-medium text-zinc-200 tabular-nums truncate">
               {Math.round(analysis.confidence * 100)}%
             </div>
           </div>
@@ -128,8 +137,8 @@ export const InspectorSidebar: React.FC<InspectorSidebarProps> = ({
             <label htmlFor="slider-sensor-tilt" className="text-zinc-400">
               Test Camera Sensor Tilt
             </label>
-            <span className="font-mono text-zinc-200 tabular-nums">
-              {simulatedTiltDeg > 0 ? `+${simulatedTiltDeg.toFixed(1)}°` : `${simulatedTiltDeg.toFixed(1)}°`}
+            <span className="text-zinc-200 tabular-nums">
+              {formatSignedDegrees(simulatedTiltDeg, 1)}
             </span>
           </div>
           <input
@@ -150,10 +159,8 @@ export const InspectorSidebar: React.FC<InspectorSidebarProps> = ({
             <label htmlFor="slider-manual-angle" className="text-zinc-400">
               Manual Fine-Tune Angle
             </label>
-            <span className="font-mono text-zinc-200 tabular-nums">
-              {config.manualAngleOffsetDeg > 0
-                ? `+${config.manualAngleOffsetDeg.toFixed(2)}°`
-                : `${config.manualAngleOffsetDeg.toFixed(2)}°`}
+            <span className="text-zinc-200 tabular-nums">
+              {formatSignedDegrees(config.manualAngleOffsetDeg, 2)}
             </span>
           </div>
           <input
@@ -161,7 +168,7 @@ export const InspectorSidebar: React.FC<InspectorSidebarProps> = ({
             type="range"
             min={-15}
             max={15}
-            step={0.1}
+            step={0.05}
             value={config.manualAngleOffsetDeg}
             onChange={(e) =>
               onChangeConfig((prev) => ({
@@ -175,10 +182,10 @@ export const InspectorSidebar: React.FC<InspectorSidebarProps> = ({
 
         {/* Inscribed Auto-Crop Controls */}
         <div className="mt-2.5 pt-2.5 border-t border-zinc-800/60">
-          <div className="flex items-center justify-between">
-            <label htmlFor="toggle-auto-crop" className="flex items-center gap-1.5 text-xs font-medium text-zinc-200 cursor-pointer">
-              <Crop className="h-3.5 w-3.5 text-blue-400" />
-              Auto-Crop Largest Inscribed Rect
+          <div className="flex items-center justify-between gap-2">
+            <label htmlFor="toggle-auto-crop" className="flex items-center gap-1.5 text-xs font-medium text-zinc-200 cursor-pointer min-w-0">
+              <Crop className="h-3.5 w-3.5 text-blue-400 shrink-0" />
+              <span className="truncate">Auto-Crop Largest Inscribed Rect</span>
             </label>
             <input
               id="toggle-auto-crop"
@@ -187,16 +194,94 @@ export const InspectorSidebar: React.FC<InspectorSidebarProps> = ({
               onChange={(e) =>
                 onChangeConfig((prev) => ({ ...prev, autoCropEnabled: e.target.checked }))
               }
-              className="h-4 w-4 accent-blue-600 rounded cursor-pointer"
+              className="h-4 w-4 accent-blue-600 rounded cursor-pointer shrink-0"
             />
           </div>
 
-          <div className="mt-1.5 flex items-center justify-between text-xs text-zinc-400">
-            <span>Inscribed Bounds</span>
-            <span className="font-mono text-zinc-200 tabular-nums" data-testid="crop-dimensions-val">
+          {config.autoCropEnabled && (
+            <div className="mt-1.5 flex items-center justify-between gap-2">
+              <label htmlFor="toggle-preserve-crop-aspect" className="text-xs text-zinc-400 cursor-pointer truncate">
+                Preserve Source Aspect Ratio
+              </label>
+              <input
+                id="toggle-preserve-crop-aspect"
+                type="checkbox"
+                checked={config.preserveAspectRatioInCrop}
+                onChange={(e) =>
+                  onChangeConfig((prev) => ({
+                    ...prev,
+                    preserveAspectRatioInCrop: e.target.checked,
+                  }))
+                }
+                className="h-3.5 w-3.5 accent-blue-600 rounded cursor-pointer shrink-0"
+              />
+            </div>
+          )}
+
+          <div className="mt-1.5 flex items-center justify-between gap-2 text-xs text-zinc-400">
+            <span className="shrink-0">Inscribed Bounds</span>
+            <span className="text-zinc-200 tabular-nums truncate text-right" data-testid="crop-dimensions-val">
               {cropRect.width} × {cropRect.height} px · {cropRect.areaRetainedPercent}% area
             </span>
           </div>
+        </div>
+
+        {/* Smart Filmic Auto-Correct (Tone, Contrast & White Balance) */}
+        <div className="mt-2.5 pt-2.5 border-t border-zinc-800/60">
+          <div className="flex items-center justify-between gap-2">
+            <label htmlFor="toggle-auto-correct" className="flex items-center gap-1.5 text-xs font-medium text-zinc-200 cursor-pointer min-w-0">
+              <Sparkles className="h-3.5 w-3.5 text-blue-400 shrink-0" />
+              <span className="truncate">Auto-Correct Tone & White Balance</span>
+            </label>
+            <input
+              id="toggle-auto-correct"
+              type="checkbox"
+              checked={autoCorrectEnabled}
+              onChange={(e) =>
+                onChangeConfig((prev) => ({ ...prev, autoCorrectEnabled: e.target.checked }))
+              }
+              className="h-4 w-4 accent-blue-600 rounded cursor-pointer shrink-0"
+            />
+          </div>
+
+          {autoCorrectEnabled && (
+            <div className="mt-2">
+              <div className="flex items-center justify-between text-xs">
+                <label htmlFor="slider-auto-correct-strength" className="text-zinc-400">
+                  Correction Intensity
+                </label>
+                <span className="text-zinc-200 tabular-nums" data-testid="auto-correct-strength-val">
+                  {autoCorrectStrength}%
+                </span>
+              </div>
+              <input
+                id="slider-auto-correct-strength"
+                type="range"
+                min={0}
+                max={100}
+                step={5}
+                value={autoCorrectStrength}
+                onChange={(e) =>
+                  onChangeConfig((prev) => ({
+                    ...prev,
+                    autoCorrectStrength: parseInt(e.target.value, 10),
+                  }))
+                }
+                className="mt-1 h-1.5 w-full cursor-pointer appearance-none rounded-lg bg-zinc-800 accent-blue-500"
+              />
+              {autoCorrect && (
+                <div className="mt-1.5 flex items-center justify-between gap-2 text-[11px] text-zinc-400 tabular-nums">
+                  <span className="truncate">
+                    EV {autoCorrect.exposureEv >= 0 ? `+${autoCorrect.exposureEv.toFixed(2)}` : autoCorrect.exposureEv.toFixed(2)}
+                  </span>
+                  <span aria-hidden="true">·</span>
+                  <span className="truncate">Contrast +{autoCorrect.contrast}</span>
+                  <span aria-hidden="true">·</span>
+                  <span className="truncate">DR {autoCorrect.dynamicRangeStops} EV</span>
+                </div>
+              )}
+            </div>
+          )}
         </div>
       </section>
 
@@ -205,14 +290,14 @@ export const InspectorSidebar: React.FC<InspectorSidebarProps> = ({
         <div className="flex items-center gap-2">
           <Frame className="h-4 w-4 text-blue-400" />
           <h2 className="font-display text-sm font-semibold tracking-tight text-zinc-100">
-            02. White Border & Square Fit
+            White Border & Framing
           </h2>
         </div>
 
         {/* Aspect Ratio Selector */}
         <div className="mt-2.5">
           <div className="text-xs text-zinc-400 mb-1.5">Target Aspect Ratio</div>
-          <div className="grid grid-cols-3 gap-1.5" role="group" aria-label="Target Aspect Ratio">
+          <div className="grid grid-cols-2 gap-1.5 sm:grid-cols-3" role="group" aria-label="Target Aspect Ratio">
             {ASPECT_PRESETS.map((preset) => {
               const active = config.aspectPreset === preset.value;
               return (
@@ -222,10 +307,10 @@ export const InspectorSidebar: React.FC<InspectorSidebarProps> = ({
                   onClick={() =>
                     onChangeConfig((prev) => ({ ...prev, aspectPreset: preset.value }))
                   }
-                  className={`rounded-lg px-2.5 py-1.5 text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${
+                  className={`rounded-lg px-2 py-1.5 text-xs font-medium transition-colors text-center truncate ${
                     active
-                      ? 'bg-blue-600 text-white'
-                      : 'bg-zinc-900 text-zinc-300 border border-zinc-800 hover:border-zinc-700 hover:text-white'
+                      ? 'bg-zinc-100 text-zinc-950 font-semibold'
+                      : 'bg-zinc-900/90 text-zinc-300 border border-zinc-800 hover:border-zinc-700 hover:text-white'
                   }`}
                 >
                   {preset.label}
@@ -241,7 +326,7 @@ export const InspectorSidebar: React.FC<InspectorSidebarProps> = ({
             <label htmlFor="slider-border-padding" className="text-zinc-300 font-medium">
               Border Thickness (Padding)
             </label>
-            <span className="font-mono text-zinc-100 tabular-nums" data-testid="padding-percent-val">
+            <span className="text-zinc-100 tabular-nums" data-testid="padding-percent-val">
               {config.paddingPercent}%
             </span>
           </div>
@@ -260,9 +345,9 @@ export const InspectorSidebar: React.FC<InspectorSidebarProps> = ({
             }
             className="mt-1 h-1.5 w-full cursor-pointer appearance-none rounded-lg bg-zinc-800 accent-blue-500"
           />
-          <div className="mt-1.5 flex items-center justify-between text-xs text-zinc-400">
-            <span>Output Frame Size</span>
-            <span className="font-mono text-zinc-200 tabular-nums" data-testid="output-canvas-size">
+          <div className="mt-1.5 flex items-center justify-between gap-2 text-xs text-zinc-400">
+            <span className="shrink-0">Output Frame Size</span>
+            <span className="text-zinc-200 tabular-nums truncate text-right" data-testid="output-canvas-size">
               {frameLayout.canvasWidth} × {frameLayout.canvasHeight} px
             </span>
           </div>
@@ -272,12 +357,12 @@ export const InspectorSidebar: React.FC<InspectorSidebarProps> = ({
         <div className="mt-3">
           <div className="flex items-center justify-between text-xs mb-1.5">
             <span className="text-zinc-300 font-medium">Frame Background Color</span>
-            <span className="font-mono text-zinc-400 uppercase tabular-nums">
+            <span className="text-zinc-400 uppercase tabular-nums">
               {config.backgroundColor}
             </span>
           </div>
 
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2">
             {BACKGROUND_COLOR_PRESETS.map((swatch) => {
               const isSelected =
                 config.backgroundColor.toLowerCase() === swatch.hex.toLowerCase();
@@ -325,7 +410,7 @@ export const InspectorSidebar: React.FC<InspectorSidebarProps> = ({
           <div className="flex items-center gap-2">
             <FileCheck className="h-4 w-4 text-blue-400" />
             <h2 className="font-display text-sm font-semibold tracking-tight text-zinc-100">
-              03. EXIF Metadata & Export
+              EXIF & Export
             </h2>
           </div>
 
@@ -367,20 +452,20 @@ export const InspectorSidebar: React.FC<InspectorSidebarProps> = ({
             </div>
           </div>
 
-          {/* Clean Unboxed EXIF Readout */}
-          <div className="mt-2.5 space-y-1 border-t border-zinc-800/80 pt-2.5 text-xs text-zinc-400">
+          {/* Clean Unboxed EXIF Readout with no overflow */}
+          <div className="mt-2.5 space-y-1.5 border-t border-zinc-800/80 pt-2.5 text-xs text-zinc-400">
             {(exif.cameraModel || exif.rawFormat) && (
-              <div className="flex justify-between">
-                <span>Camera & Format</span>
-                <span className="font-mono text-zinc-200">
+              <div className="flex items-center justify-between gap-2">
+                <span className="shrink-0">Camera & Format</span>
+                <span className="text-zinc-200 truncate text-right max-w-[65%]">
                   {[exif.cameraModel, exif.rawFormat || 'JPEG'].filter(Boolean).join(' · ')}
                 </span>
               </div>
             )}
             {exif.lensModel && (
-              <div className="flex justify-between">
-                <span>Lens</span>
-                <span className="font-mono text-zinc-200 truncate max-w-[200px]">
+              <div className="flex items-center justify-between gap-2">
+                <span className="shrink-0">Lens</span>
+                <span className="text-zinc-200 truncate text-right max-w-[65%]">
                   {exif.lensModel}
                 </span>
               </div>
@@ -391,9 +476,9 @@ export const InspectorSidebar: React.FC<InspectorSidebarProps> = ({
               exif.shutterSpeed,
               exif.iso ? `ISO ${exif.iso.replace(/^ISO\s*/i, '')}` : '',
             ].some(Boolean) && (
-              <div className="flex justify-between">
-                <span>Exposure</span>
-                <span className="font-mono text-zinc-200 tabular-nums">
+              <div className="flex items-center justify-between gap-2">
+                <span className="shrink-0">Exposure</span>
+                <span className="text-zinc-200 tabular-nums truncate text-right max-w-[65%]">
                   {[
                     exif.focalLength,
                     exif.aperture,
@@ -405,9 +490,9 @@ export const InspectorSidebar: React.FC<InspectorSidebarProps> = ({
                 </span>
               </div>
             )}
-            <div className="flex justify-between">
-              <span>Source Sensor</span>
-              <span className="font-mono text-zinc-300 tabular-nums">
+            <div className="flex items-center justify-between gap-2">
+              <span className="shrink-0">Source Sensor</span>
+              <span className="text-zinc-300 tabular-nums truncate text-right">
                 {sourceSize.width} × {sourceSize.height} px
               </span>
             </div>
@@ -420,7 +505,7 @@ export const InspectorSidebar: React.FC<InspectorSidebarProps> = ({
             type="button"
             onClick={onExportJpeg}
             disabled={isExporting || !isImageLoaded}
-            className="flex w-full items-center justify-center gap-2 rounded-lg bg-blue-600 px-4 py-2 text-xs font-semibold text-white shadow-sm transition-colors hover:bg-blue-500 disabled:opacity-50 whitespace-nowrap shrink-0"
+            className="flex w-full items-center justify-center gap-2 rounded-lg bg-zinc-100 hover:bg-white text-zinc-950 px-4 py-2 text-xs font-semibold transition-colors disabled:opacity-50 whitespace-nowrap shrink-0"
           >
             <Download className="h-4 w-4" />
             {isExporting ? 'Encoding JPEG & Injecting EXIF...' : 'Export Framed JPEG'}

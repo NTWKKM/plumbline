@@ -1,14 +1,21 @@
 import React, { useEffect, useRef, useState } from 'react';
 import {
+  AutoCorrectAnalysis,
   CropRect,
+  DEFAULT_AUTO_CORRECT_ANALYSIS,
+  DEFAULT_LEVELING_ANALYSIS,
   FrameLayout,
   LevelingAnalysis,
   PipelineConfig,
+  PipelineTelemetryUpdate,
+  analyzeAutoCorrection,
+  applyAutoCorrectionToRgba,
   computeFrameLayout,
   computeInscribedCrop,
   computeSplitDividerX,
   detectHorizonTiltFromGrayscale,
   formatExifSummaryLine,
+  formatSignedDegrees,
   getScaledDimensionsWithinBudget,
 } from '../utils/geometry';
 import { StudioPhotoItem } from '../utils/samplePhotos';
@@ -22,12 +29,7 @@ interface DarkroomCanvasProps {
   splitPercent: number;
   onSplitPercentChange: (pct: number) => void;
   showHorizonGrid: boolean;
-  onAnalysisUpdate: (
-    analysis: LevelingAnalysis,
-    crop: CropRect,
-    layout: FrameLayout,
-    sourceSize: { width: number; height: number }
-  ) => void;
+  onAnalysisUpdate: (telemetry: PipelineTelemetryUpdate) => void;
   canvasRef: React.RefObject<HTMLCanvasElement | null>;
   onImageLoaded?: (loaded: boolean) => void;
   exportCanvasRef?: React.MutableRefObject<(() => HTMLCanvasElement | null) | null>;
@@ -46,17 +48,26 @@ export const DarkroomCanvas: React.FC<DarkroomCanvasProps> = ({
   exportCanvasRef,
 }) => {
   const [sensorCanvas, setSensorCanvas] = useState<HTMLCanvasElement | null>(null);
-  const [analysis, setAnalysis] = useState<LevelingAnalysis>({
-    detectedTiltDeg: 0,
-    appliedRotationDeg: 0,
-    confidence: 0,
-    strongEdgeCount: 0,
-  });
+  const [analysis, setAnalysis] = useState<LevelingAnalysis>(DEFAULT_LEVELING_ANALYSIS);
+  const [autoCorrect, setAutoCorrect] = useState<AutoCorrectAnalysis>(
+    DEFAULT_AUTO_CORRECT_ANALYSIS
+  );
   const [loadError, setLoadError] = useState<string | null>(null);
   const [isDraggingSplit, setIsDraggingSplit] = useState<boolean>(false);
 
   const callbackRef = useRef(onAnalysisUpdate);
   callbackRef.current = onAnalysisUpdate;
+
+  // Cache processed full-resolution rotCanvas and framed output across interactive split drags
+  const pipelineCacheRef = useRef<{
+    sensorCanvas: HTMLCanvasElement;
+    cacheKey: string;
+    crop: CropRect;
+    layout: FrameLayout;
+    totalRotDeg: number;
+    rotCanvas: HTMLCanvasElement;
+    processedFrameCanvas: HTMLCanvasElement;
+  } | null>(null);
 
   // Step 1: Load source photo, apply simulated camera sensor tilt if configured, and run Sobel/Radon Horizon Detection
   useEffect(() => {
@@ -104,8 +115,8 @@ export const DarkroomCanvas: React.FC<DarkroomCanvasProps> = ({
       ctx.drawImage(img, -scaledW / 2, -scaledH / 2, scaledW, scaledH);
       ctx.restore();
 
-      // Downscale to <= 480px on longest side for fast, deterministic horizon detection
-      const detectScale = Math.min(1, 480 / Math.max(offscreen.width, offscreen.height));
+      // Downscale to <= 640px on longest side for sub-0.01° Scharr/Radon/IRLS horizon detection & Auto-Correct analysis
+      const detectScale = Math.min(1, 640 / Math.max(offscreen.width, offscreen.height));
       const dw = Math.max(16, Math.round(offscreen.width * detectScale));
       const dh = Math.max(16, Math.round(offscreen.height * detectScale));
 
@@ -113,12 +124,8 @@ export const DarkroomCanvas: React.FC<DarkroomCanvasProps> = ({
       detectCanvas.width = dw;
       detectCanvas.height = dh;
       const dCtx = detectCanvas.getContext('2d');
-      let detected: LevelingAnalysis = {
-        detectedTiltDeg: 0,
-        appliedRotationDeg: 0,
-        confidence: 0,
-        strongEdgeCount: 0,
-      };
+      let detected: LevelingAnalysis = DEFAULT_LEVELING_ANALYSIS;
+      let autoCorr: AutoCorrectAnalysis = DEFAULT_AUTO_CORRECT_ANALYSIS;
 
       if (dCtx) {
         dCtx.drawImage(offscreen, 0, 0, dw, dh);
@@ -131,10 +138,12 @@ export const DarkroomCanvas: React.FC<DarkroomCanvasProps> = ({
           );
         }
         detected = detectHorizonTiltFromGrayscale(gray, dw, dh, config.maxAutoAngleDeg);
+        autoCorr = analyzeAutoCorrection(imgData, dw, dh);
       }
 
       setSensorCanvas(offscreen);
       setAnalysis(detected);
+      setAutoCorrect(autoCorr);
     };
 
     img.onerror = () => {
@@ -182,129 +191,184 @@ export const DarkroomCanvas: React.FC<DarkroomCanvasProps> = ({
 
     const autoRot = config.autoLevelEnabled ? analysis.appliedRotationDeg : 0;
     const totalRotDeg = Number((autoRot + config.manualAngleOffsetDeg).toFixed(2));
+    const corrEnabled = config.autoCorrectEnabled ?? true;
+    const corrStrength = config.autoCorrectStrength ?? 75;
 
-    const crop = config.autoCropEnabled
-      ? computeInscribedCrop(srcW, srcH, totalRotDeg, config.preserveAspectRatioInCrop)
-      : {
-          x: 0,
-          y: 0,
-          width: srcW,
-          height: srcH,
-          scaleFactor: 1,
-          areaRetainedPercent: 100,
-        };
-
-    const layout = computeFrameLayout(
-      crop.width,
-      crop.height,
+    const pipelineKey = [
+      photo.id,
+      `${srcW}x${srcH}`,
+      totalRotDeg,
+      config.autoCropEnabled,
+      config.preserveAspectRatioInCrop,
       config.aspectPreset,
       config.paddingPercent,
       config.renderExifCaption,
-      config.pixelAreaBudget
-    );
+      config.pixelAreaBudget,
+      config.backgroundColor,
+      corrEnabled,
+      corrStrength,
+      autoCorrect.exposureEv,
+      autoCorrect.contrast,
+      autoCorrect.shadows,
+      autoCorrect.highlights,
+      autoCorrect.wbTempShift,
+      autoCorrect.wbTintShift,
+      photo.exif.cameraModel,
+      photo.exif.lensModel,
+      photo.exif.focalLength,
+    ].join('|');
 
-    callbackRef.current(analysis, crop, layout, { width: srcW, height: srcH });
+    if (
+      !pipelineCacheRef.current ||
+      pipelineCacheRef.current.sensorCanvas !== sensorCanvas ||
+      pipelineCacheRef.current.cacheKey !== pipelineKey
+    ) {
+      const crop = config.autoCropEnabled
+        ? computeInscribedCrop(srcW, srcH, totalRotDeg, config.preserveAspectRatioInCrop)
+        : {
+            x: 0,
+            y: 0,
+            width: srcW,
+            height: srcH,
+            scaleFactor: 1,
+            areaRetainedPercent: 100,
+          };
 
-    // Create rotated intermediate canvas
-    const rotCanvas = document.createElement('canvas');
-    rotCanvas.width = srcW;
-    rotCanvas.height = srcH;
-    const rCtx = rotCanvas.getContext('2d');
-    if (!rCtx) {
-      if (exportCanvasRef) exportCanvasRef.current = null;
-      onImageLoaded?.(false);
-      return;
-    }
-
-    rCtx.fillStyle = config.backgroundColor;
-    rCtx.fillRect(0, 0, srcW, srcH);
-    rCtx.save();
-    rCtx.translate(srcW / 2, srcH / 2);
-    rCtx.rotate((totalRotDeg * Math.PI) / 180);
-    rCtx.drawImage(sensorCanvas, -srcW / 2, -srcH / 2);
-    rCtx.restore();
-
-    const drawProcessedFrame = (targetCtx: CanvasRenderingContext2D) => {
-      // 1. Fill border background
-      targetCtx.fillStyle = config.backgroundColor;
-      targetCtx.fillRect(0, 0, layout.canvasWidth, layout.canvasHeight);
-
-      // 2. Draw cropped inner photograph
-      targetCtx.imageSmoothingEnabled = true;
-      targetCtx.imageSmoothingQuality = 'high';
-      targetCtx.drawImage(
-        rotCanvas,
-        crop.x,
-        crop.y,
+      const layout = computeFrameLayout(
         crop.width,
         crop.height,
-        layout.imageX,
-        layout.imageY,
-        layout.imageWidth,
-        layout.imageHeight
+        config.aspectPreset,
+        config.paddingPercent,
+        config.renderExifCaption,
+        config.pixelAreaBudget
       );
 
-      // 3. Optional EXIF typographic caption in bottom border
-      if (config.renderExifCaption) {
-        const captionText = formatExifSummaryLine(photo.exif);
-        if (captionText) {
-          let fontSize = Math.max(12, Math.round(layout.canvasHeight * 0.0145));
-          if (layout.borderBottom >= fontSize) {
-            const isDarkBg = isHexColorDark(config.backgroundColor);
-            targetCtx.fillStyle = isDarkBg ? '#a1a1aa' : '#3f3f46';
-            targetCtx.font = `500 ${fontSize}px "JetBrains Mono", monospace`;
-            targetCtx.textAlign = 'center';
-            targetCtx.textBaseline = 'middle';
+      // Create rotated intermediate canvas with transparent wedges so background color never bleeds
+      const rotCanvas = document.createElement('canvas');
+      rotCanvas.width = srcW;
+      rotCanvas.height = srcH;
+      const rCtx = rotCanvas.getContext('2d');
+      if (!rCtx) {
+        if (exportCanvasRef) exportCanvasRef.current = null;
+        onImageLoaded?.(false);
+        return;
+      }
 
-            // Measure caption and ensure rendered width fits within canvas boundaries
-            const maxCaptionWidth = Math.max(
-              10,
-              layout.canvasWidth - Math.max(32, Math.round(layout.canvasWidth * 0.08))
-            );
-            let textWidth = targetCtx.measureText(captionText).width;
+      rCtx.save();
+      rCtx.imageSmoothingEnabled = true;
+      rCtx.imageSmoothingQuality = 'high';
+      rCtx.translate(srcW / 2, srcH / 2);
+      rCtx.rotate((totalRotDeg * Math.PI) / 180);
+      rCtx.drawImage(sensorCanvas, -srcW / 2, -srcH / 2);
+      rCtx.restore();
 
-            if (textWidth > maxCaptionWidth) {
-              const scaledFontSize = Math.max(
-                9,
-                Math.floor(fontSize * (maxCaptionWidth / textWidth))
+      // Apply luminance-preserving Filmic Auto-Correct & White Balance neutralization if enabled
+      if (corrEnabled && corrStrength > 0 && crop.width > 0 && crop.height > 0) {
+        const croppedData = rCtx.getImageData(crop.x, crop.y, crop.width, crop.height);
+        applyAutoCorrectionToRgba(
+          croppedData.data,
+          crop.width,
+          crop.height,
+          autoCorrect,
+          corrStrength
+        );
+        rCtx.putImageData(croppedData, crop.x, crop.y);
+      }
+
+      // Pre-render the full-resolution processed frame (photo + frame + caption)
+      const processedFrameCanvas = document.createElement('canvas');
+      processedFrameCanvas.width = layout.canvasWidth;
+      processedFrameCanvas.height = layout.canvasHeight;
+      const pCtx = processedFrameCanvas.getContext('2d');
+      if (pCtx) {
+        pCtx.fillStyle = config.backgroundColor;
+        pCtx.fillRect(0, 0, layout.canvasWidth, layout.canvasHeight);
+
+        pCtx.imageSmoothingEnabled = true;
+        pCtx.imageSmoothingQuality = 'high';
+        pCtx.drawImage(
+          rotCanvas,
+          crop.x,
+          crop.y,
+          crop.width,
+          crop.height,
+          layout.imageX,
+          layout.imageY,
+          layout.imageWidth,
+          layout.imageHeight
+        );
+
+        if (config.renderExifCaption) {
+          const captionText = formatExifSummaryLine(photo.exif);
+          if (captionText) {
+            let fontSize = Math.max(12, Math.round(layout.canvasHeight * 0.0145));
+            if (layout.borderBottom >= fontSize) {
+              const isDarkBg = isHexColorDark(config.backgroundColor);
+              pCtx.fillStyle = isDarkBg ? '#a1a1aa' : '#3f3f46';
+              pCtx.font = `500 ${fontSize}px "JetBrains Mono", monospace`;
+              pCtx.textAlign = 'center';
+              pCtx.textBaseline = 'middle';
+
+              const maxCaptionWidth = Math.max(
+                10,
+                layout.canvasWidth - Math.max(32, Math.round(layout.canvasWidth * 0.08))
               );
-              if (scaledFontSize < fontSize) {
-                fontSize = scaledFontSize;
-                targetCtx.font = `500 ${fontSize}px "JetBrains Mono", monospace`;
-                textWidth = targetCtx.measureText(captionText).width;
-              }
-            }
+              let textWidth = pCtx.measureText(captionText).width;
 
-            let finalCaption = captionText;
-            if (textWidth > maxCaptionWidth) {
-              while (
-                finalCaption.length > 3 &&
-                targetCtx.measureText(finalCaption + '…').width > maxCaptionWidth
-              ) {
-                finalCaption = finalCaption.slice(0, -1);
+              if (textWidth > maxCaptionWidth) {
+                const scaledFontSize = Math.max(
+                  9,
+                  Math.floor(fontSize * (maxCaptionWidth / textWidth))
+                );
+                if (scaledFontSize < fontSize) {
+                  fontSize = scaledFontSize;
+                  pCtx.font = `500 ${fontSize}px "JetBrains Mono", monospace`;
+                  textWidth = pCtx.measureText(captionText).width;
+                }
               }
-              finalCaption += '…';
-            }
 
-            const captionY = layout.imageY + layout.imageHeight + layout.borderBottom * 0.52;
-            targetCtx.fillText(finalCaption, layout.canvasWidth / 2, captionY);
+              let finalCaption = captionText;
+              if (textWidth > maxCaptionWidth) {
+                while (
+                  finalCaption.length > 3 &&
+                  pCtx.measureText(finalCaption + '…').width > maxCaptionWidth
+                ) {
+                  finalCaption = finalCaption.slice(0, -1);
+                }
+                finalCaption += '…';
+              }
+
+              const captionY = layout.imageY + layout.imageHeight + layout.borderBottom * 0.52;
+              pCtx.fillText(finalCaption, layout.canvasWidth / 2, captionY);
+            }
           }
         }
       }
-    };
 
-    // Expose offscreen framed canvas generator for clean export without inspection overlays
-    if (exportCanvasRef) {
-      exportCanvasRef.current = () => {
-        const offscreen = document.createElement('canvas');
-        offscreen.width = layout.canvasWidth;
-        offscreen.height = layout.canvasHeight;
-        const oCtx = offscreen.getContext('2d');
-        if (!oCtx) return null;
-        drawProcessedFrame(oCtx);
-        return offscreen;
+      pipelineCacheRef.current = {
+        sensorCanvas,
+        cacheKey: pipelineKey,
+        crop,
+        layout,
+        totalRotDeg,
+        rotCanvas,
+        processedFrameCanvas,
       };
+
+      callbackRef.current({
+        analysis,
+        crop,
+        layout,
+        sourceSize: { width: srcW, height: srcH },
+        autoCorrect,
+      });
     }
+
+    if (exportCanvasRef) {
+      exportCanvasRef.current = () => pipelineCacheRef.current?.processedFrameCanvas ?? null;
+    }
+
+    const { crop, layout, rotCanvas, processedFrameCanvas } = pipelineCacheRef.current;
 
     const ctx = canvas.getContext('2d');
     if (!ctx) {
@@ -321,6 +385,8 @@ export const DarkroomCanvas: React.FC<DarkroomCanvasProps> = ({
       // Show rotated buffer + dimmed corner wedges + bright inscribed rectangle box
       canvas.width = srcW;
       canvas.height = srcH;
+      ctx.fillStyle = config.backgroundColor;
+      ctx.fillRect(0, 0, srcW, srcH);
       ctx.drawImage(rotCanvas, 0, 0);
 
       // Dim outside the inscribed crop rectangle
@@ -346,7 +412,7 @@ export const DarkroomCanvas: React.FC<DarkroomCanvasProps> = ({
       ctx.beginPath();
       ctx.rect(splitX, 0, layout.canvasWidth - splitX, layout.canvasHeight);
       ctx.clip();
-      drawProcessedFrame(ctx);
+      ctx.drawImage(processedFrameCanvas, 0, 0);
       ctx.restore();
 
       // Left Side (Before: Un-leveled Original Sensor aligned to the inner photo frame)
@@ -424,14 +490,13 @@ export const DarkroomCanvas: React.FC<DarkroomCanvasProps> = ({
       const sideMargin = Math.max(18, Math.round(layout.canvasWidth * 0.022));
       const badgeY = Math.max(18, Math.round(layout.canvasHeight * 0.025));
 
-      const beforeText = `BEFORE · UN-LEVELED (${
-        analysis.detectedTiltDeg > 0
-          ? `+${analysis.detectedTiltDeg.toFixed(2)}°`
-          : `${analysis.detectedTiltDeg.toFixed(2)}°`
-      })`;
-      const afterText = `AFTER · LEVELED & FRAMED (${
-        totalRotDeg > 0 ? `+${totalRotDeg.toFixed(2)}°` : `${totalRotDeg.toFixed(2)}°`
-      })`;
+      const isCompactBadge = layout.canvasWidth < 800;
+      const beforeText = isCompactBadge
+        ? `BEFORE (${formatSignedDegrees(analysis.detectedTiltDeg, 1)})`
+        : `BEFORE · UN-LEVELED (${formatSignedDegrees(analysis.detectedTiltDeg, 2)})`;
+      const afterText = isCompactBadge
+        ? `AFTER (${formatSignedDegrees(totalRotDeg, 1)})`
+        : `AFTER · LEVELED & FRAMED (${formatSignedDegrees(totalRotDeg, 2)})`;
 
       const beforeW = ctx.measureText(beforeText).width + padX * 2;
       const afterW = ctx.measureText(afterText).width + padX * 2;
@@ -458,7 +523,7 @@ export const DarkroomCanvas: React.FC<DarkroomCanvasProps> = ({
       // Standard Framed White Border output
       canvas.width = layout.canvasWidth;
       canvas.height = layout.canvasHeight;
-      drawProcessedFrame(ctx);
+      ctx.drawImage(processedFrameCanvas, 0, 0);
     }
 
     // Optional alignment grid overlay
@@ -501,6 +566,7 @@ export const DarkroomCanvas: React.FC<DarkroomCanvasProps> = ({
   }, [
     sensorCanvas,
     analysis,
+    autoCorrect,
     config,
     viewMode,
     splitPercent,
@@ -579,7 +645,7 @@ export const DarkroomCanvas: React.FC<DarkroomCanvasProps> = ({
         onPointerUp={handlePointerUp}
         onPointerCancel={handlePointerCancel}
         onLostPointerCapture={handleLostPointerCapture}
-        className={`max-h-full max-w-full object-contain shadow-2xl transition-opacity duration-150 ${
+        className={`max-h-full max-w-full object-contain ring-1 ring-zinc-800/80 transition-opacity duration-150 ${
           viewMode === 'split' ? 'cursor-ew-resize select-none touch-none' : ''
         }`}
       />
