@@ -847,7 +847,7 @@ export function computeFrameLayout(
 }
 
 /**
- * Formats EXIF metadata into a single clean typographic line for darkroom/gallery borders.
+ * Formats EXIF metadata into a single clean typographic line for studio/gallery borders.
  */
 export function formatExifSummaryLine(exif: ExifData): string {
   const parts = [
@@ -949,7 +949,7 @@ export function getScaledDimensionsWithinBudget(
 }
 
 /**
- * Analyzes an RGBA image buffer to compute optimal darkroom Auto-Correct parameters:
+ * Analyzes an RGBA image buffer to compute optimal studio Auto-Correct parameters:
  * - Percentile histogram black/white anchor points (0.5% and 99.5%)
  * - Exposure compensation (EV) targeting perceptual midtone balance with highlight headroom protection
  * - Adaptive shadow recovery and highlight roll-off
@@ -1120,7 +1120,7 @@ export function analyzeAutoCorrection(
 }
 
 /**
- * Applies darkroom Auto-Correct luminance-preserving filmic tone curve, shadow/highlight recovery,
+ * Applies studio Auto-Correct luminance-preserving filmic tone curve, shadow/highlight recovery,
  * micro-contrast S-curve, and midtone-weighted white balance neutralization in-place.
  */
 export function applyAutoCorrectionToRgba(

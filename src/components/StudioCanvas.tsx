@@ -22,7 +22,7 @@ import { StudioPhotoItem } from '../utils/samplePhotos';
 
 export type CanvasViewMode = 'framed' | 'split' | 'geometry' | 'original';
 
-interface DarkroomCanvasProps {
+interface StudioCanvasProps {
   photo: StudioPhotoItem;
   config: PipelineConfig;
   viewMode: CanvasViewMode;
@@ -35,7 +35,7 @@ interface DarkroomCanvasProps {
   exportCanvasRef?: React.MutableRefObject<(() => HTMLCanvasElement | null) | null>;
 }
 
-export const DarkroomCanvas: React.FC<DarkroomCanvasProps> = ({
+export const StudioCanvas: React.FC<StudioCanvasProps> = ({
   photo,
   config,
   viewMode,
@@ -173,7 +173,7 @@ export const DarkroomCanvas: React.FC<DarkroomCanvasProps> = ({
     onImageLoaded,
   ]);
 
-  // Step 2: Render the active pipeline stage onto the visible darkroom canvas
+  // Step 2: Render the active pipeline stage onto the visible studio canvas
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas || !sensorCanvas) {
@@ -397,8 +397,8 @@ export const DarkroomCanvas: React.FC<DarkroomCanvasProps> = ({
       ctx.fillRect(crop.x + crop.width, crop.y, srcW - (crop.x + crop.width), crop.height);
 
       // Draw inscribed rectangle outline
-      ctx.strokeStyle = '#3b82f6';
-      ctx.lineWidth = Math.max(2, Math.round(srcW * 0.0025));
+      ctx.strokeStyle = '#f4f4f5';
+      ctx.lineWidth = Math.max(2, Math.round(srcW * 0.002));
       ctx.strokeRect(crop.x, crop.y, crop.width, crop.height);
     } else if (viewMode === 'split') {
       // Before / After Split-Screen Comparison Mode
@@ -421,13 +421,13 @@ export const DarkroomCanvas: React.FC<DarkroomCanvasProps> = ({
       ctx.rect(0, 0, splitX, layout.canvasHeight);
       ctx.clip();
 
-      // Subtle darkroom matte background so unframed vs framed border is clearly distinguishable
-      ctx.fillStyle = '#141418';
+      // Subtle matte background so unframed vs framed border is clearly distinguishable
+      ctx.fillStyle = '#121215';
       ctx.fillRect(0, 0, layout.canvasWidth, layout.canvasHeight);
 
-      // Draw dashed boundary where the White Border inner image sits
-      ctx.strokeStyle = 'rgba(161, 161, 170, 0.28)';
-      ctx.lineWidth = Math.max(1, Math.round(layout.canvasWidth * 0.0012));
+      // Draw subtle boundary where the inner image sits
+      ctx.strokeStyle = 'rgba(161, 161, 170, 0.25)';
+      ctx.lineWidth = Math.max(1, Math.round(layout.canvasWidth * 0.001));
       ctx.strokeRect(layout.imageX, layout.imageY, layout.imageWidth, layout.imageHeight);
 
       // Draw the un-leveled original sensor image at the exact same inner region for 1:1 horizon comparison
@@ -448,29 +448,29 @@ export const DarkroomCanvas: React.FC<DarkroomCanvasProps> = ({
 
       // Draw crisp vertical split divider line & central grab handle
       ctx.save();
-      ctx.strokeStyle = '#3b82f6';
-      ctx.lineWidth = Math.max(2, Math.round(layout.canvasWidth * 0.0022));
+      ctx.strokeStyle = 'rgba(244, 244, 245, 0.9)';
+      ctx.lineWidth = Math.max(1.5, Math.round(layout.canvasWidth * 0.0018));
       ctx.beginPath();
       ctx.moveTo(splitX, 0);
       ctx.lineTo(splitX, layout.canvasHeight);
       ctx.stroke();
 
       // Central circular handle
-      const handleRadius = Math.max(16, Math.round(layout.canvasWidth * 0.018));
+      const handleRadius = Math.max(14, Math.round(layout.canvasWidth * 0.016));
       const centerY = layout.imageY + layout.imageHeight / 2;
       ctx.fillStyle = '#18181b';
       ctx.beginPath();
       ctx.arc(splitX, centerY, handleRadius, 0, Math.PI * 2);
       ctx.fill();
-      ctx.lineWidth = Math.max(2, Math.round(layout.canvasWidth * 0.002));
-      ctx.strokeStyle = '#3b82f6';
+      ctx.lineWidth = Math.max(1.5, Math.round(layout.canvasWidth * 0.0016));
+      ctx.strokeStyle = '#e4e4e7';
       ctx.stroke();
 
       // Left/Right arrows inside handle
-      const arrowOffset = Math.round(handleRadius * 0.42);
-      const arrowSize = Math.round(handleRadius * 0.26);
+      const arrowOffset = Math.round(handleRadius * 0.4);
+      const arrowSize = Math.round(handleRadius * 0.24);
       ctx.strokeStyle = '#f4f4f6';
-      ctx.lineWidth = Math.max(1.5, Math.round(layout.canvasWidth * 0.0015));
+      ctx.lineWidth = Math.max(1.5, Math.round(layout.canvasWidth * 0.0014));
       ctx.beginPath();
       // Left chevron
       ctx.moveTo(splitX - arrowOffset + arrowSize, centerY - arrowSize);
@@ -482,39 +482,34 @@ export const DarkroomCanvas: React.FC<DarkroomCanvasProps> = ({
       ctx.lineTo(splitX + arrowOffset - arrowSize, centerY + arrowSize);
       ctx.stroke();
 
-      // Corner comparison labels (Measured dark scrim + crisp monospace text)
-      const labelFontSize = Math.max(13, Math.round(layout.canvasWidth * 0.013));
-      ctx.font = `600 ${labelFontSize}px "JetBrains Mono", monospace`;
-      const padX = Math.round(labelFontSize * 0.85);
-      const padY = Math.round(labelFontSize * 0.55);
-      const sideMargin = Math.max(18, Math.round(layout.canvasWidth * 0.022));
-      const badgeY = Math.max(18, Math.round(layout.canvasHeight * 0.025));
+      // Minimal corner comparison labels
+      const labelFontSize = Math.max(11, Math.round(layout.canvasWidth * 0.0115));
+      ctx.font = `500 ${labelFontSize}px "JetBrains Mono", monospace`;
+      const padX = Math.round(labelFontSize * 0.75);
+      const padY = Math.round(labelFontSize * 0.45);
+      const sideMargin = Math.max(16, Math.round(layout.canvasWidth * 0.02));
+      const badgeY = Math.max(16, Math.round(layout.canvasHeight * 0.022));
 
-      const isCompactBadge = layout.canvasWidth < 800;
-      const beforeText = isCompactBadge
-        ? `BEFORE (${formatSignedDegrees(analysis.detectedTiltDeg, 1)})`
-        : `BEFORE · UN-LEVELED (${formatSignedDegrees(analysis.detectedTiltDeg, 2)})`;
-      const afterText = isCompactBadge
-        ? `AFTER (${formatSignedDegrees(totalRotDeg, 1)})`
-        : `AFTER · LEVELED & FRAMED (${formatSignedDegrees(totalRotDeg, 2)})`;
+      const beforeText = `BEFORE ${formatSignedDegrees(analysis.detectedTiltDeg, 1)}`;
+      const afterText = `AFTER ${formatSignedDegrees(totalRotDeg, 1)}`;
 
       const beforeW = ctx.measureText(beforeText).width + padX * 2;
       const afterW = ctx.measureText(afterText).width + padX * 2;
       const boxH = labelFontSize + padY * 2;
 
-      // Left badge
-      ctx.fillStyle = 'rgba(15, 15, 18, 0.88)';
+      // Left label
+      ctx.fillStyle = 'rgba(9, 9, 11, 0.82)';
       ctx.fillRect(sideMargin, badgeY, beforeW, boxH);
-      ctx.fillStyle = '#e4e4e7';
+      ctx.fillStyle = '#a1a1aa';
       ctx.textAlign = 'left';
       ctx.textBaseline = 'middle';
       ctx.fillText(beforeText, sideMargin + padX, badgeY + boxH / 2);
 
-      // Right badge
+      // Right label
       const rightX = layout.canvasWidth - sideMargin - afterW;
-      ctx.fillStyle = 'rgba(15, 15, 18, 0.88)';
+      ctx.fillStyle = 'rgba(9, 9, 11, 0.82)';
       ctx.fillRect(rightX, badgeY, afterW, boxH);
-      ctx.fillStyle = '#60a5fa';
+      ctx.fillStyle = '#f4f4f5';
       ctx.textAlign = 'left';
       ctx.fillText(afterText, rightX + padX, badgeY + boxH / 2);
 
@@ -531,8 +526,8 @@ export const DarkroomCanvas: React.FC<DarkroomCanvasProps> = ({
       const w = canvas.width;
       const h = canvas.height;
       ctx.save();
-      ctx.strokeStyle = 'rgba(59, 130, 246, 0.55)';
-      ctx.lineWidth = Math.max(1, Math.round(w * 0.0012));
+      ctx.strokeStyle = 'rgba(24, 24, 27, 0.45)';
+      ctx.lineWidth = Math.max(1, Math.round(w * 0.001));
 
       // Center horizontal & vertical reference lines
       ctx.beginPath();
@@ -543,7 +538,7 @@ export const DarkroomCanvas: React.FC<DarkroomCanvasProps> = ({
       ctx.stroke();
 
       // Rule of thirds
-      ctx.strokeStyle = 'rgba(255, 255, 255, 0.25)';
+      ctx.strokeStyle = 'rgba(113, 113, 122, 0.35)';
       ctx.beginPath();
       ctx.moveTo(0, h / 3);
       ctx.lineTo(w, h / 3);
@@ -632,20 +627,20 @@ export const DarkroomCanvas: React.FC<DarkroomCanvasProps> = ({
 
   return (
     <div
-      className="relative flex h-full w-full items-center justify-center overflow-hidden p-4"
+      className="relative flex h-full w-full items-center justify-center overflow-hidden p-2 sm:p-4"
       data-state={sensorCanvas ? 'ready' : 'loading'}
       data-view-mode={viewMode}
     >
       <canvas
         ref={canvasRef}
-        data-testid="darkroom-canvas"
+        data-testid="studio-canvas"
         aria-label={`Framed preview of ${photo.title}`}
         onPointerDown={handlePointerDown}
         onPointerMove={handlePointerMove}
         onPointerUp={handlePointerUp}
         onPointerCancel={handlePointerCancel}
         onLostPointerCapture={handleLostPointerCapture}
-        className={`max-h-full max-w-full object-contain ring-1 ring-zinc-800/80 transition-opacity duration-150 ${
+        className={`max-h-full max-w-full object-contain ring-1 ring-zinc-800/70 transition-opacity duration-150 ${
           viewMode === 'split' ? 'cursor-ew-resize select-none touch-none' : ''
         }`}
       />
