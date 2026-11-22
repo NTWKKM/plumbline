@@ -3,15 +3,20 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useCallback, useRef, useState } from 'react';
-import { Grid, ImagePlus } from 'lucide-react';
-import { CanvasViewMode, DarkroomCanvas } from './components/DarkroomCanvas';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
+import { Grid, ImagePlus, ZoomIn, ZoomOut } from 'lucide-react';
+import {
+  CanvasViewMode,
+  DarkroomCanvas,
+  renderPhotoToFramedCanvas,
+} from './components/DarkroomCanvas';
 import { InspectorSidebar } from './components/InspectorSidebar';
 import {
   injectApp1ExifIntoJpegBlob,
   parseExifFromArrayBuffer,
 } from './utils/exifParser';
 import {
+  AspectRatioPreset,
   AutoCorrectAnalysis,
   CropRect,
   DEFAULT_AUTO_CORRECT_ANALYSIS,
@@ -20,9 +25,15 @@ import {
   LevelingAnalysis,
   PipelineConfig,
   PipelineTelemetryUpdate,
+  clamp,
   formatSignedDegrees,
 } from './utils/geometry';
 import { INITIAL_SAMPLE_PHOTOS, StudioPhotoItem } from './utils/samplePhotos';
+
+const CONFIG_STORAGE_KEY = 'plumbline.pipelineConfig.v1';
+const VIEW_STORAGE_KEY = 'plumbline.viewState.v1';
+const VALID_ASPECT_PRESETS: AspectRatioPreset[] = ['1:1', '4:5', '16:9', '3:2', 'original'];
+const VALID_VIEW_MODES: CanvasViewMode[] = ['framed', 'split', 'geometry', 'original'];
 
 const DEFAULT_PIPELINE_CONFIG: PipelineConfig = {
   autoLevelEnabled: true,
@@ -40,15 +51,136 @@ const DEFAULT_PIPELINE_CONFIG: PipelineConfig = {
   jpegQuality: 95,
 };
 
+function loadPersistedConfig(): PipelineConfig {
+  try {
+    const raw = localStorage.getItem(CONFIG_STORAGE_KEY);
+    if (!raw) return DEFAULT_PIPELINE_CONFIG;
+    const parsed: unknown = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object') return DEFAULT_PIPELINE_CONFIG;
+    const obj = parsed as Record<string, unknown>;
+    return {
+      autoLevelEnabled:
+        typeof obj.autoLevelEnabled === 'boolean'
+          ? obj.autoLevelEnabled
+          : DEFAULT_PIPELINE_CONFIG.autoLevelEnabled,
+      maxAutoAngleDeg:
+        typeof obj.maxAutoAngleDeg === 'number' && Number.isFinite(obj.maxAutoAngleDeg)
+          ? clamp(obj.maxAutoAngleDeg, 1, 15)
+          : DEFAULT_PIPELINE_CONFIG.maxAutoAngleDeg,
+      manualAngleOffsetDeg:
+        typeof obj.manualAngleOffsetDeg === 'number' && Number.isFinite(obj.manualAngleOffsetDeg)
+          ? clamp(obj.manualAngleOffsetDeg, -15, 15)
+          : DEFAULT_PIPELINE_CONFIG.manualAngleOffsetDeg,
+      autoCropEnabled:
+        typeof obj.autoCropEnabled === 'boolean'
+          ? obj.autoCropEnabled
+          : DEFAULT_PIPELINE_CONFIG.autoCropEnabled,
+      preserveAspectRatioInCrop:
+        typeof obj.preserveAspectRatioInCrop === 'boolean'
+          ? obj.preserveAspectRatioInCrop
+          : DEFAULT_PIPELINE_CONFIG.preserveAspectRatioInCrop,
+      autoCorrectEnabled:
+        typeof obj.autoCorrectEnabled === 'boolean'
+          ? obj.autoCorrectEnabled
+          : DEFAULT_PIPELINE_CONFIG.autoCorrectEnabled,
+      autoCorrectStrength:
+        typeof obj.autoCorrectStrength === 'number' && Number.isFinite(obj.autoCorrectStrength)
+          ? clamp(Math.round(obj.autoCorrectStrength), 0, 100)
+          : DEFAULT_PIPELINE_CONFIG.autoCorrectStrength,
+      aspectPreset:
+        typeof obj.aspectPreset === 'string' &&
+        VALID_ASPECT_PRESETS.includes(obj.aspectPreset as AspectRatioPreset)
+          ? (obj.aspectPreset as AspectRatioPreset)
+          : DEFAULT_PIPELINE_CONFIG.aspectPreset,
+      paddingPercent:
+        typeof obj.paddingPercent === 'number' && Number.isFinite(obj.paddingPercent)
+          ? clamp(Math.round(obj.paddingPercent), 0, 30)
+          : DEFAULT_PIPELINE_CONFIG.paddingPercent,
+      backgroundColor:
+        typeof obj.backgroundColor === 'string' && /^#[0-9a-fA-F]{6}$/.test(obj.backgroundColor)
+          ? obj.backgroundColor
+          : DEFAULT_PIPELINE_CONFIG.backgroundColor,
+      preserveExifMetadata:
+        typeof obj.preserveExifMetadata === 'boolean'
+          ? obj.preserveExifMetadata
+          : DEFAULT_PIPELINE_CONFIG.preserveExifMetadata,
+      renderExifCaption:
+        typeof obj.renderExifCaption === 'boolean'
+          ? obj.renderExifCaption
+          : DEFAULT_PIPELINE_CONFIG.renderExifCaption,
+      jpegQuality:
+        typeof obj.jpegQuality === 'number' && Number.isFinite(obj.jpegQuality)
+          ? clamp(Math.round(obj.jpegQuality), 70, 100)
+          : DEFAULT_PIPELINE_CONFIG.jpegQuality,
+    };
+  } catch {
+    return DEFAULT_PIPELINE_CONFIG;
+  }
+}
+
+function loadPersistedViewState(): {
+  viewMode: CanvasViewMode;
+  showHorizonGrid: boolean;
+  tiltOverrides: Record<string, number>;
+} {
+  const fallback = {
+    viewMode: 'framed' as CanvasViewMode,
+    showHorizonGrid: false,
+    tiltOverrides: {} as Record<string, number>,
+  };
+  try {
+    const raw = localStorage.getItem(VIEW_STORAGE_KEY);
+    if (!raw) return fallback;
+    const parsed: unknown = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object') return fallback;
+    const obj = parsed as Record<string, unknown>;
+    const tiltOverrides: Record<string, number> = {};
+    if (obj.tiltOverrides && typeof obj.tiltOverrides === 'object') {
+      for (const [k, v] of Object.entries(obj.tiltOverrides as Record<string, unknown>)) {
+        if (typeof v === 'number' && Number.isFinite(v)) {
+          tiltOverrides[k] = clamp(v, -12, 12);
+        }
+      }
+    }
+    return {
+      viewMode:
+        typeof obj.viewMode === 'string' &&
+        VALID_VIEW_MODES.includes(obj.viewMode as CanvasViewMode)
+          ? (obj.viewMode as CanvasViewMode)
+          : fallback.viewMode,
+      showHorizonGrid:
+        typeof obj.showHorizonGrid === 'boolean' ? obj.showHorizonGrid : fallback.showHorizonGrid,
+      tiltOverrides,
+    };
+  } catch {
+    return fallback;
+  }
+}
+
+function getInitialPhotos(tiltOverrides: Record<string, number>): StudioPhotoItem[] {
+  return INITIAL_SAMPLE_PHOTOS.map((item) =>
+    typeof tiltOverrides[item.id] === 'number'
+      ? { ...item, simulatedSensorTiltDeg: tiltOverrides[item.id] }
+      : item
+  );
+}
+
 export default function App() {
-  const [photos, setPhotos] = useState<StudioPhotoItem[]>(INITIAL_SAMPLE_PHOTOS);
+  const initialView = useRef(loadPersistedViewState()).current;
+  const [photos, setPhotos] = useState<StudioPhotoItem[]>(() =>
+    getInitialPhotos(initialView.tiltOverrides)
+  );
   const [selectedId, setSelectedId] = useState<string>(INITIAL_SAMPLE_PHOTOS[0].id);
-  const [config, setConfig] = useState<PipelineConfig>(DEFAULT_PIPELINE_CONFIG);
-  const [viewMode, setViewMode] = useState<CanvasViewMode>('framed');
+  const [config, setConfig] = useState<PipelineConfig>(() => loadPersistedConfig());
+  const [viewMode, setViewMode] = useState<CanvasViewMode>(initialView.viewMode);
   const [mobileTab, setMobileTab] = useState<'canvas' | 'adjust' | 'queue'>('canvas');
   const [splitPercent, setSplitPercent] = useState<number>(50);
-  const [showHorizonGrid, setShowHorizonGrid] = useState<boolean>(false);
+  const [showHorizonGrid, setShowHorizonGrid] = useState<boolean>(initialView.showHorizonGrid);
+  const [zoomLevel, setZoomLevel] = useState<number>(1);
+  const [panOffset, setPanOffset] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
+  const [isDraggingFiles, setIsDraggingFiles] = useState<boolean>(false);
   const [isExporting, setIsExporting] = useState<boolean>(false);
+  const [isBatchExporting, setIsBatchExporting] = useState<boolean>(false);
   const [isImageLoaded, setIsImageLoaded] = useState<boolean>(false);
   const [exportBanner, setExportBanner] = useState<string | null>(null);
   const [exportError, setExportError] = useState<string | null>(null);
@@ -85,8 +217,48 @@ export default function App() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const exportCanvasRef = useRef<(() => HTMLCanvasElement | null) | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const dragDepthRef = useRef<number>(0);
 
   const activePhoto = photos.find((p) => p.id === selectedId) || photos[0];
+
+  // Persist pipeline config and workspace preferences locally
+  useEffect(() => {
+    try {
+      localStorage.setItem(CONFIG_STORAGE_KEY, JSON.stringify(config));
+    } catch {
+      // Ignore quota or storage restriction errors
+    }
+  }, [config]);
+
+  useEffect(() => {
+    try {
+      const tiltOverrides: Record<string, number> = {};
+      for (const item of photos) {
+        if (!item.id.startsWith('imported-')) {
+          tiltOverrides[item.id] = item.simulatedSensorTiltDeg;
+        }
+      }
+      localStorage.setItem(
+        VIEW_STORAGE_KEY,
+        JSON.stringify({ viewMode, showHorizonGrid, tiltOverrides })
+      );
+    } catch {
+      // Ignore quota or storage restriction errors
+    }
+  }, [viewMode, showHorizonGrid, photos]);
+
+  // Reset pan offset when switching photos or returning zoom to 1x
+  useEffect(() => {
+    setPanOffset({ x: 0, y: 0 });
+  }, [selectedId]);
+
+  const handleZoomChange = useCallback((nextZoom: number) => {
+    const clamped = clamp(Number(nextZoom.toFixed(2)), 1, 4);
+    setZoomLevel(clamped);
+    if (clamped <= 1) {
+      setPanOffset({ x: 0, y: 0 });
+    }
+  }, []);
 
   const handleAnalysisUpdate = useCallback((telemetry: PipelineTelemetryUpdate) => {
     setAnalysis(telemetry.analysis);
@@ -96,47 +268,165 @@ export default function App() {
     setAutoCorrect(telemetry.autoCorrect);
   }, []);
 
-  const handleChangeSimulatedTilt = (deg: number) => {
-    setPhotos((prev) =>
-      prev.map((item) =>
-        item.id === activePhoto.id ? { ...item, simulatedSensorTiltDeg: deg } : item
-      )
-    );
-  };
+  const handleChangeSimulatedTilt = useCallback(
+    (deg: number) => {
+      setPhotos((prev) =>
+        prev.map((item) =>
+          item.id === activePhoto.id ? { ...item, simulatedSensorTiltDeg: deg } : item
+        )
+      );
+    },
+    [activePhoto.id]
+  );
 
-  const handleResetAll = () => {
+  const handleResetAll = useCallback(() => {
     setConfig(DEFAULT_PIPELINE_CONFIG);
     setSplitPercent(50);
+    setZoomLevel(1);
+    setPanOffset({ x: 0, y: 0 });
     handleChangeSimulatedTilt(0);
-  };
+  }, [handleChangeSimulatedTilt]);
+
+  const importFiles = useCallback(async (files: File[]) => {
+    const imageFiles = files.filter((file) =>
+      /\.(jpe?g|png|webp|dng|arw|cr2|nef)$/i.test(file.name) ||
+      file.type.startsWith('image/')
+    );
+    if (imageFiles.length === 0) return;
+
+    const importedItems: StudioPhotoItem[] = [];
+    for (const file of imageFiles) {
+      const buffer = await file.arrayBuffer();
+      const parsed = parseExifFromArrayBuffer(buffer, file.name);
+      const objectUrl = URL.createObjectURL(file);
+
+      const uniqueSuffix =
+        typeof crypto !== 'undefined' && crypto.randomUUID
+          ? crypto.randomUUID()
+          : `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+
+      importedItems.push({
+        id: `imported-${Date.now()}-${uniqueSuffix}`,
+        title: file.name.replace(/\.[^.]+$/, ''),
+        fileName: file.name,
+        src: objectUrl,
+        isRaw: parsed.isRawContainer,
+        simulatedSensorTiltDeg: 0,
+        exif: parsed.exif,
+        rawApp1Segment: parsed.rawApp1Segment,
+      });
+    }
+
+    if (importedItems.length > 0) {
+      setPhotos((prev) => [...importedItems, ...prev]);
+      setSelectedId(importedItems[0].id);
+      setMobileTab('canvas');
+    }
+  }, []);
 
   const handleFileImport = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
+    const files = Array.from(e.target.files ?? []);
+    if (files.length === 0) return;
+    await importFiles(files);
+    e.target.value = '';
+  };
 
-    const buffer = await file.arrayBuffer();
-    const parsed = parseExifFromArrayBuffer(buffer, file.name);
-    const objectUrl = URL.createObjectURL(file);
+  // Global keyboard shortcuts for studio navigation and inspection
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+      const target = e.target as HTMLElement | null;
+      if (
+        target &&
+        (target.tagName === 'INPUT' ||
+          target.tagName === 'TEXTAREA' ||
+          target.tagName === 'SELECT' ||
+          target.isContentEditable)
+      ) {
+        return;
+      }
 
-    const uniqueSuffix =
-      typeof crypto !== 'undefined' && crypto.randomUUID
-        ? crypto.randomUUID()
-        : `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+      if (e.key === ' ' && target && (target.tagName === 'BUTTON' || target.tagName === 'SUMMARY' || target.tagName === 'A')) {
+        return;
+      }
 
-    const newItem: StudioPhotoItem = {
-      id: `imported-${Date.now()}-${uniqueSuffix}`,
-      title: file.name.replace(/\.[^.]+$/, ''),
-      fileName: file.name,
-      src: objectUrl,
-      isRaw: parsed.isRawContainer,
-      simulatedSensorTiltDeg: 0,
-      exif: parsed.exif,
-      rawApp1Segment: parsed.rawApp1Segment,
+      if (e.key === 'g' || e.key === 'G') {
+        e.preventDefault();
+        setShowHorizonGrid((prev) => !prev);
+      } else if (e.key === 'b' || e.key === 'B' || e.key === ' ') {
+        e.preventDefault();
+        setViewMode((prev) => (prev === 'split' ? 'framed' : 'split'));
+      } else if (e.key === 'r' || e.key === 'R') {
+        e.preventDefault();
+        handleResetAll();
+      } else if (e.key === '=' || e.key === '+') {
+        e.preventDefault();
+        handleZoomChange(zoomLevel + 0.25);
+      } else if (e.key === '-') {
+        e.preventDefault();
+        handleZoomChange(zoomLevel - 0.25);
+      } else if (e.key === '0') {
+        e.preventDefault();
+        handleZoomChange(1);
+      } else if (e.key === '[' || e.key === 'ArrowUp') {
+        e.preventDefault();
+        const idx = photos.findIndex((p) => p.id === activePhoto.id);
+        if (idx > 0) setSelectedId(photos[idx - 1].id);
+      } else if (e.key === ']' || e.key === 'ArrowDown') {
+        e.preventDefault();
+        const idx = photos.findIndex((p) => p.id === activePhoto.id);
+        if (idx >= 0 && idx < photos.length - 1) setSelectedId(photos[idx + 1].id);
+      }
     };
 
-    setPhotos((prev) => [newItem, ...prev]);
-    setSelectedId(newItem.id);
-    e.target.value = '';
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [activePhoto.id, handleResetAll, handleZoomChange, photos, zoomLevel]);
+
+  const encodeAndDownloadFramedCanvas = async (
+    canvas: HTMLCanvasElement,
+    photoItem: StudioPhotoItem,
+    photoSourceSize: { width: number; height: number }
+  ): Promise<{ outName: string; exifPreserved: boolean }> => {
+    const quality = Math.max(0.7, Math.min(1.0, config.jpegQuality / 100));
+    const blob = await new Promise<Blob | null>((resolve) =>
+      canvas.toBlob((b) => resolve(b), 'image/jpeg', quality)
+    );
+
+    if (!blob) {
+      throw new Error('Failed to encode canvas to JPEG format.');
+    }
+
+    let finalBlob = blob;
+    let exifPreserved = false;
+
+    if (config.preserveExifMetadata) {
+      const injectResult = await injectApp1ExifIntoJpegBlob(
+        blob,
+        photoItem.rawApp1Segment,
+        {
+          width: canvas.width,
+          height: canvas.height,
+          sourceWidth: photoSourceSize.width,
+          sourceHeight: photoSourceSize.height,
+        }
+      );
+      finalBlob = injectResult.blob;
+      exifPreserved = injectResult.exifPreserved;
+    }
+
+    const url = URL.createObjectURL(finalBlob);
+    const a = document.createElement('a');
+    const baseName = photoItem.fileName.replace(/\.[^.]+$/, '');
+    const outName = `${baseName}_whiteborder_${config.aspectPreset.replace(':', 'x')}.jpg`;
+    a.href = url;
+    a.download = outName;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+
+    return { outName, exifPreserved };
   };
 
   const handleExportJpeg = async () => {
@@ -145,54 +435,20 @@ export default function App() {
     setExportError(null);
 
     try {
-      // Use the offscreen framed canvas generator to exclude inspection labels, dividers, crop guides, and Horizon Grid lines
       const canvas = exportCanvasRef.current ? exportCanvasRef.current() : canvasRef.current;
       if (!canvas) {
         setExportError('Darkroom canvas is not ready for export.');
         return;
       }
 
-      const quality = Math.max(0.7, Math.min(1.0, config.jpegQuality / 100));
-      const blob = await new Promise<Blob | null>((resolve) =>
-        canvas.toBlob((b) => resolve(b), 'image/jpeg', quality)
+      const { outName, exifPreserved } = await encodeAndDownloadFramedCanvas(
+        canvas,
+        activePhoto,
+        sourceSize
       );
 
-      if (!blob) {
-        setExportError('Failed to encode canvas to JPEG format.');
-        return;
-      }
-
-      let finalBlob = blob;
-      let exifPreserved = false;
-
-      if (config.preserveExifMetadata) {
-        const injectResult = await injectApp1ExifIntoJpegBlob(
-          blob,
-          activePhoto.rawApp1Segment,
-          {
-            width: canvas.width,
-            height: canvas.height,
-            sourceWidth: sourceSize.width,
-            sourceHeight: sourceSize.height,
-          }
-        );
-        finalBlob = injectResult.blob;
-        exifPreserved = injectResult.exifPreserved;
-      }
-
-      const url = URL.createObjectURL(finalBlob);
-      const a = document.createElement('a');
-      const baseName = activePhoto.fileName.replace(/\.[^.]+$/, '');
-      const outName = `${baseName}_whiteborder_${config.aspectPreset.replace(':', 'x')}.jpg`;
-      a.href = url;
-      a.download = outName;
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      URL.revokeObjectURL(url);
-
       setExportBanner(
-        `Exported ${outName} (${canvas.width} × ${canvas.height} px · ${
+        `Exported ${outName} (${canvas.width} × ${canvas.height} px, ${
           exifPreserved ? 'EXIF Preserved' : 'EXIF Stripped'
         })`
       );
@@ -204,54 +460,142 @@ export default function App() {
     }
   };
 
+  const handleBatchExportAll = async () => {
+    if (photos.length === 0) return;
+    setIsBatchExporting(true);
+    setExportBanner(null);
+    setExportError(null);
+
+    let exportedCount = 0;
+    try {
+      for (let i = 0; i < photos.length; i++) {
+        const item = photos[i];
+        setExportBanner(`Batch exporting ${i + 1} of ${photos.length}: ${item.title}…`);
+        const { canvas, sourceSize: itemSourceSize } = await renderPhotoToFramedCanvas(item, config);
+        await encodeAndDownloadFramedCanvas(canvas, item, itemSourceSize);
+        exportedCount += 1;
+      }
+      setExportBanner(
+        `Batch exported ${exportedCount} framed JPEG ${exportedCount === 1 ? 'file' : 'files'} (${config.aspectPreset}).`
+      );
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setExportError(`Batch export stopped after ${exportedCount} of ${photos.length}: ${msg}`);
+    } finally {
+      setIsBatchExporting(false);
+    }
+  };
+
+  const handleDragEnter = (e: React.DragEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    dragDepthRef.current += 1;
+    if (e.dataTransfer.types.includes('Files')) {
+      setIsDraggingFiles(true);
+    }
+  };
+
+  const handleDragOver = (e: React.DragEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'copy';
+  };
+
+  const handleDragLeave = (e: React.DragEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    dragDepthRef.current = Math.max(0, dragDepthRef.current - 1);
+    if (dragDepthRef.current === 0) {
+      setIsDraggingFiles(false);
+    }
+  };
+
+  const handleDrop = async (e: React.DragEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    dragDepthRef.current = 0;
+    setIsDraggingFiles(false);
+    const files = Array.from(e.dataTransfer.files ?? []);
+    await importFiles(files);
+  };
+
   return (
-    <div className="flex h-[100dvh] overflow-hidden flex-col bg-[#09090b] text-zinc-100">
+    <div
+      className="relative flex h-[100dvh] overflow-hidden flex-col bg-paper text-ink"
+      onDragEnter={handleDragEnter}
+      onDragOver={handleDragOver}
+      onDragLeave={handleDragLeave}
+      onDrop={handleDrop}
+    >
+      <a className="skip" href="#workspace">
+        Skip to workspace
+      </a>
+
       {/* Hidden File Input for Supported Image Formats */}
       <input
         ref={fileInputRef}
         type="file"
-        accept=".jpg,.jpeg,.png,.webp"
+        multiple
+        accept=".jpg,.jpeg,.png,.webp,.dng,.arw,.cr2,.nef"
         onChange={handleFileImport}
         className="hidden"
         aria-label="Upload photo"
       />
 
+      {/* Drag-and-Drop Overlay Indicator */}
+      {isDraggingFiles && (
+        <div
+          role="status"
+          aria-live="polite"
+          className="pointer-events-none fixed inset-0 z-modal flex items-center justify-center bg-paper/85 p-6"
+        >
+          <div className="atelier-stock max-w-md px-8 py-6 text-center">
+            <p className="font-display text-lg text-ink">
+              Drop photos to add to the studio queue
+            </p>
+            <p className="mt-1 text-sm text-muted">
+              Supports JPEG, PNG, WebP, and RAW containers with local EXIF parsing.
+            </p>
+          </div>
+        </div>
+      )}
+
       {/* 3-Zone Responsive Header */}
-      <header className="flex flex-wrap items-center justify-between gap-x-2 gap-y-1.5 sm:gap-6 border-b border-zinc-800/80 bg-[#121215] px-2.5 sm:px-6 py-2 sm:py-3 shrink-0">
-        {/* Zone 1: Wordmark & Studio badge */}
-        <div className="flex items-center gap-2 shrink-0">
-          <a
-            href="#workspace"
-            onClick={(e) => {
-              e.preventDefault();
-              setViewMode('framed');
-              setMobileTab('canvas');
-            }}
-            className="font-display text-sm sm:text-lg font-bold tracking-tight text-zinc-100 whitespace-nowrap"
-          >
-            Plumb_Line
-          </a>
-          <span className="hidden sm:inline-block rounded px-1.5 py-0.5 text-[10px] font-medium tracking-wide uppercase text-zinc-400 border border-zinc-800 bg-zinc-900/60">
+      <header className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1.5 sm:gap-6 border-b border-rule bg-paper-2 px-3 sm:px-6 py-2 sm:py-3 shrink-0">
+        {/* Zone 1: Wordmark & Studio label */}
+        <div className="flex items-center gap-2.5 shrink-0">
+          <h1 className="font-display text-base sm:text-xl font-normal tracking-tight text-ink leading-none">
+            <a
+              href="#workspace"
+              onClick={(e) => {
+                e.preventDefault();
+                setViewMode('framed');
+                setMobileTab('canvas');
+              }}
+              className="whitespace-nowrap no-underline hover:text-accent transition-colors"
+            >
+              Plumb_Line
+            </a>
+          </h1>
+          <span className="hidden sm:inline-block rounded-pill px-2 py-0.5 text-xs font-medium text-muted border border-rule bg-paper">
             Darkroom
           </span>
         </div>
 
         {/* Zone 2: Active Photo Telemetry (Desktop) / Section Switcher Tabs (Mobile < 1024px) */}
-        <div className="hidden lg:flex items-center gap-2 text-xs text-zinc-400 min-w-0">
-          <span className="font-medium text-zinc-200 truncate max-w-xs">{activePhoto.title}</span>
-          <span aria-hidden="true" className="text-zinc-600">·</span>
-          <span className="tabular-nums whitespace-nowrap">
+        <div className="hidden lg:flex items-center gap-3 text-xs text-muted min-w-0">
+          <span className="font-medium text-ink truncate max-w-xs">{activePhoto.title}</span>
+          <span className="border-l border-rule pl-3 font-mono tabular-nums whitespace-nowrap">
             {sourceSize.width} × {sourceSize.height} px
+          </span>
+          <span className="border-l border-rule pl-3 whitespace-nowrap text-muted">
+            Keys: B split, G grid, R reset
           </span>
         </div>
 
         {/* Mobile View Switcher Tabs (Only visible on screens < 1024px) */}
-        <div className="flex lg:hidden items-center rounded-lg bg-zinc-900 p-0.5 border border-zinc-800 text-[11px] sm:text-xs shrink min-w-0">
+        <div className="flex lg:hidden items-center rounded-pill bg-paper p-0.5 border border-rule text-xs shrink min-w-0">
           <button
             type="button"
             onClick={() => setMobileTab('canvas')}
-            className={`rounded-md px-2 py-1 sm:px-2.5 font-medium transition-colors whitespace-nowrap ${
-              mobileTab === 'canvas' ? 'bg-zinc-800 text-white' : 'text-zinc-400 hover:text-zinc-200'
+            className={`min-h-[32px] rounded-pill px-2.5 py-1 font-medium transition-colors whitespace-nowrap ${
+              mobileTab === 'canvas' ? 'bg-ink text-paper' : 'text-muted hover:text-ink'
             }`}
           >
             Canvas
@@ -259,8 +603,8 @@ export default function App() {
           <button
             type="button"
             onClick={() => setMobileTab('adjust')}
-            className={`rounded-md px-2 py-1 sm:px-2.5 font-medium transition-colors whitespace-nowrap ${
-              mobileTab === 'adjust' ? 'bg-zinc-800 text-white' : 'text-zinc-400 hover:text-zinc-200'
+            className={`min-h-[32px] rounded-pill px-2.5 py-1 font-medium transition-colors whitespace-nowrap ${
+              mobileTab === 'adjust' ? 'bg-ink text-paper' : 'text-muted hover:text-ink'
             }`}
           >
             Adjust
@@ -268,22 +612,22 @@ export default function App() {
           <button
             type="button"
             onClick={() => setMobileTab('queue')}
-            className={`rounded-md px-2 py-1 sm:px-2.5 font-medium transition-colors whitespace-nowrap ${
-              mobileTab === 'queue' ? 'bg-zinc-800 text-white' : 'text-zinc-400 hover:text-zinc-200'
+            className={`min-h-[32px] rounded-pill px-2.5 py-1 font-medium transition-colors whitespace-nowrap ${
+              mobileTab === 'queue' ? 'bg-ink text-paper' : 'text-muted hover:text-ink'
             }`}
           >
             Queue ({photos.length})
           </button>
         </div>
 
-        {/* Zone 3: Primary Action */}
+        {/* Zone 3: Primary Import Action (quiet hairline button in masthead; filled primary lives on Export) */}
         <div className="flex items-center gap-2 shrink-0">
           <button
             type="button"
             onClick={() => fileInputRef.current?.click()}
-            className="flex items-center gap-1.5 rounded-lg bg-zinc-100 hover:bg-white text-zinc-950 px-2.5 py-1.5 sm:px-3.5 sm:py-2 text-xs font-semibold transition-colors whitespace-nowrap shrink-0"
+            className="btn btn--quiet btn--sm shrink-0"
           >
-            <ImagePlus className="h-3.5 w-3.5" />
+            <ImagePlus className="h-3.5 w-3.5" aria-hidden="true" />
             <span className="hidden sm:inline">Import Photo</span>
             <span className="sm:hidden">Import</span>
           </button>
@@ -291,24 +635,24 @@ export default function App() {
       </header>
 
       {/* Main Studio Layout */}
-      <main className="flex flex-1 flex-col lg:flex-row overflow-hidden min-h-0">
+      <main id="workspace" tabIndex={-1} className="flex flex-1 flex-col lg:flex-row overflow-hidden min-h-0 outline-none">
         {/* Left Filmstrip Queue */}
         <aside
           aria-label="Photo Filmstrip Queue"
-          className={`w-full lg:w-[250px] shrink-0 flex-col border-b lg:border-b-0 lg:border-r border-zinc-800/80 bg-[#121215] ${
+          className={`w-full lg:w-[258px] shrink-0 flex-col border-b lg:border-b-0 lg:border-r border-rule bg-paper-2 ${
             mobileTab === 'queue' ? 'flex flex-1 overflow-y-auto' : 'hidden lg:flex'
           }`}
         >
-          <div className="flex items-center justify-between border-b border-zinc-800/80 px-4 py-3 shrink-0">
-            <span className="font-display text-xs font-semibold text-zinc-200">
+          <div className="flex items-center justify-between border-b border-rule px-4 py-3 shrink-0">
+            <h2 className="font-display text-sm font-normal text-ink">
               Filmstrip Queue ({photos.length})
-            </span>
+            </h2>
             <button
               type="button"
               onClick={() => fileInputRef.current?.click()}
-              className="text-xs font-medium text-blue-400 hover:text-blue-300 whitespace-nowrap shrink-0"
+              className="text-xs font-medium text-accent underline underline-offset-4 hover:text-ink whitespace-nowrap shrink-0"
             >
-              + Add File
+              Add file
             </button>
           </div>
 
@@ -319,32 +663,34 @@ export default function App() {
                 <button
                   key={item.id}
                   type="button"
+                  aria-pressed={isSelected}
                   onClick={() => {
                     setSelectedId(item.id);
                     if (mobileTab === 'queue') setMobileTab('canvas');
                   }}
-                  className={`group flex w-56 lg:w-full shrink-0 flex-col rounded-lg border p-2 text-left transition-colors min-w-0 ${
+                  className={`flex w-56 lg:w-full shrink-0 flex-col p-2 text-left transition-colors min-w-0 ${
                     isSelected
-                      ? 'border-zinc-500 bg-zinc-900/90 text-white'
-                      : 'border-zinc-800/80 bg-[#16161a] hover:border-zinc-700'
+                      ? 'atelier-stock border-ink text-ink'
+                      : 'border border-rule bg-paper hover:bg-paper-3 hover:border-ink-2 text-ink-2'
                   }`}
                 >
-                  <div className="relative h-28 w-full overflow-hidden rounded bg-zinc-950">
+                  <div className="relative h-28 w-full overflow-hidden bg-paper-3 border border-rule">
                     <img
                       src={item.src}
                       alt={item.title}
+                      width={320}
+                      height={180}
                       referrerPolicy="no-referrer"
-                      className="h-full w-full object-cover transition-transform duration-150 group-hover:scale-[1.02]"
+                      className="h-full w-full object-cover"
                     />
                   </div>
                   <div className="mt-2 min-w-0 w-full">
-                    <div className="truncate text-xs font-semibold text-zinc-100">
+                    <div className="truncate text-xs font-medium text-ink">
                       {item.title}
                     </div>
-                    {/* Clean unboxed metadata with typographic separator */}
-                    <div className="mt-1 flex items-center justify-between gap-1 text-[11px] text-zinc-400 tabular-nums">
+                    <div className="mt-1 flex items-center justify-between gap-2 text-xs text-muted font-mono tabular-nums">
                       <span className="truncate min-w-0">{item.fileName}</span>
-                      <span className="shrink-0 text-zinc-500">
+                      <span className="shrink-0 text-ink-2">
                         {formatSignedDegrees(item.simulatedSensorTiltDeg, 1)}
                       </span>
                     </div>
@@ -352,77 +698,89 @@ export default function App() {
                 </button>
               );
             })}
+
+            <button
+              type="button"
+              onClick={() => fileInputRef.current?.click()}
+              className="hidden lg:flex w-full shrink-0 items-center justify-center border border-dashed border-rule bg-paper px-3 py-3 text-center text-xs text-muted whitespace-nowrap transition-colors hover:border-ink-2 hover:text-ink"
+            >
+              Drop or browse files
+            </button>
           </div>
         </aside>
 
         {/* Center Interactive Darkroom Viewport */}
         <section
           aria-label="Darkroom Canvas Workspace"
-          className={`flex flex-1 min-w-0 min-h-0 flex-col bg-[#09090b] ${
+          className={`flex flex-1 min-w-0 min-h-0 flex-col bg-paper-3 ${
             mobileTab === 'canvas' ? 'flex' : 'hidden lg:flex'
           }`}
         >
           {/* Workspace Secondary Toolbar */}
-          <div className="flex flex-wrap items-center justify-between gap-2 border-b border-zinc-800/80 bg-[#111114]/60 px-4 py-2 min-w-0">
-            {/* View Mode Segmented Control (Scrollable on narrow mobile viewports < 420px) */}
+          <div className="flex flex-wrap items-center justify-between gap-2 border-b border-rule bg-paper px-4 py-2 min-w-0">
+            {/* View Mode Segmented Control */}
             <div
-              className="flex max-w-full overflow-x-auto items-center gap-0.5 rounded-lg bg-zinc-900 p-1 border border-zinc-800"
+              className="flex max-w-full overflow-x-auto items-center gap-0.5 rounded-pill bg-paper-2 p-0.5 border border-rule"
               role="group"
               aria-label="Canvas Inspection Mode"
             >
               <button
                 type="button"
+                aria-pressed={viewMode === 'framed'}
                 onClick={() => setViewMode('framed')}
-                className={`rounded-md px-2.5 py-1 text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${
+                className={`min-h-[32px] rounded-pill px-2.5 py-1 text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${
                   viewMode === 'framed'
-                    ? 'bg-zinc-800 text-white'
-                    : 'text-zinc-400 hover:text-zinc-200'
+                    ? 'bg-ink text-paper'
+                    : 'text-muted hover:text-ink'
                 }`}
               >
                 Framed Output
               </button>
               <button
                 type="button"
+                aria-pressed={viewMode === 'split'}
                 onClick={() => setViewMode('split')}
-                className={`rounded-md px-2.5 py-1 text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${
+                className={`min-h-[32px] rounded-pill px-2.5 py-1 text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${
                   viewMode === 'split'
-                    ? 'bg-blue-600 text-white'
-                    : 'text-zinc-400 hover:text-zinc-200'
+                    ? 'bg-accent text-accent-ink'
+                    : 'text-muted hover:text-ink'
                 }`}
               >
                 Before / After Split
               </button>
               <button
                 type="button"
+                aria-pressed={viewMode === 'geometry'}
                 onClick={() => setViewMode('geometry')}
-                className={`rounded-md px-2.5 py-1 text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${
+                className={`min-h-[32px] rounded-pill px-2.5 py-1 text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${
                   viewMode === 'geometry'
-                    ? 'bg-zinc-800 text-white'
-                    : 'text-zinc-400 hover:text-zinc-200'
+                    ? 'bg-ink text-paper'
+                    : 'text-muted hover:text-ink'
                 }`}
               >
                 Inscribed Crop Box
               </button>
               <button
                 type="button"
+                aria-pressed={viewMode === 'original'}
                 onClick={() => setViewMode('original')}
-                className={`rounded-md px-2.5 py-1 text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${
+                className={`min-h-[32px] rounded-pill px-2.5 py-1 text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${
                   viewMode === 'original'
-                    ? 'bg-zinc-800 text-white'
-                    : 'text-zinc-400 hover:text-zinc-200'
+                    ? 'bg-ink text-paper'
+                    : 'text-muted hover:text-ink'
                 }`}
               >
                 Original Sensor
               </button>
             </div>
 
-            <div className="flex items-center gap-2 shrink-0">
+            <div className="flex flex-wrap items-center gap-2 shrink-0">
               {/* Interactive Split Position Slider when in Before/After Split mode */}
               {viewMode === 'split' && (
-                <div className="flex items-center gap-2 rounded-lg border border-zinc-800 bg-zinc-900/90 px-2.5 py-1 shrink-0">
+                <div className="flex items-center gap-2 rounded-pill border border-rule bg-paper-2 px-2.5 py-1 shrink-0">
                   <label
                     htmlFor="slider-split-position"
-                    className="text-xs text-zinc-300 whitespace-nowrap shrink-0"
+                    className="text-xs text-ink-2 whitespace-nowrap shrink-0"
                   >
                     Split
                   </label>
@@ -435,10 +793,10 @@ export default function App() {
                     step={1}
                     value={splitPercent}
                     onChange={(e) => setSplitPercent(parseFloat(e.target.value))}
-                    className="h-1.5 w-16 sm:w-20 cursor-pointer appearance-none rounded-lg bg-zinc-700 accent-blue-500"
+                    className="h-1.5 w-16 sm:w-20 cursor-pointer rounded-pill bg-paper-3 accent-accent"
                   />
                   <span
-                    className="text-xs text-blue-400 tabular-nums whitespace-nowrap shrink-0"
+                    className="font-mono text-xs text-accent tabular-nums whitespace-nowrap shrink-0"
                     data-testid="split-percent-val"
                   >
                     {Math.round(splitPercent)}%
@@ -446,16 +804,51 @@ export default function App() {
                 </div>
               )}
 
+              {/* Zoom Controls */}
+              <div
+                className="flex items-center rounded-pill border border-rule bg-paper-2 p-0.5 shrink-0"
+                role="group"
+                aria-label="Canvas Zoom"
+              >
+                <button
+                  type="button"
+                  aria-label="Zoom out"
+                  onClick={() => handleZoomChange(zoomLevel - 0.25)}
+                  disabled={zoomLevel <= 1}
+                  className="hit-target-expand flex min-h-[28px] min-w-[28px] items-center justify-center rounded-pill text-ink-2 hover:bg-paper-3 hover:text-ink disabled:opacity-45"
+                >
+                  <ZoomOut className="h-3.5 w-3.5" aria-hidden="true" />
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleZoomChange(1)}
+                  title="Reset zoom to 100%"
+                  className="min-h-[28px] px-2 font-mono text-xs text-ink tabular-nums hover:text-accent whitespace-nowrap"
+                >
+                  {Math.round(zoomLevel * 100)}%
+                </button>
+                <button
+                  type="button"
+                  aria-label="Zoom in"
+                  onClick={() => handleZoomChange(zoomLevel + 0.25)}
+                  disabled={zoomLevel >= 4}
+                  className="hit-target-expand flex min-h-[28px] min-w-[28px] items-center justify-center rounded-pill text-ink-2 hover:bg-paper-3 hover:text-ink disabled:opacity-45"
+                >
+                  <ZoomIn className="h-3.5 w-3.5" aria-hidden="true" />
+                </button>
+              </div>
+
               <button
                 type="button"
+                aria-pressed={showHorizonGrid}
                 onClick={() => setShowHorizonGrid((prev) => !prev)}
-                className={`flex items-center gap-1.5 rounded-lg border px-2.5 py-1 text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${
+                className={`flex min-h-[32px] items-center gap-1.5 rounded-pill border px-2.5 py-1 text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${
                   showHorizonGrid
-                    ? 'border-blue-500/60 bg-blue-500/15 text-blue-300'
-                    : 'border-zinc-800 bg-zinc-900 text-zinc-300 hover:border-zinc-700'
+                    ? 'border-accent bg-accent text-accent-ink'
+                    : 'border-rule bg-paper-2 text-ink hover:border-ink-2'
                 }`}
               >
-                <Grid className="h-3.5 w-3.5" />
+                <Grid className="h-3.5 w-3.5" aria-hidden="true" />
                 <span className="hidden sm:inline">Horizon Grid</span>
                 <span className="sm:hidden">Grid</span>
               </button>
@@ -464,36 +857,37 @@ export default function App() {
 
           {/* Export Error Alert Banner */}
           {exportError && (
-            <div className="flex items-center justify-between border-b border-rose-900/60 bg-rose-950/40 px-5 py-2 text-xs text-rose-300">
+            <div
+              role="alert"
+              className="flex items-center justify-between border-b border-error bg-paper px-5 py-2 text-xs text-error"
+            >
               <span className="truncate">Export error: {exportError}</span>
               <button
                 type="button"
                 onClick={() => setExportError(null)}
-                className="text-rose-400 hover:text-rose-200 shrink-0 ml-2"
+                className="font-medium underline underline-offset-2 hover:text-ink shrink-0 ml-2"
               >
                 Dismiss
               </button>
             </div>
           )}
 
-          {/* Export Confirmation Toast Banner */}
+          {/* Export Confirmation Status Banner */}
           {exportBanner && (
             <div
-              className={`flex items-center justify-between border-b px-5 py-2 text-xs ${
+              role="status"
+              aria-live="polite"
+              className={`flex items-center justify-between border-b border-rule bg-paper-2 px-5 py-2 text-xs ${
                 exportBanner.startsWith('Export failed.')
-                  ? 'border-amber-900/60 bg-amber-950/40 text-amber-300'
-                  : 'border-emerald-900/60 bg-emerald-950/40 text-emerald-300'
+                  ? 'text-error'
+                  : 'text-ink'
               }`}
             >
               <span className="truncate">{exportBanner}</span>
               <button
                 type="button"
                 onClick={() => setExportBanner(null)}
-                className={`shrink-0 ml-2 ${
-                  exportBanner.startsWith('Export failed.')
-                    ? 'text-amber-400 hover:text-amber-200'
-                    : 'text-emerald-400 hover:text-emerald-200'
-                }`}
+                className="font-medium text-muted underline underline-offset-2 hover:text-ink shrink-0 ml-2"
               >
                 Dismiss
               </button>
@@ -514,36 +908,38 @@ export default function App() {
               canvasRef={canvasRef}
               onImageLoaded={setIsImageLoaded}
               exportCanvasRef={exportCanvasRef}
+              zoomLevel={zoomLevel}
+              panOffset={panOffset}
+              onPanOffsetChange={setPanOffset}
+              onZoomLevelChange={handleZoomChange}
             />
           </div>
 
-          {/* Quiet Unboxed Metadata Footer Bar */}
-          <footer className="flex flex-wrap items-center justify-between gap-x-4 gap-y-1.5 border-t border-zinc-800/80 bg-[#121215] px-4 sm:px-6 py-2 text-xs text-zinc-400 tabular-nums">
-            <div className="flex flex-wrap items-center gap-2 min-w-0">
-              <span className="text-zinc-200 font-medium truncate max-w-[160px] sm:max-w-xs">{activePhoto.fileName}</span>
+          {/* Quiet Unboxed Metadata Footer Bar (hairline-parted, tabular numerals) */}
+          <footer className="flex flex-wrap items-center justify-between gap-x-4 gap-y-1.5 border-t border-rule bg-paper-2 px-4 sm:px-6 py-2 text-xs text-muted font-mono tabular-nums">
+            <div className="flex flex-wrap items-center gap-x-3 gap-y-1 min-w-0">
+              <span className="text-ink font-medium truncate max-w-[160px] sm:max-w-xs">
+                {activePhoto.fileName}
+              </span>
               {activePhoto.exif.cameraModel && (
-                <>
-                  <span aria-hidden="true" className="text-zinc-600">·</span>
-                  <span className="truncate max-w-[140px] sm:max-w-none">{activePhoto.exif.cameraModel}</span>
-                </>
+                <span className="border-l border-rule pl-3 truncate max-w-[140px] sm:max-w-none">
+                  {activePhoto.exif.cameraModel}
+                </span>
               )}
               {activePhoto.exif.lensModel && (
-                <>
-                  <span aria-hidden="true" className="text-zinc-600 hidden sm:inline">·</span>
-                  <span className="truncate max-w-[180px] hidden sm:inline text-zinc-500">{activePhoto.exif.lensModel}</span>
-                </>
+                <span className="border-l border-rule pl-3 truncate max-w-[180px] hidden sm:inline">
+                  {activePhoto.exif.lensModel}
+                </span>
               )}
             </div>
             <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
               <span>
                 Horizon Tilt: {formatSignedDegrees(analysis.detectedTiltDeg, 2)}
               </span>
-              <span aria-hidden="true" className="text-zinc-600">·</span>
-              <span>
+              <span className="border-l border-rule pl-3">
                 Inscribed Crop: {cropRect.width}×{cropRect.height} ({cropRect.areaRetainedPercent}%)
               </span>
-              <span aria-hidden="true" className="text-zinc-600">·</span>
-              <span>
+              <span className="border-l border-rule pl-3">
                 Frame: {frameLayout.canvasWidth}×{frameLayout.canvasHeight} ({config.aspectPreset})
               </span>
             </div>
@@ -564,9 +960,12 @@ export default function App() {
           onChangeSimulatedTilt={handleChangeSimulatedTilt}
           onResetAll={handleResetAll}
           onExportJpeg={handleExportJpeg}
+          onBatchExportAll={handleBatchExportAll}
           isExporting={isExporting}
+          isBatchExporting={isBatchExporting}
+          queueCount={photos.length}
           isImageLoaded={isImageLoaded}
-          className={`w-full lg:w-[356px] shrink-0 border-t lg:border-t-0 lg:border-l border-zinc-800/80 bg-[#121215] ${
+          className={`w-full lg:w-[364px] shrink-0 border-t lg:border-t-0 lg:border-l border-rule bg-paper-2 ${
             mobileTab === 'adjust' ? 'flex flex-1 overflow-y-auto' : 'hidden lg:flex'
           }`}
         />

@@ -73,6 +73,7 @@ export interface AutoCorrectAnalysis {
   blackPoint: number; // 0 to 255
   whitePoint: number; // 0 to 255
   dynamicRangeStops: number;
+  lumaHistogram: number[]; // 64-bin normalized [0..1] luminance distribution
 }
 
 export interface PipelineTelemetryUpdate {
@@ -100,6 +101,7 @@ export const DEFAULT_AUTO_CORRECT_ANALYSIS: AutoCorrectAnalysis = {
   blackPoint: 0,
   whitePoint: 255,
   dynamicRangeStops: 8.0,
+  lumaHistogram: new Array(64).fill(0),
 };
 
 export const MAX_AUTO_ANGLE_LIMIT_DEG = 15.0;
@@ -973,6 +975,7 @@ export function analyzeAutoCorrection(
       blackPoint: 0,
       whitePoint: 255,
       dynamicRangeStops: 8.0,
+      lumaHistogram: new Array(64).fill(0),
     };
   }
 
@@ -1054,6 +1057,7 @@ export function analyzeAutoCorrection(
       blackPoint: 0,
       whitePoint: 255,
       dynamicRangeStops: 8.0,
+      lumaHistogram: new Array(64).fill(0),
     };
   }
 
@@ -1106,6 +1110,18 @@ export function analyzeAutoCorrection(
     clamp(Math.log2(Math.max(2, p995 - p005 + 1)) * 1.42, 1.0, 11.5).toFixed(1)
   );
 
+  // Build 64-bin normalized luminance histogram for waveform readout
+  const numBins = 64;
+  const rawBins = new Array<number>(numBins).fill(0);
+  for (let i = 0; i < 256; i++) {
+    rawBins[i >> 2] += lumaHist[i];
+  }
+  const sortedNonZero = rawBins.filter((v) => v > 0).sort((a, b) => a - b);
+  const peakIndex =
+    sortedNonZero.length > 0 ? Math.min(sortedNonZero.length - 1, Math.floor(sortedNonZero.length * 0.98)) : 0;
+  const normPeak = sortedNonZero.length > 0 ? Math.max(1, sortedNonZero[peakIndex]) : 1;
+  const lumaHistogram = rawBins.map((v) => Number(clamp(v / normPeak, 0, 1).toFixed(3)));
+
   return {
     exposureEv,
     contrast,
@@ -1116,6 +1132,7 @@ export function analyzeAutoCorrection(
     blackPoint,
     whitePoint,
     dynamicRangeStops,
+    lumaHistogram,
   };
 }
 
