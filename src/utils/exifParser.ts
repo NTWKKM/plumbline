@@ -89,6 +89,182 @@ export function parseExifFromArrayBuffer(
   return { exif, rawApp1Segment, isRawContainer };
 }
 
+/**
+ * Extracts the largest browser-decodable embedded JPEG preview from a RAW/TIFF container
+ * (e.g. .DNG, .CR2, .NEF, .ARW, .RAF, .ORF, .RW2) via TIFF IFD preview pointers or fallback
+ * JPEG bitstream scanning. Returns null if no valid embedded JPEG preview exists.
+ */
+export function extractEmbeddedJpegFromRawBuffer(buffer: ArrayBuffer): Blob | null {
+  const bytes = new Uint8Array(buffer);
+  if (bytes.length < 16) return null;
+
+  const view = new DataView(buffer);
+  let bestStart = -1;
+  let bestLength = 0;
+
+  const recordCandidate = (start: number, length: number) => {
+    if (
+      start < 0 ||
+      length < 16 ||
+      start + length > bytes.length ||
+      bytes[start] !== 0xff ||
+      bytes[start + 1] !== 0xd8
+    ) {
+      return;
+    }
+    if (length > bestLength) {
+      bestStart = start;
+      bestLength = length;
+    }
+  };
+
+  // 1. Inspect TIFF-based RAW IFD directories (IFD0, SubIFDs 0x014A, and chained IFDs)
+  const isTiffLE = bytes[0] === 0x49 && bytes[1] === 0x49;
+  const isTiffBE = bytes[0] === 0x4d && bytes[1] === 0x4d;
+  if (isTiffLE || isTiffBE) {
+    const littleEndian = isTiffLE;
+    const magic = view.getUint16(2, littleEndian);
+    if (magic === 42) {
+      const queue: number[] = [];
+      const visited = new Set<number>();
+      const firstIfd = view.getUint32(4, littleEndian);
+      if (firstIfd >= 8 && firstIfd + 2 <= bytes.length) {
+        queue.push(firstIfd);
+      }
+
+      while (queue.length > 0 && visited.size < 64) {
+        const ifdOffset = queue.shift()!;
+        if (visited.has(ifdOffset) || ifdOffset < 8 || ifdOffset + 2 > bytes.length) continue;
+        visited.add(ifdOffset);
+
+        const entries = view.getUint16(ifdOffset, littleEndian);
+        let jpegOffset = -1;
+        let jpegLength = 0;
+        let stripOffsets: number[] = [];
+        let stripCounts: number[] = [];
+
+        for (let i = 0; i < entries; i++) {
+          const entryPos = ifdOffset + 2 + i * 12;
+          if (entryPos + 12 > bytes.length) break;
+          const tag = view.getUint16(entryPos, littleEndian);
+          const type = view.getUint16(entryPos + 2, littleEndian);
+          const count = view.getUint32(entryPos + 4, littleEndian);
+
+          if (tag === 0x0201 && count === 1 && (type === 3 || type === 4)) {
+            jpegOffset =
+              type === 4
+                ? view.getUint32(entryPos + 8, littleEndian)
+                : view.getUint16(entryPos + 8, littleEndian);
+          } else if (tag === 0x0202 && count === 1 && (type === 3 || type === 4)) {
+            jpegLength =
+              type === 4
+                ? view.getUint32(entryPos + 8, littleEndian)
+                : view.getUint16(entryPos + 8, littleEndian);
+          } else if (tag === 0x0111 && (type === 3 || type === 4)) {
+            stripOffsets = readUintArray(view, 0, entryPos, type, count, littleEndian, bytes.length);
+          } else if (tag === 0x0117 && (type === 3 || type === 4)) {
+            stripCounts = readUintArray(view, 0, entryPos, type, count, littleEndian, bytes.length);
+          } else if (tag === 0x014a && (type === 3 || type === 4 || type === 13)) {
+            const subOffsets = readUintArray(
+              view,
+              0,
+              entryPos,
+              type === 13 ? 4 : type,
+              count,
+              littleEndian,
+              bytes.length
+            );
+            for (const sub of subOffsets) {
+              if (!visited.has(sub) && sub >= 8 && sub + 2 <= bytes.length) {
+                queue.push(sub);
+              }
+            }
+          }
+        }
+
+        if (jpegOffset >= 0 && jpegLength > 0) {
+          recordCandidate(jpegOffset, jpegLength);
+        }
+        if (stripOffsets.length === 1 && stripCounts.length === 1) {
+          recordCandidate(stripOffsets[0], stripCounts[0]);
+        }
+
+        const nextIfdPos = ifdOffset + 2 + entries * 12;
+        if (nextIfdPos + 4 <= bytes.length) {
+          const nextIfd = view.getUint32(nextIfdPos, littleEndian);
+          if (nextIfd >= 8 && nextIfd + 2 <= bytes.length && !visited.has(nextIfd)) {
+            queue.push(nextIfd);
+          }
+        }
+      }
+    }
+  }
+
+  // 2. Fallback scan for embedded JPEG streams (e.g. Fujifilm RAF or non-standard RAW wrappers)
+  if (bestLength < 512) {
+    let pos = 0;
+    while (pos + 4 < bytes.length) {
+      if (bytes[pos] === 0xff && bytes[pos + 1] === 0xd8 && bytes[pos + 2] === 0xff) {
+        let cursor = pos + 2;
+        let sawSos = false;
+        let foundEoi = -1;
+
+        while (cursor + 1 < bytes.length) {
+          if (bytes[cursor] !== 0xff) {
+            cursor++;
+            continue;
+          }
+          const marker = bytes[cursor + 1];
+          if (marker === 0x00 || (marker >= 0xd0 && marker <= 0xd7)) {
+            cursor += 2;
+            continue;
+          }
+          if (marker === 0xd9) {
+            if (sawSos) {
+              foundEoi = cursor + 2;
+              break;
+            }
+            cursor += 2;
+            continue;
+          }
+          if (marker === 0xda) {
+            sawSos = true;
+          }
+          if (cursor + 4 > bytes.length) break;
+          const segLen = view.getUint16(cursor + 2, false);
+          if (segLen < 2 || cursor + 2 + segLen > bytes.length) break;
+          if (marker === 0xda) {
+            // Scan entropy-coded data after SOS header for EOI (0xFF 0xD9)
+            let scan = cursor + 2 + segLen;
+            while (scan + 1 < bytes.length) {
+              if (bytes[scan] === 0xff && bytes[scan + 1] === 0xd9) {
+                foundEoi = scan + 2;
+                break;
+              }
+              scan++;
+            }
+            break;
+          }
+          cursor += 2 + segLen;
+        }
+
+        if (foundEoi > pos) {
+          const streamLen = foundEoi - pos;
+          if (streamLen >= 512) {
+            recordCandidate(pos, streamLen);
+          }
+          pos = foundEoi;
+          continue;
+        }
+      }
+      pos++;
+    }
+  }
+
+  if (bestStart < 0 || bestLength <= 0) return null;
+  return new Blob([bytes.slice(bestStart, bestStart + bestLength)], { type: 'image/jpeg' });
+}
+
 function readTiffIfdTags(
   view: DataView,
   tiffStart: number,

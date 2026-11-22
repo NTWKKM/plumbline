@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {
   parseExifFromArrayBuffer,
   injectApp1ExifIntoJpegBlob,
+  extractEmbeddedJpegFromRawBuffer,
 } from './exifParser';
 
 test('parseExifFromArrayBuffer returns empty fields for missing metadata instead of fabricated Sony defaults', () => {
@@ -871,4 +872,64 @@ test('injectApp1ExifIntoJpegBlob clamps thumbnail range ending past segment', as
   for (let i = 2 + tiffStart + 50; i < 2 + totalLen; i++) {
     assert.equal(injected[i], 0x00, `Expected byte at ${i} to be zeroed`);
   }
+});
+
+test('extractEmbeddedJpegFromRawBuffer extracts largest embedded JPEG preview from TIFF/RAW buffer and returns null otherwise', async () => {
+  // Construct synthetic TIFF/DNG buffer with IFD0 pointing to a small thumbnail and IFD1 pointing to a larger preview JPEG
+  const buf = new Uint8Array(120);
+  const view = new DataView(buf.buffer);
+  view.setUint16(0, 0x4949, false); // 'II'
+  view.setUint16(2, 42, true);
+  view.setUint32(4, 8, true); // IFD0 at 8
+
+  // IFD0 at 8: 2 entries (JPEGInterchangeFormat + JPEGInterchangeFormatLength), next IFD at 44
+  view.setUint16(8, 2, true);
+  view.setUint16(10, 0x0201, true);
+  view.setUint16(12, 4, true);
+  view.setUint32(14, 1, true);
+  view.setUint32(18, 70, true);
+  view.setUint16(22, 0x0202, true);
+  view.setUint16(24, 4, true);
+  view.setUint32(26, 1, true);
+  view.setUint32(30, 16, true);
+  view.setUint32(34, 44, true); // IFD1 at 44
+
+  // IFD1 at 44: 2 entries pointing to larger preview at offset 86 (length 30)
+  view.setUint16(44, 2, true);
+  view.setUint16(46, 0x0201, true);
+  view.setUint16(48, 4, true);
+  view.setUint32(50, 1, true);
+  view.setUint32(54, 86, true);
+  view.setUint16(58, 0x0202, true);
+  view.setUint16(60, 4, true);
+  view.setUint32(62, 1, true);
+  view.setUint32(66, 30, true);
+
+  // IFD1 nextIFD at 44 + 2 + 2*12 = 70; small JPEG at 74..90 (16 bytes), large JPEG at 90..120 (30 bytes)
+  view.setUint32(18, 74, true);
+  view.setUint32(54, 90, true);
+  view.setUint32(70, 0, true);
+
+  // Small JPEG (16 bytes at 74)
+  buf[74] = 0xff;
+  buf[75] = 0xd8;
+  buf[76] = 0xff;
+  buf[88] = 0xff;
+  buf[89] = 0xd9;
+
+  // Larger JPEG (30 bytes at 90)
+  buf[90] = 0xff;
+  buf[91] = 0xd8;
+  buf[92] = 0xff;
+  buf[93] = 0xe0;
+  buf[118] = 0xff;
+  buf[119] = 0xd9;
+
+  const preview = extractEmbeddedJpegFromRawBuffer(buf.buffer);
+  assert.ok(preview instanceof Blob);
+  assert.equal(preview.type, 'image/jpeg');
+  assert.equal(preview.size, 30);
+
+  const empty = new Uint8Array(64);
+  assert.equal(extractEmbeddedJpegFromRawBuffer(empty.buffer), null);
 });

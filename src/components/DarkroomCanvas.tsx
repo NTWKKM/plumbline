@@ -1,4 +1,5 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
+import { ArrowDown, ArrowLeft, ArrowRight, ArrowUp, RotateCcw } from 'lucide-react';
 import {
   AutoCorrectAnalysis,
   CropRect,
@@ -759,6 +760,45 @@ export const DarkroomCanvas: React.FC<DarkroomCanvasProps> = ({
     }
   };
 
+  const computeMaxPan = useCallback((): { maxPanX: number; maxPanY: number } => {
+    const canvas = canvasRef.current;
+    const stage = stageContainerRef.current;
+    if (!canvas || zoomLevel <= 1) {
+      return { maxPanX: 0, maxPanY: 0 };
+    }
+    const baseW = canvas.offsetWidth;
+    const baseH = canvas.offsetHeight;
+    const scaledW = baseW * zoomLevel;
+    const scaledH = baseH * zoomLevel;
+    const stageW = stage && stage.clientWidth > 0 ? stage.clientWidth : baseW;
+    const stageH = stage && stage.clientHeight > 0 ? stage.clientHeight : baseH;
+    return {
+      maxPanX: Math.max(0, Math.round((scaledW - stageW) / 2)),
+      maxPanY: Math.max(0, Math.round((scaledH - stageH) / 2)),
+    };
+  }, [canvasRef, zoomLevel]);
+
+  const nudgePan = useCallback(
+    (dx: number, dy: number) => {
+      if (!onPanOffsetChange) return;
+      const { maxPanX, maxPanY } = computeMaxPan();
+      const nextX = clamp(Math.round(panOffset.x + dx), -maxPanX, maxPanX);
+      const nextY = clamp(Math.round(panOffset.y + dy), -maxPanY, maxPanY);
+      onPanOffsetChange({ x: nextX, y: nextY });
+    },
+    [computeMaxPan, onPanOffsetChange, panOffset.x, panOffset.y]
+  );
+
+  useEffect(() => {
+    if (!onPanOffsetChange) return;
+    const { maxPanX, maxPanY } = computeMaxPan();
+    const clampedX = clamp(panOffset.x, -maxPanX, maxPanX);
+    const clampedY = clamp(panOffset.y, -maxPanY, maxPanY);
+    if (clampedX !== panOffset.x || clampedY !== panOffset.y) {
+      onPanOffsetChange({ x: clampedX, y: clampedY });
+    }
+  }, [zoomLevel, panOffset.x, panOffset.y, computeMaxPan, onPanOffsetChange]);
+
   const handlePointerMove = (e: React.PointerEvent<HTMLCanvasElement>) => {
     if (viewMode === 'split' && isDraggingSplit) {
       updateSplitFromClientX(e.clientX);
@@ -766,9 +806,7 @@ export const DarkroomCanvas: React.FC<DarkroomCanvasProps> = ({
     }
 
     if (isPanningRef.current && onPanOffsetChange) {
-      const rect = e.currentTarget.getBoundingClientRect();
-      const maxPanX = Math.max(120, Math.round(rect.width * (zoomLevel - 1) * 0.6));
-      const maxPanY = Math.max(120, Math.round(rect.height * (zoomLevel - 1) * 0.6));
+      const { maxPanX, maxPanY } = computeMaxPan();
       const nextX = clamp(
         panStartRef.current.offsetX + (e.clientX - panStartRef.current.clientX),
         -maxPanX,
@@ -866,6 +904,59 @@ export const DarkroomCanvas: React.FC<DarkroomCanvasProps> = ({
               : ''
         }`}
       />
+      {zoomLevel > 1 && onPanOffsetChange && (
+        <div
+          role="group"
+          aria-label="Pan zoomed canvas"
+          className="absolute bottom-3 right-3 z-raised grid grid-cols-3 gap-1 rounded-pill border border-rule bg-paper-2 p-1 shadow-card"
+        >
+          <span aria-hidden="true" />
+          <button
+            type="button"
+            aria-label="Pan up"
+            onClick={() => nudgePan(0, 48)}
+            className="hit-target-expand flex min-h-[28px] min-w-[28px] items-center justify-center rounded-pill border border-rule bg-paper text-ink hover:bg-paper-3"
+          >
+            <ArrowUp className="h-3.5 w-3.5" aria-hidden="true" />
+          </button>
+          <span aria-hidden="true" />
+          <button
+            type="button"
+            aria-label="Pan left"
+            onClick={() => nudgePan(48, 0)}
+            className="hit-target-expand flex min-h-[28px] min-w-[28px] items-center justify-center rounded-pill border border-rule bg-paper text-ink hover:bg-paper-3"
+          >
+            <ArrowLeft className="h-3.5 w-3.5" aria-hidden="true" />
+          </button>
+          <button
+            type="button"
+            aria-label="Center pan"
+            onClick={() => onPanOffsetChange({ x: 0, y: 0 })}
+            disabled={panOffset.x === 0 && panOffset.y === 0}
+            className="hit-target-expand flex min-h-[28px] min-w-[28px] items-center justify-center rounded-pill border border-rule bg-paper text-ink hover:bg-paper-3 disabled:opacity-45"
+          >
+            <RotateCcw className="h-3 w-3" aria-hidden="true" />
+          </button>
+          <button
+            type="button"
+            aria-label="Pan right"
+            onClick={() => nudgePan(-48, 0)}
+            className="hit-target-expand flex min-h-[28px] min-w-[28px] items-center justify-center rounded-pill border border-rule bg-paper text-ink hover:bg-paper-3"
+          >
+            <ArrowRight className="h-3.5 w-3.5" aria-hidden="true" />
+          </button>
+          <span aria-hidden="true" />
+          <button
+            type="button"
+            aria-label="Pan down"
+            onClick={() => nudgePan(0, -48)}
+            className="hit-target-expand flex min-h-[28px] min-w-[28px] items-center justify-center rounded-pill border border-rule bg-paper text-ink hover:bg-paper-3"
+          >
+            <ArrowDown className="h-3.5 w-3.5" aria-hidden="true" />
+          </button>
+          <span aria-hidden="true" />
+        </div>
+      )}
     </div>
   );
 };

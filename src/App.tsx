@@ -12,6 +12,7 @@ import {
 } from './components/DarkroomCanvas';
 import { InspectorSidebar } from './components/InspectorSidebar';
 import {
+  extractEmbeddedJpegFromRawBuffer,
   injectApp1ExifIntoJpegBlob,
   parseExifFromArrayBuffer,
 } from './utils/exifParser';
@@ -295,32 +296,60 @@ export default function App() {
     if (imageFiles.length === 0) return;
 
     const importedItems: StudioPhotoItem[] = [];
+    const failedFiles: string[] = [];
+
     for (const file of imageFiles) {
-      const buffer = await file.arrayBuffer();
-      const parsed = parseExifFromArrayBuffer(buffer, file.name);
-      const objectUrl = URL.createObjectURL(file);
+      let objectUrl: string | null = null;
+      try {
+        const buffer = await file.arrayBuffer();
+        const parsed = parseExifFromArrayBuffer(buffer, file.name);
 
-      const uniqueSuffix =
-        typeof crypto !== 'undefined' && crypto.randomUUID
-          ? crypto.randomUUID()
-          : `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+        let displayBlob: Blob = file;
+        if (parsed.isRawContainer) {
+          const previewBlob = extractEmbeddedJpegFromRawBuffer(buffer);
+          if (!previewBlob) {
+            failedFiles.push(`${file.name} (no embedded JPEG preview found in RAW file)`);
+            continue;
+          }
+          displayBlob = previewBlob;
+        }
 
-      importedItems.push({
-        id: `imported-${Date.now()}-${uniqueSuffix}`,
-        title: file.name.replace(/\.[^.]+$/, ''),
-        fileName: file.name,
-        src: objectUrl,
-        isRaw: parsed.isRawContainer,
-        simulatedSensorTiltDeg: 0,
-        exif: parsed.exif,
-        rawApp1Segment: parsed.rawApp1Segment,
-      });
+        objectUrl = URL.createObjectURL(displayBlob);
+
+        const uniqueSuffix =
+          typeof crypto !== 'undefined' && crypto.randomUUID
+            ? crypto.randomUUID()
+            : `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+
+        importedItems.push({
+          id: `imported-${Date.now()}-${uniqueSuffix}`,
+          title: file.name.replace(/\.[^.]+$/, ''),
+          fileName: file.name,
+          src: objectUrl,
+          isRaw: parsed.isRawContainer,
+          simulatedSensorTiltDeg: 0,
+          exif: parsed.exif,
+          rawApp1Segment: parsed.isRawContainer ? null : parsed.rawApp1Segment,
+        });
+      } catch (err) {
+        if (objectUrl) {
+          URL.revokeObjectURL(objectUrl);
+        }
+        const reason = err instanceof Error ? err.message : 'unreadable file';
+        failedFiles.push(`${file.name} (${reason})`);
+      }
     }
 
     if (importedItems.length > 0) {
       setPhotos((prev) => [...importedItems, ...prev]);
       setSelectedId(importedItems[0].id);
       setMobileTab('canvas');
+    }
+
+    if (failedFiles.length > 0) {
+      setExportError(`Unable to import ${failedFiles.join('; ')}`);
+    } else if (importedItems.length > 0) {
+      setExportError(null);
     }
   }, []);
 
@@ -476,7 +505,7 @@ export default function App() {
         exportedCount += 1;
       }
       setExportBanner(
-        `Batch exported ${exportedCount} framed JPEG ${exportedCount === 1 ? 'file' : 'files'} (${config.aspectPreset}).`
+        `Triggered ${exportedCount} framed JPEG download ${exportedCount === 1 ? 'request' : 'requests'} (${config.aspectPreset}). Your browser may prompt for or block additional downloads.`
       );
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
