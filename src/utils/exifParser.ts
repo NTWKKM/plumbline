@@ -22,6 +22,35 @@ const DEFAULT_FALLBACK_EXIF: ExifData = {
   colorSpace: 'sRGB',
 };
 
+export const SUPPORTED_RAW_EXTENSIONS = [
+  'cr2',
+  'nef',
+  'arw',
+  'dng',
+  'raf',
+  'orf',
+  'rw2',
+] as const;
+
+export const SUPPORTED_IMAGE_EXTENSIONS = [
+  'jpg',
+  'jpeg',
+  'png',
+  'webp',
+  ...SUPPORTED_RAW_EXTENSIONS,
+] as const;
+
+export const SUPPORTED_IMAGE_ACCEPT = SUPPORTED_IMAGE_EXTENSIONS.map((ext) => `.${ext}`).join(',');
+
+export function isRawFileExtension(ext: string): boolean {
+  return (SUPPORTED_RAW_EXTENSIONS as readonly string[]).includes(ext.toLowerCase());
+}
+
+export function isSupportedImageOrRawFileName(fileName: string): boolean {
+  const ext = fileName.split('.').pop()?.toLowerCase() || '';
+  return (SUPPORTED_IMAGE_EXTENSIONS as readonly string[]).includes(ext);
+}
+
 export function parseExifFromArrayBuffer(
   buffer: ArrayBuffer,
   fileName: string
@@ -29,7 +58,7 @@ export function parseExifFromArrayBuffer(
   const bytes = new Uint8Array(buffer);
   const view = new DataView(buffer);
   const ext = fileName.split('.').pop()?.toLowerCase() || 'jpg';
-  const isRawContainer = ['cr2', 'nef', 'arw', 'dng', 'raf', 'orf', 'rw2'].includes(ext);
+  const isRawContainer = isRawFileExtension(ext);
 
   let rawApp1Segment: Uint8Array | null = null;
   let tiffOffset = -1;
@@ -280,11 +309,20 @@ export function extractEmbeddedJpegCandidatesFromRawBuffer(buffer: ArrayBuffer):
   // 2. Fallback scan for embedded JPEG streams (e.g. Fujifilm RAF or non-standard RAW wrappers)
   const maxTiffLength = candidates.reduce((max, item) => Math.max(max, item.length), 0);
   if (maxTiffLength < 512) {
+    // Locate the last EOI (0xFF 0xD9) once so candidates after it are rejected without rescanning
+    let lastEoiOffset = -1;
+    for (let i = bytes.length - 2; i >= 0; i--) {
+      if (bytes[i] === 0xff && bytes[i + 1] === 0xd9) {
+        lastEoiOffset = i;
+        break;
+      }
+    }
+
     let pos = 0;
-    while (pos + 4 < bytes.length) {
+    while (pos + 4 < bytes.length && pos < lastEoiOffset) {
       if (bytes[pos] === 0xff && bytes[pos + 1] === 0xd8 && bytes[pos + 2] === 0xff) {
         let cursor = pos + 2;
-        let sawSos = false;
+        let hasSof = false;
         let foundEoi = -1;
 
         while (cursor + 1 < bytes.length) {
@@ -292,38 +330,61 @@ export function extractEmbeddedJpegCandidatesFromRawBuffer(buffer: ArrayBuffer):
             cursor++;
             continue;
           }
-          const marker = bytes[cursor + 1];
-          if (marker === 0x00 || (marker >= 0xd0 && marker <= 0xd7)) {
-            cursor += 2;
+          let markerPos = cursor + 1;
+          while (markerPos < bytes.length && bytes[markerPos] === 0xff) {
+            markerPos++;
+          }
+          if (markerPos >= bytes.length) break;
+
+          const marker = bytes[markerPos];
+          if (marker === 0x00 || marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7)) {
+            cursor = markerPos + 1;
             continue;
           }
           if (marker === 0xd9) {
-            if (sawSos) {
-              foundEoi = cursor + 2;
-              break;
-            }
-            cursor += 2;
-            continue;
+            // EOI before SOS cannot form a valid JPEG stream
+            break;
           }
-          if (marker === 0xda) {
-            sawSos = true;
-          }
-          if (cursor + 4 > bytes.length) break;
-          const segLen = view.getUint16(cursor + 2, false);
-          if (segLen < 2 || cursor + 2 + segLen > bytes.length) break;
-          if (marker === 0xda) {
-            // Scan entropy-coded data after SOS header for EOI (0xFF 0xD9)
-            let scan = cursor + 2 + segLen;
-            while (scan + 1 < bytes.length) {
-              if (bytes[scan] === 0xff && bytes[scan + 1] === 0xd9) {
-                foundEoi = scan + 2;
-                break;
+          if (markerPos + 3 > bytes.length) break;
+          const segLen = view.getUint16(markerPos + 1, false);
+          if (segLen < 2 || markerPos + 1 + segLen > bytes.length) break;
+
+          const isSofMarker =
+            marker >= 0xc0 &&
+            marker <= 0xcf &&
+            marker !== 0xc4 &&
+            marker !== 0xc8 &&
+            marker !== 0xcc;
+          if (isSofMarker) {
+            if (segLen < 7 || markerPos + 8 > bytes.length) break;
+            const frameHeight = view.getUint16(markerPos + 4, false);
+            const frameWidth = view.getUint16(markerPos + 6, false);
+            if (frameWidth <= 0 || frameHeight <= 0) break;
+            hasSof = true;
+          } else if (marker === 0xda) {
+            if (!hasSof || segLen < 6) break;
+            const scanStart = markerPos + 1 + segLen;
+            if (scanStart > lastEoiOffset) break;
+            // Scan entropy-coded data after SOS header for EOI (0xFF 0xD9) up to lastEoiOffset
+            let scan = scanStart;
+            const scanLimit = Math.min(bytes.length - 1, lastEoiOffset + 1);
+            while (scan < scanLimit) {
+              if (bytes[scan] === 0xff) {
+                const next = bytes[scan + 1];
+                if (next === 0x00 || (next >= 0xd0 && next <= 0xd7)) {
+                  scan += 2;
+                  continue;
+                }
+                if (next === 0xd9) {
+                  foundEoi = scan + 2;
+                  break;
+                }
               }
               scan++;
             }
             break;
           }
-          cursor += 2 + segLen;
+          cursor = markerPos + 1 + segLen;
         }
 
         if (foundEoi > pos) {

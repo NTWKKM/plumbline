@@ -169,67 +169,67 @@ function buildProcessedFramePipeline(
   processedFrameCanvas.width = layout.canvasWidth;
   processedFrameCanvas.height = layout.canvasHeight;
   const pCtx = processedFrameCanvas.getContext('2d');
-  if (pCtx) {
-    pCtx.fillStyle = config.backgroundColor;
-    pCtx.fillRect(0, 0, layout.canvasWidth, layout.canvasHeight);
+  if (!pCtx) return null;
 
-    pCtx.imageSmoothingEnabled = true;
-    pCtx.imageSmoothingQuality = 'high';
-    pCtx.drawImage(
-      rotCanvas,
-      crop.x,
-      crop.y,
-      crop.width,
-      crop.height,
-      layout.imageX,
-      layout.imageY,
-      layout.imageWidth,
-      layout.imageHeight
-    );
+  pCtx.fillStyle = config.backgroundColor;
+  pCtx.fillRect(0, 0, layout.canvasWidth, layout.canvasHeight);
 
-    if (config.renderExifCaption) {
-      const captionText = formatExifSummaryLine(photo.exif);
-      if (captionText) {
-        let fontSize = Math.max(12, Math.round(layout.canvasHeight * 0.0145));
-        if (layout.borderBottom >= fontSize) {
-          const isDarkBg = isHexColorDark(config.backgroundColor);
-          pCtx.fillStyle = isDarkBg ? '#b3ada3' : '#4a433c';
-          pCtx.font = `500 ${fontSize}px "JetBrains Mono", monospace`;
-          pCtx.textAlign = 'center';
-          pCtx.textBaseline = 'middle';
+  pCtx.imageSmoothingEnabled = true;
+  pCtx.imageSmoothingQuality = 'high';
+  pCtx.drawImage(
+    rotCanvas,
+    crop.x,
+    crop.y,
+    crop.width,
+    crop.height,
+    layout.imageX,
+    layout.imageY,
+    layout.imageWidth,
+    layout.imageHeight
+  );
 
-          const maxCaptionWidth = Math.max(
-            10,
-            layout.canvasWidth - Math.max(32, Math.round(layout.canvasWidth * 0.08))
+  if (config.renderExifCaption) {
+    const captionText = formatExifSummaryLine(photo.exif);
+    if (captionText) {
+      let fontSize = Math.max(12, Math.round(layout.canvasHeight * 0.0145));
+      if (layout.borderBottom >= fontSize) {
+        const isDarkBg = isHexColorDark(config.backgroundColor);
+        pCtx.fillStyle = isDarkBg ? '#b3ada3' : '#4a433c';
+        pCtx.font = `500 ${fontSize}px "JetBrains Mono", monospace`;
+        pCtx.textAlign = 'center';
+        pCtx.textBaseline = 'middle';
+
+        const maxCaptionWidth = Math.max(
+          10,
+          layout.canvasWidth - Math.max(32, Math.round(layout.canvasWidth * 0.08))
+        );
+        let textWidth = pCtx.measureText(captionText).width;
+
+        if (textWidth > maxCaptionWidth) {
+          const scaledFontSize = Math.max(
+            9,
+            Math.floor(fontSize * (maxCaptionWidth / textWidth))
           );
-          let textWidth = pCtx.measureText(captionText).width;
-
-          if (textWidth > maxCaptionWidth) {
-            const scaledFontSize = Math.max(
-              9,
-              Math.floor(fontSize * (maxCaptionWidth / textWidth))
-            );
-            if (scaledFontSize < fontSize) {
-              fontSize = scaledFontSize;
-              pCtx.font = `500 ${fontSize}px "JetBrains Mono", monospace`;
-              textWidth = pCtx.measureText(captionText).width;
-            }
+          if (scaledFontSize < fontSize) {
+            fontSize = scaledFontSize;
+            pCtx.font = `500 ${fontSize}px "JetBrains Mono", monospace`;
+            textWidth = pCtx.measureText(captionText).width;
           }
-
-          let finalCaption = captionText;
-          if (textWidth > maxCaptionWidth) {
-            while (
-              finalCaption.length > 3 &&
-              pCtx.measureText(finalCaption + '…').width > maxCaptionWidth
-            ) {
-              finalCaption = finalCaption.slice(0, -1);
-            }
-            finalCaption += '…';
-          }
-
-          const captionY = layout.imageY + layout.imageHeight + layout.borderBottom * 0.52;
-          pCtx.fillText(finalCaption, layout.canvasWidth / 2, captionY);
         }
+
+        let finalCaption = captionText;
+        if (textWidth > maxCaptionWidth) {
+          while (
+            finalCaption.length > 3 &&
+            pCtx.measureText(finalCaption + '…').width > maxCaptionWidth
+          ) {
+            finalCaption = finalCaption.slice(0, -1);
+          }
+          finalCaption += '…';
+        }
+
+        const captionY = layout.imageY + layout.imageHeight + layout.borderBottom * 0.52;
+        pCtx.fillText(finalCaption, layout.canvasWidth / 2, captionY);
       }
     }
   }
@@ -791,13 +791,29 @@ export const DarkroomCanvas: React.FC<DarkroomCanvasProps> = ({
 
   useEffect(() => {
     if (!onPanOffsetChange) return;
-    const { maxPanX, maxPanY } = computeMaxPan();
-    const clampedX = clamp(panOffset.x, -maxPanX, maxPanX);
-    const clampedY = clamp(panOffset.y, -maxPanY, maxPanY);
-    if (clampedX !== panOffset.x || clampedY !== panOffset.y) {
-      onPanOffsetChange({ x: clampedX, y: clampedY });
-    }
-  }, [zoomLevel, panOffset.x, panOffset.y, computeMaxPan, onPanOffsetChange]);
+
+    const clampPanToBounds = () => {
+      const { maxPanX, maxPanY } = computeMaxPan();
+      const clampedX = clamp(panOffset.x, -maxPanX, maxPanX);
+      const clampedY = clamp(panOffset.y, -maxPanY, maxPanY);
+      if (clampedX !== panOffset.x || clampedY !== panOffset.y) {
+        onPanOffsetChange({ x: clampedX, y: clampedY });
+      }
+    };
+
+    clampPanToBounds();
+
+    if (typeof ResizeObserver !== 'function') return;
+    const observer = new ResizeObserver(() => {
+      clampPanToBounds();
+    });
+    if (canvasRef.current) observer.observe(canvasRef.current);
+    if (stageContainerRef.current) observer.observe(stageContainerRef.current);
+
+    return () => {
+      observer.disconnect();
+    };
+  }, [zoomLevel, panOffset.x, panOffset.y, computeMaxPan, onPanOffsetChange, canvasRef]);
 
   const handlePointerMove = (e: React.PointerEvent<HTMLCanvasElement>) => {
     if (viewMode === 'split' && isDraggingSplit) {

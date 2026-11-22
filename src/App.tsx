@@ -12,8 +12,10 @@ import {
 } from './components/DarkroomCanvas';
 import { InspectorSidebar } from './components/InspectorSidebar';
 import {
+  SUPPORTED_IMAGE_ACCEPT,
   extractEmbeddedJpegCandidatesFromRawBuffer,
   injectApp1ExifIntoJpegBlob,
+  isSupportedImageOrRawFileName,
   parseExifFromArrayBuffer,
   verifyDecodableImageBlob,
 } from './utils/exifParser';
@@ -291,7 +293,7 @@ export default function App() {
 
   const importFiles = useCallback(async (files: File[]) => {
     const imageFiles = files.filter((file) =>
-      /\.(jpe?g|png|webp|dng|arw|cr2|nef)$/i.test(file.name) ||
+      isSupportedImageOrRawFileName(file.name) ||
       file.type.startsWith('image/')
     );
     if (imageFiles.length === 0) return;
@@ -521,6 +523,7 @@ export default function App() {
       );
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
+      setExportBanner(null);
       setExportError(`Batch export stopped after ${exportedCount} of ${photos.length}: ${msg}`);
     } finally {
       setIsBatchExporting(false);
@@ -573,7 +576,7 @@ export default function App() {
         ref={fileInputRef}
         type="file"
         multiple
-        accept=".jpg,.jpeg,.png,.webp,.dng,.arw,.cr2,.nef"
+        accept={SUPPORTED_IMAGE_ACCEPT}
         onChange={handleFileImport}
         className="hidden"
         aria-label="Upload photo"
@@ -674,6 +677,44 @@ export default function App() {
           </button>
         </div>
       </header>
+
+      {/* Shared Export & Import Status Notices (visible across Canvas, Adjust, and Queue tabs) */}
+      {exportError && (
+        <div
+          role="alert"
+          className="flex items-center justify-between border-b border-error bg-paper px-5 py-2 text-xs text-error shrink-0"
+        >
+          <span className="truncate">Export error: {exportError}</span>
+          <button
+            type="button"
+            onClick={() => setExportError(null)}
+            className="font-medium underline underline-offset-2 hover:text-ink shrink-0 ml-2"
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
+
+      {exportBanner && (
+        <div
+          role="status"
+          aria-live="polite"
+          className={`flex items-center justify-between border-b border-rule bg-paper-2 px-5 py-2 text-xs shrink-0 ${
+            exportBanner.startsWith('Export failed.')
+              ? 'text-error'
+              : 'text-ink'
+          }`}
+        >
+          <span className="truncate">{exportBanner}</span>
+          <button
+            type="button"
+            onClick={() => setExportBanner(null)}
+            className="font-medium text-muted underline underline-offset-2 hover:text-ink shrink-0 ml-2"
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
 
       {/* Main Studio Layout */}
       <main id="workspace" tabIndex={-1} className="flex flex-1 flex-col lg:flex-row overflow-hidden min-h-0 outline-none">
@@ -895,45 +936,6 @@ export default function App() {
               </button>
             </div>
           </div>
-
-          {/* Export Error Alert Banner */}
-          {exportError && (
-            <div
-              role="alert"
-              className="flex items-center justify-between border-b border-error bg-paper px-5 py-2 text-xs text-error"
-            >
-              <span className="truncate">Export error: {exportError}</span>
-              <button
-                type="button"
-                onClick={() => setExportError(null)}
-                className="font-medium underline underline-offset-2 hover:text-ink shrink-0 ml-2"
-              >
-                Dismiss
-              </button>
-            </div>
-          )}
-
-          {/* Export Confirmation Status Banner */}
-          {exportBanner && (
-            <div
-              role="status"
-              aria-live="polite"
-              className={`flex items-center justify-between border-b border-rule bg-paper-2 px-5 py-2 text-xs ${
-                exportBanner.startsWith('Export failed.')
-                  ? 'text-error'
-                  : 'text-ink'
-              }`}
-            >
-              <span className="truncate">{exportBanner}</span>
-              <button
-                type="button"
-                onClick={() => setExportBanner(null)}
-                className="font-medium text-muted underline underline-offset-2 hover:text-ink shrink-0 ml-2"
-              >
-                Dismiss
-              </button>
-            </div>
-          )}
 
           {/* Canvas Stage */}
           <div className="flex-1 min-h-0 flex items-center justify-center overflow-hidden p-2 sm:p-4">
