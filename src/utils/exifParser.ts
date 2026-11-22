@@ -90,32 +90,109 @@ export function parseExifFromArrayBuffer(
 }
 
 /**
- * Extracts the largest browser-decodable embedded JPEG preview from a RAW/TIFF container
- * (e.g. .DNG, .CR2, .NEF, .ARW, .RAF, .ORF, .RW2) via TIFF IFD preview pointers or fallback
- * JPEG bitstream scanning. Returns null if no valid embedded JPEG preview exists.
+ * Validates that a byte slice contains a structurally complete JPEG stream:
+ * SOI (0xFFD8), at least one SOF frame header with non-zero dimensions,
+ * an SOS scan header (0xFFDA), and an EOI marker (0xFFD9).
  */
-export function extractEmbeddedJpegFromRawBuffer(buffer: ArrayBuffer): Blob | null {
+export function isValidJpegSlice(
+  bytes: Uint8Array,
+  view: DataView,
+  start: number,
+  length: number
+): boolean {
+  const end = start + length;
+  if (
+    start < 0 ||
+    length < 16 ||
+    end > bytes.length ||
+    bytes[start] !== 0xff ||
+    bytes[start + 1] !== 0xd8 ||
+    bytes[start + 2] !== 0xff
+  ) {
+    return false;
+  }
+
+  let cursor = start + 2;
+  let hasSof = false;
+
+  while (cursor + 1 < end) {
+    if (bytes[cursor] !== 0xff) return false;
+    while (cursor < end && bytes[cursor] === 0xff) {
+      cursor++;
+    }
+    if (cursor >= end) return false;
+
+    const marker = bytes[cursor];
+    cursor++;
+
+    if (marker === 0x00 || marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7)) {
+      continue;
+    }
+    if (marker === 0xd9) {
+      // EOI reached before SOS scan
+      return false;
+    }
+
+    if (cursor + 2 > end) return false;
+    const segLen = view.getUint16(cursor, false);
+    if (segLen < 2 || cursor + segLen > end) return false;
+
+    const isSofMarker =
+      marker >= 0xc0 &&
+      marker <= 0xcf &&
+      marker !== 0xc4 &&
+      marker !== 0xc8 &&
+      marker !== 0xcc;
+
+    if (isSofMarker) {
+      if (segLen < 7 || cursor + 7 > end) return false;
+      const frameHeight = view.getUint16(cursor + 3, false);
+      const frameWidth = view.getUint16(cursor + 5, false);
+      if (frameWidth <= 0 || frameHeight <= 0) return false;
+      hasSof = true;
+    } else if (marker === 0xda) {
+      if (!hasSof || segLen < 6) return false;
+      let scan = cursor + segLen;
+      while (scan + 1 < end) {
+        if (bytes[scan] === 0xff) {
+          const next = bytes[scan + 1];
+          if (next === 0x00 || (next >= 0xd0 && next <= 0xd7)) {
+            scan += 2;
+            continue;
+          }
+          if (next === 0xd9) {
+            return true;
+          }
+        }
+        scan++;
+      }
+      return false;
+    }
+
+    cursor += segLen;
+  }
+
+  return false;
+}
+
+/**
+ * Extracts all structurally valid embedded JPEG previews from a RAW/TIFF container
+ * (e.g. .DNG, .CR2, .NEF, .ARW, .RAF, .ORF, .RW2), ordered largest-first.
+ */
+export function extractEmbeddedJpegCandidatesFromRawBuffer(buffer: ArrayBuffer): Blob[] {
   const bytes = new Uint8Array(buffer);
-  if (bytes.length < 16) return null;
+  if (bytes.length < 16) return [];
 
   const view = new DataView(buffer);
-  let bestStart = -1;
-  let bestLength = 0;
+  const candidates: Array<{ start: number; length: number }> = [];
+  const seenOffsets = new Set<string>();
 
   const recordCandidate = (start: number, length: number) => {
-    if (
-      start < 0 ||
-      length < 16 ||
-      start + length > bytes.length ||
-      bytes[start] !== 0xff ||
-      bytes[start + 1] !== 0xd8
-    ) {
-      return;
-    }
-    if (length > bestLength) {
-      bestStart = start;
-      bestLength = length;
-    }
+    const key = `${start}:${length}`;
+    if (seenOffsets.has(key)) return;
+    if (!isValidJpegSlice(bytes, view, start, length)) return;
+    seenOffsets.add(key);
+    candidates.push({ start, length });
   };
 
   // 1. Inspect TIFF-based RAW IFD directories (IFD0, SubIFDs 0x014A, and chained IFDs)
@@ -201,7 +278,8 @@ export function extractEmbeddedJpegFromRawBuffer(buffer: ArrayBuffer): Blob | nu
   }
 
   // 2. Fallback scan for embedded JPEG streams (e.g. Fujifilm RAF or non-standard RAW wrappers)
-  if (bestLength < 512) {
+  const maxTiffLength = candidates.reduce((max, item) => Math.max(max, item.length), 0);
+  if (maxTiffLength < 512) {
     let pos = 0;
     while (pos + 4 < bytes.length) {
       if (bytes[pos] === 0xff && bytes[pos + 1] === 0xd8 && bytes[pos + 2] === 0xff) {
@@ -261,8 +339,57 @@ export function extractEmbeddedJpegFromRawBuffer(buffer: ArrayBuffer): Blob | nu
     }
   }
 
-  if (bestStart < 0 || bestLength <= 0) return null;
-  return new Blob([bytes.slice(bestStart, bestStart + bestLength)], { type: 'image/jpeg' });
+  candidates.sort((a, b) => b.length - a.length);
+  return candidates.map(
+    (c) => new Blob([bytes.slice(c.start, c.start + c.length)], { type: 'image/jpeg' })
+  );
+}
+
+/**
+ * Extracts the largest valid embedded JPEG preview from a RAW/TIFF container.
+ * Returns null if no structurally valid embedded JPEG preview exists.
+ */
+export function extractEmbeddedJpegFromRawBuffer(buffer: ArrayBuffer): Blob | null {
+  const candidates = extractEmbeddedJpegCandidatesFromRawBuffer(buffer);
+  return candidates[0] ?? null;
+}
+
+/**
+ * Verifies with the runtime browser image decoder (createImageBitmap or Image) that a Blob
+ * decodes to non-zero pixel dimensions before adding it to the studio queue.
+ */
+export async function verifyDecodableImageBlob(blob: Blob): Promise<boolean> {
+  if (typeof globalThis.createImageBitmap === 'function') {
+    try {
+      const bitmap = await globalThis.createImageBitmap(blob);
+      const ok = bitmap.width > 0 && bitmap.height > 0;
+      if (typeof bitmap.close === 'function') {
+        bitmap.close();
+      }
+      return ok;
+    } catch {
+      return false;
+    }
+  }
+
+  if (typeof globalThis.Image === 'function' && typeof URL.createObjectURL === 'function') {
+    const tempUrl = URL.createObjectURL(blob);
+    try {
+      return await new Promise<boolean>((resolve) => {
+        const img = new globalThis.Image();
+        img.onload = () => resolve(img.naturalWidth > 0 && img.naturalHeight > 0);
+        img.onerror = () => resolve(false);
+        img.src = tempUrl;
+      });
+    } finally {
+      URL.revokeObjectURL(tempUrl);
+    }
+  }
+
+  // Fallback for non-DOM environments without createImageBitmap/Image
+  const buf = await blob.arrayBuffer();
+  const bytes = new Uint8Array(buf);
+  return isValidJpegSlice(bytes, new DataView(buf), 0, bytes.length);
 }
 
 function readTiffIfdTags(

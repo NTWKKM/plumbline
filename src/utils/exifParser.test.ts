@@ -4,6 +4,8 @@ import {
   parseExifFromArrayBuffer,
   injectApp1ExifIntoJpegBlob,
   extractEmbeddedJpegFromRawBuffer,
+  extractEmbeddedJpegCandidatesFromRawBuffer,
+  verifyDecodableImageBlob,
 } from './exifParser';
 
 test('parseExifFromArrayBuffer returns empty fields for missing metadata instead of fabricated Sony defaults', () => {
@@ -874,62 +876,121 @@ test('injectApp1ExifIntoJpegBlob clamps thumbnail range ending past segment', as
   }
 });
 
-test('extractEmbeddedJpegFromRawBuffer extracts largest embedded JPEG preview from TIFF/RAW buffer and returns null otherwise', async () => {
-  // Construct synthetic TIFF/DNG buffer with IFD0 pointing to a small thumbnail and IFD1 pointing to a larger preview JPEG
-  const buf = new Uint8Array(120);
+test('extractEmbeddedJpegFromRawBuffer rejects malformed SOI/EOI candidates without SOF/SOS and extracts valid JPEG previews', async () => {
+  // Valid minimal structural JPEG stream: SOI + SOF0 (16x16) + SOS + scan data + EOI
+  const validJpeg = new Uint8Array([
+    0xff, 0xd8, // SOI
+    0xff, 0xc0, 0x00, 0x11, 0x08, 0x00, 0x10, 0x00, 0x10, 0x03, // SOF0: 16x16, 3 components
+    0x01, 0x11, 0x00, 0x02, 0x11, 0x00, 0x03, 0x11, 0x00,
+    0xff, 0xda, 0x00, 0x0c, 0x03, 0x01, 0x00, 0x02, 0x00, 0x03, 0x00, 0x00, 0x3f, 0x00, // SOS
+    0xab, 0xcd, 0xef, // entropy scan bytes
+    0xff, 0xd9, // EOI
+  ]);
+
+  // Larger invalid candidate (48 bytes) that starts with FF D8 FF and ends with FF D9,
+  // but contains no SOF frame header or SOS scan segment.
+  const invalidCandidate = new Uint8Array(48);
+  invalidCandidate[0] = 0xff;
+  invalidCandidate[1] = 0xd8;
+  invalidCandidate[2] = 0xff;
+  invalidCandidate[3] = 0xe0;
+  invalidCandidate[4] = 0x00;
+  invalidCandidate[5] = 0x10;
+  invalidCandidate[46] = 0xff;
+  invalidCandidate[47] = 0xd9;
+
+  // Construct synthetic TIFF/DNG buffer:
+  // IFD0 points to the larger invalid candidate; IFD1 points to the valid structural JPEG.
+  const buf = new Uint8Array(74 + invalidCandidate.length + validJpeg.length);
   const view = new DataView(buf.buffer);
   view.setUint16(0, 0x4949, false); // 'II'
   view.setUint16(2, 42, true);
   view.setUint32(4, 8, true); // IFD0 at 8
 
-  // IFD0 at 8: 2 entries (JPEGInterchangeFormat + JPEGInterchangeFormatLength), next IFD at 44
+  const invalidOffset = 74;
+  const validOffset = invalidOffset + invalidCandidate.length;
+
+  // IFD0 at 8: 2 entries pointing to invalidCandidate, next IFD at 44
   view.setUint16(8, 2, true);
   view.setUint16(10, 0x0201, true);
   view.setUint16(12, 4, true);
   view.setUint32(14, 1, true);
-  view.setUint32(18, 70, true);
+  view.setUint32(18, invalidOffset, true);
   view.setUint16(22, 0x0202, true);
   view.setUint16(24, 4, true);
   view.setUint32(26, 1, true);
-  view.setUint32(30, 16, true);
+  view.setUint32(30, invalidCandidate.length, true);
   view.setUint32(34, 44, true); // IFD1 at 44
 
-  // IFD1 at 44: 2 entries pointing to larger preview at offset 86 (length 30)
+  // IFD1 at 44: 2 entries pointing to validJpeg
   view.setUint16(44, 2, true);
   view.setUint16(46, 0x0201, true);
   view.setUint16(48, 4, true);
   view.setUint32(50, 1, true);
-  view.setUint32(54, 86, true);
+  view.setUint32(54, validOffset, true);
   view.setUint16(58, 0x0202, true);
   view.setUint16(60, 4, true);
   view.setUint32(62, 1, true);
-  view.setUint32(66, 30, true);
-
-  // IFD1 nextIFD at 44 + 2 + 2*12 = 70; small JPEG at 74..90 (16 bytes), large JPEG at 90..120 (30 bytes)
-  view.setUint32(18, 74, true);
-  view.setUint32(54, 90, true);
+  view.setUint32(66, validJpeg.length, true);
   view.setUint32(70, 0, true);
 
-  // Small JPEG (16 bytes at 74)
-  buf[74] = 0xff;
-  buf[75] = 0xd8;
-  buf[76] = 0xff;
-  buf[88] = 0xff;
-  buf[89] = 0xd9;
+  buf.set(invalidCandidate, invalidOffset);
+  buf.set(validJpeg, validOffset);
 
-  // Larger JPEG (30 bytes at 90)
-  buf[90] = 0xff;
-  buf[91] = 0xd8;
-  buf[92] = 0xff;
-  buf[93] = 0xe0;
-  buf[118] = 0xff;
-  buf[119] = 0xd9;
+  const candidates = extractEmbeddedJpegCandidatesFromRawBuffer(buf.buffer);
+  assert.equal(candidates.length, 1);
+  assert.equal(candidates[0].size, validJpeg.length);
 
   const preview = extractEmbeddedJpegFromRawBuffer(buf.buffer);
   assert.ok(preview instanceof Blob);
   assert.equal(preview.type, 'image/jpeg');
-  assert.equal(preview.size, 30);
+  assert.equal(preview.size, validJpeg.length);
 
-  const empty = new Uint8Array(64);
-  assert.equal(extractEmbeddedJpegFromRawBuffer(empty.buffer), null);
+  // Buffer containing only the invalid candidate must return null
+  const invalidOnlyBuf = new Uint8Array(40 + invalidCandidate.length);
+  const invalidView = new DataView(invalidOnlyBuf.buffer);
+  invalidView.setUint16(0, 0x4949, false);
+  invalidView.setUint16(2, 42, true);
+  invalidView.setUint32(4, 8, true);
+  invalidView.setUint16(8, 2, true);
+  invalidView.setUint16(10, 0x0201, true);
+  invalidView.setUint16(12, 4, true);
+  invalidView.setUint32(14, 1, true);
+  invalidView.setUint32(18, 40, true);
+  invalidView.setUint16(22, 0x0202, true);
+  invalidView.setUint16(24, 4, true);
+  invalidView.setUint32(26, 1, true);
+  invalidView.setUint32(30, invalidCandidate.length, true);
+  invalidView.setUint32(34, 0, true);
+  invalidOnlyBuf.set(invalidCandidate, 40);
+  assert.equal(extractEmbeddedJpegFromRawBuffer(invalidOnlyBuf.buffer), null);
+
+  // Test browser-decoder verification with valid and failing decode responses
+  const origDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'createImageBitmap');
+  try {
+    Object.defineProperty(globalThis, 'createImageBitmap', {
+      configurable: true,
+      writable: true,
+      value: async (blob: Blob) => {
+        const bytes = new Uint8Array(await blob.arrayBuffer());
+        // Simulate real browser decoder rejecting malformed candidate bytes
+        if (bytes.length === validJpeg.length && bytes[2] === 0xff && bytes[3] === 0xc0) {
+          return { width: 16, height: 16, close: () => {} };
+        }
+        throw new Error('Invalid image bitstream');
+      },
+    });
+
+    assert.equal(await verifyDecodableImageBlob(preview), true);
+    assert.equal(
+      await verifyDecodableImageBlob(new Blob([invalidCandidate], { type: 'image/jpeg' })),
+      false
+    );
+  } finally {
+    if (origDescriptor) {
+      Object.defineProperty(globalThis, 'createImageBitmap', origDescriptor);
+    } else {
+      delete (globalThis as { createImageBitmap?: unknown }).createImageBitmap;
+    }
+  }
 });

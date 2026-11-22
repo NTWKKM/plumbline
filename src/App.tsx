@@ -12,9 +12,10 @@ import {
 } from './components/DarkroomCanvas';
 import { InspectorSidebar } from './components/InspectorSidebar';
 import {
-  extractEmbeddedJpegFromRawBuffer,
+  extractEmbeddedJpegCandidatesFromRawBuffer,
   injectApp1ExifIntoJpegBlob,
   parseExifFromArrayBuffer,
+  verifyDecodableImageBlob,
 } from './utils/exifParser';
 import {
   AspectRatioPreset,
@@ -304,14 +305,25 @@ export default function App() {
         const buffer = await file.arrayBuffer();
         const parsed = parseExifFromArrayBuffer(buffer, file.name);
 
-        let displayBlob: Blob = file;
+        let displayBlob: Blob | null = null;
         if (parsed.isRawContainer) {
-          const previewBlob = extractEmbeddedJpegFromRawBuffer(buffer);
-          if (!previewBlob) {
-            failedFiles.push(`${file.name} (no embedded JPEG preview found in RAW file)`);
+          const candidates = extractEmbeddedJpegCandidatesFromRawBuffer(buffer);
+          for (const candidate of candidates) {
+            if (await verifyDecodableImageBlob(candidate)) {
+              displayBlob = candidate;
+              break;
+            }
+          }
+          if (!displayBlob) {
+            failedFiles.push(`${file.name} (no decodable embedded JPEG preview found in RAW file)`);
             continue;
           }
-          displayBlob = previewBlob;
+        } else {
+          if (!(await verifyDecodableImageBlob(file))) {
+            failedFiles.push(`${file.name} (unsupported or corrupt image data)`);
+            continue;
+          }
+          displayBlob = file;
         }
 
         objectUrl = URL.createObjectURL(displayBlob);
