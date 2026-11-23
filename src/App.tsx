@@ -13,7 +13,7 @@ import {
 import { InspectorSidebar } from './components/InspectorSidebar';
 import {
   SUPPORTED_IMAGE_ACCEPT,
-  extractEmbeddedJpegCandidatesFromRawBuffer,
+  extractDecodableEmbeddedJpegFromRawBuffer,
   injectApp1ExifIntoJpegBlob,
   isSupportedImageOrRawFileName,
   parseExifFromArrayBuffer,
@@ -324,13 +324,7 @@ export default function App() {
 
         let displayBlob: Blob | null = null;
         if (parsed.isRawContainer) {
-          const candidates = extractEmbeddedJpegCandidatesFromRawBuffer(buffer);
-          for (const candidate of candidates) {
-            if (await verifyDecodableImageBlob(candidate)) {
-              displayBlob = candidate;
-              break;
-            }
-          }
+          displayBlob = await extractDecodableEmbeddedJpegFromRawBuffer(buffer);
           if (!displayBlob) {
             failedFiles.push(`${file.name} (no decodable embedded JPEG preview found in RAW file)`);
             continue;
@@ -699,7 +693,9 @@ export default function App() {
           role="alert"
           className="flex items-start sm:items-center justify-between gap-3 border-b border-error bg-paper px-5 py-2 text-xs text-error shrink-0"
         >
-          <span className="min-w-0 flex-1 break-words">Export error: {exportError}</span>
+          <span className="min-w-0 flex-1 max-h-[25vh] overflow-y-auto break-words">
+            Export error: {exportError}
+          </span>
           <button
             type="button"
             onClick={() => setExportError(null)}

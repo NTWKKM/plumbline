@@ -5,6 +5,7 @@ import {
   injectApp1ExifIntoJpegBlob,
   extractEmbeddedJpegFromRawBuffer,
   extractEmbeddedJpegCandidatesFromRawBuffer,
+  extractDecodableEmbeddedJpegFromRawBuffer,
   verifyDecodableImageBlob,
 } from './exifParser';
 
@@ -1028,42 +1029,106 @@ test('extractEmbeddedJpegFromRawBuffer rejects SOF-missing and SOS-missing candi
   assert.equal(recoveredFromTruncated.size, fallbackPreview.length);
 
   // Multi-scan / progressive JPEG: SOI + SOF2 + SOS (scan 1) + DHT + SOS (scan 2, with 0xFF 0x00) + EOI
-  const progressiveJpeg = new Uint8Array(560);
-  progressiveJpeg[0] = 0xff;
-  progressiveJpeg[1] = 0xd8; // SOI
-  progressiveJpeg[2] = 0xff;
-  progressiveJpeg[3] = 0xc2; // SOF2 (progressive)
-  progressiveJpeg.set([0x00, 0x11, 0x08, 0x00, 0x10, 0x00, 0x10, 0x03, 0x01, 0x11, 0x00, 0x02, 0x11, 0x00, 0x03, 0x11, 0x00], 4);
-  progressiveJpeg[21] = 0xff;
-  progressiveJpeg[22] = 0xda; // SOS scan 1
-  progressiveJpeg.set([0x00, 0x0c, 0x03, 0x01, 0x00, 0x02, 0x00, 0x03, 0x00, 0x00, 0x3f, 0x00], 23);
-  progressiveJpeg[35] = 0x12;
-  progressiveJpeg[36] = 0x34;
-  // Length-delimited DHT segment between scans (contains 0xFF 0xD8 payload bytes inside segment body)
-  progressiveJpeg[37] = 0xff;
-  progressiveJpeg[38] = 0xc4; // DHT
-  progressiveJpeg[39] = 0x00;
-  progressiveJpeg[40] = 0x08; // 8-byte segment
-  progressiveJpeg[41] = 0x10;
-  progressiveJpeg[42] = 0xff;
-  progressiveJpeg[43] = 0xd8; // payload bytes inside DHT (must be skipped by segLen, not treated as nested SOI)
-  progressiveJpeg[47] = 0xff;
-  progressiveJpeg[48] = 0xda; // SOS scan 2
-  progressiveJpeg.set([0x00, 0x08, 0x01, 0x01, 0x00, 0x01, 0x3f, 0x00], 49);
-  progressiveJpeg[60] = 0xff;
-  progressiveJpeg[61] = 0x00; // stuffed 0xFF inside scan 2 entropy data
-  progressiveJpeg[558] = 0xff;
-  progressiveJpeg[559] = 0xd9; // EOI
+  const makeProgressiveJpeg = (totalLength: number): Uint8Array => {
+    const bufOut = new Uint8Array(totalLength);
+    bufOut[0] = 0xff;
+    bufOut[1] = 0xd8; // SOI
+    bufOut[2] = 0xff;
+    bufOut[3] = 0xc2; // SOF2 (progressive)
+    bufOut.set(
+      [0x00, 0x11, 0x08, 0x00, 0x10, 0x00, 0x10, 0x03, 0x01, 0x11, 0x00, 0x02, 0x11, 0x00, 0x03, 0x11, 0x00],
+      4
+    );
+    bufOut[21] = 0xff;
+    bufOut[22] = 0xda; // SOS scan 1
+    bufOut.set([0x00, 0x0c, 0x03, 0x01, 0x00, 0x02, 0x00, 0x03, 0x00, 0x00, 0x3f, 0x00], 23);
+    bufOut[35] = 0x12;
+    bufOut[36] = 0x34;
+    // Length-delimited DHT segment between scans (contains 0xFF 0xD8 payload bytes inside segment body)
+    bufOut[37] = 0xff;
+    bufOut[38] = 0xc4; // DHT
+    bufOut[39] = 0x00;
+    bufOut[40] = 0x08; // 8-byte segment
+    bufOut[41] = 0x10;
+    bufOut[42] = 0xff;
+    bufOut[43] = 0xd8; // payload bytes inside DHT (must be skipped by segLen, not treated as nested SOI)
+    bufOut[47] = 0xff;
+    bufOut[48] = 0xda; // SOS scan 2
+    bufOut.set([0x00, 0x08, 0x01, 0x01, 0x00, 0x01, 0x3f, 0x00], 49);
+    bufOut[60] = 0xff;
+    bufOut[61] = 0x00; // stuffed 0xFF inside scan 2 entropy data
+    bufOut[totalLength - 2] = 0xff;
+    bufOut[totalLength - 1] = 0xd9; // EOI
+    return bufOut;
+  };
 
-  const progIfdResult = extractEmbeddedJpegFromRawBuffer(makeSingleIfdRaw(progressiveJpeg));
+  // Use < 512 bytes for IFD assertion so extraction proves TIFF IFD discovery rather than fallback scanning
+  const progressiveIfdJpeg = makeProgressiveJpeg(128);
+  const progIfdResult = extractEmbeddedJpegFromRawBuffer(makeSingleIfdRaw(progressiveIfdJpeg));
   assert.ok(progIfdResult instanceof Blob);
-  assert.equal(progIfdResult.size, progressiveJpeg.length);
+  assert.equal(progIfdResult.size, progressiveIfdJpeg.length);
 
+  // Retain 560-byte fixture (>= 512) for the fallback-scanning assertion
+  const progressiveJpeg = makeProgressiveJpeg(560);
   const progFallbackBuf = new Uint8Array(16 + progressiveJpeg.length + 16);
   progFallbackBuf.set(progressiveJpeg, 16);
   const progFallbackResult = extractEmbeddedJpegFromRawBuffer(progFallbackBuf.buffer);
   assert.ok(progFallbackResult instanceof Blob);
   assert.equal(progFallbackResult.size, progressiveJpeg.length);
+
+  // Rejected enclosing JPEG with APP1 payload containing a valid JPEG followed by a nested SOI:
+  // must reconsider candidate starts inside the skipped APP1 payload before jumping to nested SOI
+  const app1SegLen = 2 + 8 + fallbackPreview.length + 8;
+  const enclosingWithNestedAppPreview = new Uint8Array(16 + 4 + app1SegLen + 32);
+  enclosingWithNestedAppPreview[8] = 0xff;
+  enclosingWithNestedAppPreview[9] = 0xd8; // enclosing SOI
+  enclosingWithNestedAppPreview[10] = 0xff;
+  enclosingWithNestedAppPreview[11] = 0xe1; // APP1
+  enclosingWithNestedAppPreview[12] = (app1SegLen >> 8) & 0xff;
+  enclosingWithNestedAppPreview[13] = app1SegLen & 0xff;
+  enclosingWithNestedAppPreview.set(fallbackPreview, 14 + 8);
+  const afterApp1 = 14 + app1SegLen;
+  enclosingWithNestedAppPreview[afterApp1] = 0xff;
+  enclosingWithNestedAppPreview[afterApp1 + 1] = 0xd8; // nested SOI after APP1 rejects enclosing JPEG
+  enclosingWithNestedAppPreview[afterApp1 + 2] = 0xff;
+  enclosingWithNestedAppPreview[afterApp1 + 3] = 0xd9;
+
+  const recoveredFromSkippedApp = extractEmbeddedJpegFromRawBuffer(
+    enclosingWithNestedAppPreview.buffer
+  );
+  assert.ok(recoveredFromSkippedApp instanceof Blob);
+  assert.equal(recoveredFromSkippedApp.size, fallbackPreview.length);
+
+  // Accepted enclosing JPEG whose APP1 payload also contains a >=512-byte JPEG preserves fast path
+  const acceptedEnclosingLen = 4 + app1SegLen + 600;
+  const acceptedEnclosingBuf = new Uint8Array(16 + acceptedEnclosingLen + 16);
+  const encStart = 16;
+  acceptedEnclosingBuf[encStart] = 0xff;
+  acceptedEnclosingBuf[encStart + 1] = 0xd8; // SOI
+  acceptedEnclosingBuf[encStart + 2] = 0xff;
+  acceptedEnclosingBuf[encStart + 3] = 0xe1; // APP1
+  acceptedEnclosingBuf[encStart + 4] = (app1SegLen >> 8) & 0xff;
+  acceptedEnclosingBuf[encStart + 5] = app1SegLen & 0xff;
+  acceptedEnclosingBuf.set(fallbackPreview, encStart + 6 + 8);
+  const encSof = encStart + 4 + app1SegLen;
+  acceptedEnclosingBuf[encSof] = 0xff;
+  acceptedEnclosingBuf[encSof + 1] = 0xc0; // SOF0
+  acceptedEnclosingBuf.set(
+    [0x00, 0x11, 0x08, 0x00, 0x10, 0x00, 0x10, 0x03, 0x01, 0x11, 0x00, 0x02, 0x11, 0x00, 0x03, 0x11, 0x00],
+    encSof + 2
+  );
+  acceptedEnclosingBuf[encSof + 19] = 0xff;
+  acceptedEnclosingBuf[encSof + 20] = 0xda; // SOS
+  acceptedEnclosingBuf.set(
+    [0x00, 0x0c, 0x03, 0x01, 0x00, 0x02, 0x00, 0x03, 0x00, 0x00, 0x3f, 0x00],
+    encSof + 21
+  );
+  acceptedEnclosingBuf[encStart + acceptedEnclosingLen - 2] = 0xff;
+  acceptedEnclosingBuf[encStart + acceptedEnclosingLen - 1] = 0xd9; // EOI
+
+  const fastPathCandidates = extractEmbeddedJpegCandidatesFromRawBuffer(acceptedEnclosingBuf.buffer);
+  assert.equal(fastPathCandidates.length, 1);
+  assert.equal(fastPathCandidates[0].size, acceptedEnclosingLen);
 
   // Test browser-decoder verification with valid and failing decode responses
   const origDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'createImageBitmap');
@@ -1090,6 +1155,87 @@ test('extractEmbeddedJpegFromRawBuffer rejects SOF-missing and SOS-missing candi
       await verifyDecodableImageBlob(new Blob([missingSosCandidate], { type: 'image/jpeg' })),
       false
     );
+  } finally {
+    if (origDescriptor) {
+      Object.defineProperty(globalThis, 'createImageBitmap', origDescriptor);
+    } else {
+      delete (globalThis as { createImageBitmap?: unknown }).createImageBitmap;
+    }
+  }
+});
+
+test('extractDecodableEmbeddedJpegFromRawBuffer tries indexed candidates first and falls back to buffer scan when none decodes', async () => {
+  const makeSizedJpeg = (size: number, tagByte: number): Uint8Array => {
+    const jpeg = new Uint8Array(size);
+    jpeg[0] = 0xff;
+    jpeg[1] = 0xd8; // SOI
+    jpeg[2] = 0xff;
+    jpeg[3] = 0xc0; // SOF0
+    jpeg.set(
+      [0x00, 0x11, 0x08, 0x00, 0x10, 0x00, 0x10, 0x03, 0x01, 0x11, 0x00, 0x02, 0x11, 0x00, 0x03, 0x11, 0x00],
+      4
+    );
+    jpeg[21] = 0xff;
+    jpeg[22] = 0xda; // SOS
+    jpeg.set([0x00, 0x0c, 0x03, 0x01, 0x00, 0x02, 0x00, 0x03, 0x00, 0x00, 0x3f, 0x00], 23);
+    jpeg[35] = tagByte;
+    jpeg[size - 2] = 0xff;
+    jpeg[size - 1] = 0xd9; // EOI
+    return jpeg;
+  };
+
+  const makeIfdWithTrailingBuffer = (ifdPayload: Uint8Array, trailingPayload: Uint8Array): ArrayBuffer => {
+    const out = new Uint8Array(40 + ifdPayload.length + 16 + trailingPayload.length + 16);
+    const v = new DataView(out.buffer);
+    v.setUint16(0, 0x4949, false);
+    v.setUint16(2, 42, true);
+    v.setUint32(4, 8, true);
+    v.setUint16(8, 2, true);
+    v.setUint16(10, 0x0201, true);
+    v.setUint16(12, 4, true);
+    v.setUint32(14, 1, true);
+    v.setUint32(18, 40, true);
+    v.setUint16(22, 0x0202, true);
+    v.setUint16(24, 4, true);
+    v.setUint32(26, 1, true);
+    v.setUint32(30, ifdPayload.length, true);
+    v.setUint32(34, 0, true);
+    out.set(ifdPayload, 40);
+    out.set(trailingPayload, 40 + ifdPayload.length + 16);
+    return out.buffer;
+  };
+
+  const indexedGood = makeSizedJpeg(600, 0x11);
+  const indexedUnreadable = makeSizedJpeg(600, 0xee);
+  const unindexedLarger = makeSizedJpeg(700, 0x22);
+
+  const origDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'createImageBitmap');
+  try {
+    Object.defineProperty(globalThis, 'createImageBitmap', {
+      configurable: true,
+      writable: true,
+      value: async (blob: Blob) => {
+        const bytes = new Uint8Array(await blob.arrayBuffer());
+        if (bytes[35] === 0xee) {
+          throw new Error('Corrupt indexed preview bitstream');
+        }
+        return { width: 16, height: 16, close: () => {} };
+      },
+    });
+
+    // 1. Fast path: decodable indexed candidate (>= 512) returns immediately without scanning for larger unindexed one
+    const fastPathResult = await extractDecodableEmbeddedJpegFromRawBuffer(
+      makeIfdWithTrailingBuffer(indexedGood, unindexedLarger)
+    );
+    assert.ok(fastPathResult instanceof Blob);
+    assert.equal(fastPathResult.size, indexedGood.length);
+
+    // 2. Fallback path: indexed candidate (>= 512) fails decode, so buffer scan discovers unindexed decodable preview
+    const fallbackResult = await extractDecodableEmbeddedJpegFromRawBuffer(
+      makeIfdWithTrailingBuffer(indexedUnreadable, unindexedLarger)
+    );
+    assert.ok(fallbackResult instanceof Blob);
+    assert.equal(fallbackResult.size, unindexedLarger.length);
   } finally {
     if (origDescriptor) {
       Object.defineProperty(globalThis, 'createImageBitmap', origDescriptor);
