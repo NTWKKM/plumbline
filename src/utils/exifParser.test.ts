@@ -11,6 +11,7 @@ import {
   withJpegOrientation,
   MAX_RAW_PREVIEW_DECODE_ATTEMPTS,
   readJpegExifOrientation,
+  collectIndexedCandidatesForTest,
   scanJpegStreamForTest,
   scanRawBufferForTest,
 } from './exifParser';
@@ -1648,4 +1649,44 @@ test('RAW container Orientation is applied to the decoded embedded preview', asy
   assert.equal(withJpegOrientation(preview, 1), preview);
   const tagged = withJpegOrientation(preview, 8);
   assert.equal(withJpegOrientation(tagged, 3), tagged);
+});
+
+test('repeated 0x002E entries draw from one caller-owned budget and stop when it is spent', () => {
+  const preview = makeFrameJpeg(4000);
+  const repeats = 50;
+  // IFD0 with `repeats` JpgFromRaw entries that all point at the same preview
+  const ifdSize = 2 + repeats * 12 + 4;
+  const dataStart = 8 + ifdSize;
+  const buf = new Uint8Array(dataStart + preview.length);
+  const v = new DataView(buf.buffer);
+  v.setUint16(0, 0x4949, false);
+  v.setUint16(2, 0x0055, true);
+  v.setUint32(4, 8, true);
+  v.setUint16(8, repeats, true);
+  for (let i = 0; i < repeats; i++) {
+    const e = 10 + i * 12;
+    v.setUint16(e, 0x002e, true);
+    v.setUint16(e + 2, 7, true);
+    v.setUint32(e + 4, preview.length, true);
+    v.setUint32(e + 8, dataStart, true);
+  }
+  buf.set(preview, dataStart);
+
+  const single = { remaining: 10_000_000 };
+  assert.equal(scanJpegStreamForTest(buf, dataStart, buf.length, single).valid, true);
+  const oneWalk = 10_000_000 - single.remaining;
+
+  // Budget for one and a half walks: the second entry exhausts it and no later entry walks
+  const limited = { remaining: Math.floor(oneWalk * 1.5) };
+  const cut = collectIndexedCandidatesForTest(buf, limited);
+  assert.equal(cut.budgetExhausted, true);
+  assert.equal(limited.remaining, -1);
+  assert.equal(cut.candidateCount, 1);
+
+  // With ample budget every entry is charged, and dedupe still yields a single candidate
+  const ample = { remaining: oneWalk * (repeats + 1) };
+  const full = collectIndexedCandidatesForTest(buf, ample);
+  assert.equal(full.budgetExhausted, false);
+  assert.equal(full.candidateCount, 1);
+  assert.equal(oneWalk * (repeats + 1) - ample.remaining, oneWalk * repeats);
 });

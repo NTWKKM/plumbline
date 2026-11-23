@@ -364,14 +364,17 @@ interface CandidateSlice {
 function collectTiffIfdJpegCandidates(
   bytes: Uint8Array,
   view: DataView,
-  seenOffsets: Set<string>
+  seenOffsets: Set<string>,
+  budget: ScanBudget
 ): CandidateSlice[] {
   const candidates: CandidateSlice[] = [];
+  // Indexed walks share the buffer scan's budget, so repeated IFD entries pointing at one large
+  // stream (e.g. thousands of 0x002E tags) cannot rescan it without bound
   const recordCandidate = (start: number, length: number) => {
     const end = start + length;
-    if (start < 0 || length < 16 || end > bytes.length) return;
+    if (budget.remaining < 0 || start < 0 || length < 16 || end > bytes.length) return;
     // Rejects lossless (SOF3) raw sensor strips so the real preview is tried first
-    const res = scanJpegStream(bytes, view, start, end);
+    const res = scanJpegStream(bytes, view, start, end, budget);
     if (!isDecodablePreviewScan(res)) return;
     // Trim padding after EOI so the slice and its key match the same stream found by the scan
     const streamLength = res.endOffset - start;
@@ -392,7 +395,7 @@ function collectTiffIfdJpegCandidates(
       queue.push(firstIfd);
     }
 
-    while (queue.length > 0 && visited.size < 64) {
+    while (queue.length > 0 && visited.size < 64 && budget.remaining >= 0) {
       const ifdOffset = queue.shift()!;
       if (visited.has(ifdOffset) || ifdOffset < 8 || ifdOffset + 2 > bytes.length) continue;
       visited.add(ifdOffset);
@@ -405,7 +408,7 @@ function collectTiffIfdJpegCandidates(
 
       for (let i = 0; i < entries; i++) {
         const entryPos = ifdOffset + 2 + i * 12;
-        if (entryPos + 12 > bytes.length) break;
+        if (entryPos + 12 > bytes.length || budget.remaining < 0) break;
         const tag = view.getUint16(entryPos, littleEndian);
         const type = view.getUint16(entryPos + 2, littleEndian);
         const count = view.getUint32(entryPos + 4, littleEndian);
@@ -464,6 +467,16 @@ function collectTiffIfdJpegCandidates(
 
   candidates.sort((a, b) => b.length - a.length);
   return candidates;
+}
+
+/** Test-only entry to the indexed (IFD) candidate collection with a caller-owned budget. */
+export function collectIndexedCandidatesForTest(
+  bytes: Uint8Array,
+  budget: { remaining: number }
+): { candidateCount: number; budgetExhausted: boolean } {
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const candidates = collectTiffIfdJpegCandidates(bytes, view, new Set<string>(), budget);
+  return { candidateCount: candidates.length, budgetExhausted: budget.remaining < 0 };
 }
 
 function createScanBudget(bytes: Uint8Array): ScanBudget {
@@ -724,8 +737,10 @@ function* iterateRawPreviewCandidates(bytes: Uint8Array): Generator<CandidateSli
   if (bytes.length < 16) return;
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const seenOffsets = new Set<string>();
-  yield* collectTiffIfdJpegCandidates(bytes, view, seenOffsets);
+  // One budget covers the indexed walks, the buffer scan, and the deferred APP payloads
   const budget = createScanBudget(bytes);
+  yield* collectTiffIfdJpegCandidates(bytes, view, seenOffsets, budget);
+  if (budget.remaining < 0) return;
   const { candidates, deferred } = scanRawBufferForJpegCandidates(bytes, view, seenOffsets, budget);
   yield* candidates;
   // Reached only when every enclosing candidate above failed to decode (or none existed)
