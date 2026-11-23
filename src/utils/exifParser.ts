@@ -189,6 +189,10 @@ export function isValidJpegSlice(
             scan += 2;
             continue;
           }
+          if (next === 0xd8) {
+            // Unescaped nested SOI inside entropy data indicates a truncated/corrupt stream
+            return false;
+          }
           if (next === 0xd9) {
             return true;
           }
@@ -324,6 +328,7 @@ export function extractEmbeddedJpegCandidatesFromRawBuffer(buffer: ArrayBuffer):
         let cursor = pos + 2;
         let hasSof = false;
         let foundEoi = -1;
+        let nestedSoi = -1;
 
         while (cursor + 1 < bytes.length) {
           if (bytes[cursor] !== 0xff) {
@@ -375,6 +380,11 @@ export function extractEmbeddedJpegCandidatesFromRawBuffer(buffer: ArrayBuffer):
                   scan += 2;
                   continue;
                 }
+                if (next === 0xd8) {
+                  // Unescaped nested SOI before EOI: restart candidate search at nested SOI
+                  nestedSoi = scan;
+                  break;
+                }
                 if (next === 0xd9) {
                   foundEoi = scan + 2;
                   break;
@@ -385,6 +395,11 @@ export function extractEmbeddedJpegCandidatesFromRawBuffer(buffer: ArrayBuffer):
             break;
           }
           cursor = markerPos + 1 + segLen;
+        }
+
+        if (nestedSoi > pos) {
+          pos = nestedSoi;
+          continue;
         }
 
         if (foundEoi > pos) {

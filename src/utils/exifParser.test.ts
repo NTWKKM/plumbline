@@ -904,7 +904,6 @@ test('extractEmbeddedJpegFromRawBuffer rejects SOF-missing and SOS-missing candi
     0x01, 0x11, 0x00, 0x02, 0x11, 0x00, 0x03, 0x11, 0x00,
     0xff, 0xe0, 0x00, 0x10, // APP0 (16 bytes total)
     0x4a, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00,
-    0x00, 0x00,
     0xff, 0xd9, // EOI before any SOS
   ]);
 
@@ -1010,6 +1009,23 @@ test('extractEmbeddedJpegFromRawBuffer rejects SOF-missing and SOS-missing candi
   const fallbackFound = extractEmbeddedJpegFromRawBuffer(rafWrapper.buffer);
   assert.ok(fallbackFound instanceof Blob);
   assert.equal(fallbackFound.size, fallbackPreview.length);
+
+  // Truncated-scan candidate (valid SOI + SOF0 + SOS + scan data, missing EOI) followed by valid JPEG
+  const truncatedScanPrefix = new Uint8Array([
+    0xff, 0xd8, // SOI
+    0xff, 0xc0, 0x00, 0x11, 0x08, 0x00, 0x10, 0x00, 0x10, 0x03, // SOF0: 16x16
+    0x01, 0x11, 0x00, 0x02, 0x11, 0x00, 0x03, 0x11, 0x00,
+    0xff, 0xda, 0x00, 0x0c, 0x03, 0x01, 0x00, 0x02, 0x00, 0x03, 0x00, 0x00, 0x3f, 0x00, // SOS
+    0x12, 0x34, 0x56, 0x78, // truncated scan without EOI
+  ]);
+
+  const truncatedScanWrapper = new Uint8Array(16 + truncatedScanPrefix.length + fallbackPreview.length + 16);
+  truncatedScanWrapper.set(truncatedScanPrefix, 16);
+  truncatedScanWrapper.set(fallbackPreview, 16 + truncatedScanPrefix.length);
+
+  const recoveredFromTruncated = extractEmbeddedJpegFromRawBuffer(truncatedScanWrapper.buffer);
+  assert.ok(recoveredFromTruncated instanceof Blob);
+  assert.equal(recoveredFromTruncated.size, fallbackPreview.length);
 
   // Test browser-decoder verification with valid and failing decode responses
   const origDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'createImageBitmap');
