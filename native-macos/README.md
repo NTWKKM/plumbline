@@ -15,7 +15,23 @@ Requirements:
 - macOS (Apple Silicon M1/M2/M3/M4 or Intel)
 - Rust toolchain (`curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`)
 
+### Option 1: Run directly from CLI
+
 ```bash
 cd native-macos
 cargo run --release
 ```
+
+### Option 2: Package & Install as Native macOS App (.app)
+
+```bash
+cd native-macos
+./bundle.sh
+```
+
+This compiles an optimized release binary, packages it into `native-macos/dist/Plumb_Line.app` (git-ignored), performs ad-hoc codesigning, and installs it into `~/Applications/Plumb_Line.app` (launchable via Spotlight or Finder).
+
+- The bundle version (`CFBundleShortVersionString` / `CFBundleVersion`) is read from `Cargo.toml`.
+- `~/Applications` is created if missing; any existing `~/Applications/Plumb_Line.app` is replaced on each run.
+- The ad-hoc signature is local-only: it is not notarized and is not intended for distribution to other Macs.
+
