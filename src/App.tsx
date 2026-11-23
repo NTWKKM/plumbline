@@ -202,7 +202,7 @@ export default function App() {
   const [isBatchExporting, setIsBatchExporting] = useState<boolean>(false);
   const [isImageLoaded, setIsImageLoaded] = useState<boolean>(false);
   const [exportBanner, setExportBanner] = useState<string | null>(null);
-  const [exportError, setExportError] = useState<string | null>(null);
+  const [errorNotice, setErrorNotice] = useState<string | null>(null);
 
   const [analysis, setAnalysis] = useState<LevelingAnalysis>(DEFAULT_LEVELING_ANALYSIS);
   const [autoCorrect, setAutoCorrect] = useState<AutoCorrectAnalysis>(
@@ -370,9 +370,9 @@ export default function App() {
     }
 
     if (failedFiles.length > 0) {
-      setExportError(`Unable to import ${failedFiles.join('; ')}`);
+      setErrorNotice(`Import error: unable to import ${failedFiles.join('; ')}`);
     } else if (importedItems.length > 0) {
-      setExportError(null);
+      setErrorNotice(null);
     }
   }, []);
 
@@ -484,12 +484,12 @@ export default function App() {
   const handleExportJpeg = async () => {
     setIsExporting(true);
     setExportBanner(null);
-    setExportError(null);
+    setErrorNotice(null);
 
     try {
       const canvas = exportCanvasRef.current ? exportCanvasRef.current() : canvasRef.current;
       if (!canvas) {
-        setExportError('Darkroom canvas is not ready for export.');
+        setErrorNotice('Export error: darkroom canvas is not ready for export.');
         return;
       }
 
@@ -516,7 +516,7 @@ export default function App() {
     if (photos.length === 0) return;
     setIsBatchExporting(true);
     setExportBanner(null);
-    setExportError(null);
+    setErrorNotice(null);
 
     let exportedCount = 0;
     try {
@@ -533,7 +533,7 @@ export default function App() {
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       setExportBanner(null);
-      setExportError(`Batch export stopped after ${exportedCount} of ${photos.length}: ${msg}`);
+      setErrorNotice(`Export error: batch export stopped after ${exportedCount} of ${photos.length}: ${msg}`);
     } finally {
       setIsBatchExporting(false);
     }
@@ -688,17 +688,22 @@ export default function App() {
       </header>
 
       {/* Shared Export & Import Status Notices (visible across Canvas, Adjust, and Queue tabs) */}
-      {exportError && (
+      {errorNotice && (
         <div
           role="alert"
           className="flex items-start sm:items-center justify-between gap-3 border-b border-error bg-paper px-5 py-2 text-xs text-error shrink-0"
         >
-          <span className="min-w-0 flex-1 max-h-[25vh] overflow-y-auto break-words">
-            Export error: {exportError}
+          <span
+            role="region"
+            aria-label="Error details"
+            tabIndex={0}
+            className="min-w-0 flex-1 max-h-[25vh] overflow-y-auto break-words"
+          >
+            {errorNotice}
           </span>
           <button
             type="button"
-            onClick={() => setExportError(null)}
+            onClick={() => setErrorNotice(null)}
             className="font-medium underline underline-offset-2 hover:text-ink shrink-0"
           >
             Dismiss

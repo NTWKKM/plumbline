@@ -7,6 +7,9 @@ import {
   extractEmbeddedJpegCandidatesFromRawBuffer,
   extractDecodableEmbeddedJpegFromRawBuffer,
   verifyDecodableImageBlob,
+  readRawContainerOrientation,
+  withJpegOrientation,
+  MAX_RAW_PREVIEW_DECODE_ATTEMPTS,
 } from './exifParser';
 
 test('parseExifFromArrayBuffer returns empty fields for missing metadata instead of fabricated Sony defaults', () => {
@@ -1243,4 +1246,191 @@ test('extractDecodableEmbeddedJpegFromRawBuffer tries indexed candidates first a
       delete (globalThis as { createImageBitmap?: unknown }).createImageBitmap;
     }
   }
+});
+
+// ---- RAW preview hardening: SOF filtering, decode cap, scan budget, vendor TIFF magic, orientation ----
+
+const makeFrameJpeg = (size: number, sofMarker = 0xc0, tagByte = 0x11): Uint8Array<ArrayBuffer> => {
+  const jpeg = new Uint8Array(size);
+  jpeg[0] = 0xff;
+  jpeg[1] = 0xd8; // SOI
+  jpeg[2] = 0xff;
+  jpeg[3] = sofMarker;
+  jpeg.set(
+    [0x00, 0x11, 0x08, 0x00, 0x10, 0x00, 0x10, 0x03, 0x01, 0x11, 0x00, 0x02, 0x11, 0x00, 0x03, 0x11, 0x00],
+    4
+  );
+  jpeg[21] = 0xff;
+  jpeg[22] = 0xda; // SOS
+  jpeg.set([0x00, 0x0c, 0x03, 0x01, 0x00, 0x02, 0x00, 0x03, 0x00, 0x00, 0x3f, 0x00], 23);
+  jpeg[35] = tagByte;
+  jpeg[size - 2] = 0xff;
+  jpeg[size - 1] = 0xd9; // EOI
+  return jpeg;
+};
+
+/** Little-endian TIFF-family container whose IFD0 holds Orientation plus JPEG pointers to each payload. */
+const makeTiffContainer = (
+  payloads: Uint8Array[],
+  { magic = 42, orientation }: { magic?: number; orientation?: number } = {}
+): ArrayBuffer => {
+  const entryCount = payloads.length * 2 + (orientation ? 1 : 0);
+  const ifdSize = 2 + entryCount * 12 + 4;
+  const dataStart = 8 + ifdSize;
+  const total = dataStart + payloads.reduce((sum, p) => sum + p.length, 0);
+  const out = new Uint8Array(total);
+  const v = new DataView(out.buffer);
+  v.setUint16(0, 0x4949, false);
+  v.setUint16(2, magic, true);
+  v.setUint32(4, 8, true);
+  v.setUint16(8, entryCount, true);
+  let entry = 10;
+  if (orientation) {
+    v.setUint16(entry, 0x0112, true);
+    v.setUint16(entry + 2, 3, true);
+    v.setUint32(entry + 4, 1, true);
+    v.setUint16(entry + 8, orientation, true);
+    entry += 12;
+  }
+  // Only the last pointer pair per IFD wins, so chain one IFD per payload via SubIFD-free layout:
+  // use StripOffsets/StripByteCounts for payload 0 and JPEGInterchangeFormat for payload 1.
+  let offset = dataStart;
+  payloads.forEach((payload, i) => {
+    const [offTag, lenTag] = i === 0 ? [0x0111, 0x0117] : [0x0201, 0x0202];
+    v.setUint16(entry, offTag, true);
+    v.setUint16(entry + 2, 4, true);
+    v.setUint32(entry + 4, 1, true);
+    v.setUint32(entry + 8, offset, true);
+    v.setUint16(entry + 12, lenTag, true);
+    v.setUint16(entry + 14, 4, true);
+    v.setUint32(entry + 16, 1, true);
+    v.setUint32(entry + 20, payload.length, true);
+    entry += 24;
+    out.set(payload, offset);
+    offset += payload.length;
+  });
+  v.setUint32(entry, 0, true); // next IFD
+  return out.buffer;
+};
+
+const withMockedImageBitmap = async (
+  decoder: (bytes: Uint8Array) => boolean,
+  body: () => Promise<void>
+) => {
+  const origDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'createImageBitmap');
+  Object.defineProperty(globalThis, 'createImageBitmap', {
+    configurable: true,
+    writable: true,
+    value: async (blob: Blob) => {
+      if (!decoder(new Uint8Array(await blob.arrayBuffer()))) throw new Error('decode failed');
+      return { width: 16, height: 16, close: () => {} };
+    },
+  });
+  try {
+    await body();
+  } finally {
+    if (origDescriptor) {
+      Object.defineProperty(globalThis, 'createImageBitmap', origDescriptor);
+    } else {
+      delete (globalThis as { createImageBitmap?: unknown }).createImageBitmap;
+    }
+  }
+};
+
+test('RAW preview candidates skip lossless SOF3 sensor strips so the real preview is tried first', () => {
+  const losslessStrip = makeFrameJpeg(4000, 0xc3); // larger, structurally valid, not browser-decodable
+  const preview = makeFrameJpeg(900, 0xc0);
+  const candidates = extractEmbeddedJpegCandidatesFromRawBuffer(makeTiffContainer([losslessStrip, preview]));
+  assert.equal(candidates.length, 1);
+  assert.equal(candidates[0].size, preview.length);
+});
+
+test('extractDecodableEmbeddedJpegFromRawBuffer stops after MAX_RAW_PREVIEW_DECODE_ATTEMPTS failing decodes', async () => {
+  const streams = Array.from({ length: MAX_RAW_PREVIEW_DECODE_ATTEMPTS + 6 }, (_, i) =>
+    makeFrameJpeg(600 + i * 10, 0xc0, 0xee)
+  );
+  const wrapper = new Uint8Array(16 + streams.reduce((s, p) => s + p.length + 8, 0));
+  let offset = 16;
+  for (const s of streams) {
+    wrapper.set(s, offset);
+    offset += s.length + 8;
+  }
+  let decodeCalls = 0;
+  await withMockedImageBitmap(
+    () => {
+      decodeCalls += 1;
+      return false;
+    },
+    async () => {
+      assert.equal(await extractDecodableEmbeddedJpegFromRawBuffer(wrapper.buffer), null);
+    }
+  );
+  assert.equal(decodeCalls, MAX_RAW_PREVIEW_DECODE_ATTEMPTS);
+});
+
+test('fallback scan stays linear on a crafted buffer of nested APP segments over one long entropy run', () => {
+  // k SOI+APP1 headers, each APP1 payload swallowing the next header, all funnelling into one
+  // SOF/SOS with a long entropy run and no EOI until the very end: quadratic without a work budget.
+  const k = 4000;
+  const header = 6; // FF D8 FF E1 len(2)
+  const entropyLen = 2_000_000;
+  const tailStart = k * header;
+  const buf = new Uint8Array(tailStart + 40 + entropyLen + 6);
+  for (let i = 0; i < k; i++) {
+    const at = i * header;
+    const segLen = tailStart - at - 4; // payload runs up to the shared SOF
+    buf.set([0xff, 0xd8, 0xff, 0xe1, (segLen >> 8) & 0xff, segLen & 0xff], at);
+  }
+  buf.set(
+    [0xff, 0xc0, 0x00, 0x11, 0x08, 0x00, 0x10, 0x00, 0x10, 0x03, 0x01, 0x11, 0x00, 0x02, 0x11, 0x00, 0x03, 0x11, 0x00],
+    tailStart
+  );
+  buf.set([0xff, 0xda, 0x00, 0x0c, 0x03, 0x01, 0x00, 0x02, 0x00, 0x03, 0x00, 0x00, 0x3f, 0x00], tailStart + 19);
+  buf.fill(0x5a, tailStart + 33, tailStart + 33 + entropyLen);
+  // Unescaped nested SOI ends the run (rejecting every enclosing stream), then the only EOI
+  buf.set([0xff, 0xd8, 0xff, 0xd9], buf.length - 4);
+
+  const started = performance.now();
+  extractEmbeddedJpegCandidatesFromRawBuffer(buf.buffer);
+  const elapsedMs = performance.now() - started;
+  assert.ok(elapsedMs < 2000, `scan took ${elapsedMs.toFixed(0)} ms`);
+});
+
+test('ORF and RW2 vendor TIFF magic numbers still use the IFD fast path', () => {
+  const preview = makeFrameJpeg(300); // < 512 bytes: only IFD discovery can find it, not the scan
+  for (const magic of [0x4f52, 0x5352, 0x0055]) {
+    const candidates = extractEmbeddedJpegCandidatesFromRawBuffer(
+      makeTiffContainer([new Uint8Array(0), preview], { magic })
+    );
+    assert.equal(candidates.length, 1, `magic 0x${magic.toString(16)}`);
+    assert.equal(candidates[0].size, preview.length);
+  }
+});
+
+test('RAW container Orientation is applied to the decoded embedded preview', async () => {
+  const preview = makeFrameJpeg(900);
+  const buffer = makeTiffContainer([new Uint8Array(0), preview], { orientation: 6 });
+  assert.equal(readRawContainerOrientation(buffer), 6);
+  assert.equal(readRawContainerOrientation(new Uint8Array(32).buffer), 1);
+
+  await withMockedImageBitmap(
+    () => true,
+    async () => {
+      const blob = await extractDecodableEmbeddedJpegFromRawBuffer(buffer);
+      assert.ok(blob instanceof Blob);
+      const bytes = new Uint8Array(await blob.arrayBuffer());
+      assert.equal(bytes.length, preview.length + 36);
+      assert.deepEqual([...bytes.subarray(0, 4)], [0xff, 0xd8, 0xff, 0xe1]);
+      assert.equal(String.fromCharCode(...bytes.subarray(6, 10)), 'Exif');
+      const v = new DataView(bytes.buffer);
+      assert.equal(v.getUint16(12 + 10, true), 0x0112); // IFD0 entry tag
+      assert.equal(v.getUint16(12 + 18, true), 6); // Orientation value
+      assert.deepEqual([...bytes.subarray(38)], [...preview.subarray(2)]);
+    }
+  );
+
+  // Orientation 1 and previews that already carry an Exif APP1 are left untouched
+  assert.equal(withJpegOrientation(preview, 1), preview);
+  const tagged = withJpegOrientation(preview, 8);
+  assert.equal(withJpegOrientation(tagged, 3), tagged);
 });
