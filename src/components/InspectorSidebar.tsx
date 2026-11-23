@@ -44,10 +44,10 @@ interface InspectorSidebarProps {
 }
 
 const ASPECT_PRESETS: { value: AspectRatioPreset; label: string }[] = [
-  { value: '1:1', label: '1:1 Square' },
-  { value: '4:5', label: '4:5 Portrait' },
-  { value: '16:9', label: '16:9 Cinema' },
-  { value: '3:2', label: '3:2 Classic' },
+  { value: '1:1', label: '1:1' },
+  { value: '4:5', label: '4:5' },
+  { value: '16:9', label: '16:9' },
+  { value: '3:2', label: '3:2' },
   { value: 'original', label: 'Original' },
 ];
 
@@ -75,10 +75,22 @@ export const InspectorSidebar: React.FC<InspectorSidebarProps> = ({
   className = '',
 }) => {
   const totalRotationDeg = Number(
-    ((config.autoLevelEnabled ? analysis.appliedRotationDeg : 0) + config.manualAngleOffsetDeg).toFixed(2)
+    (
+      (config.autoLevelEnabled ? analysis.appliedRotationDeg : 0) +
+      config.manualAngleOffsetDeg
+    ).toFixed(2)
+  );
+  const keystoneEnabled = config.keystoneWarpEnabled ?? true;
+  const manualKeystoneDeg = config.manualKeystoneDeg ?? 0;
+  const totalKeystoneDeg = Number(
+    (
+      (keystoneEnabled ? (analysis.appliedKeystoneDeg ?? 0) : 0) +
+      manualKeystoneDeg
+    ).toFixed(2)
   );
   const autoCorrectEnabled = config.autoCorrectEnabled ?? true;
   const autoCorrectStrength = config.autoCorrectStrength ?? 75;
+  const wbProfile = config.wbProfile ?? 'ambient';
   const histogram = autoCorrect?.lumaHistogram ?? [];
 
   const handleNudgeManualAngle = (delta: number) => {
@@ -272,6 +284,70 @@ export const InspectorSidebar: React.FC<InspectorSidebarProps> = ({
               </div>
             </div>
 
+            {/* 2D Projective Keystone Warp */}
+            <div className="pt-2.5 border-t border-rule">
+              <div className="flex items-center justify-between gap-2">
+                <label htmlFor="toggle-keystone-warp" className="text-xs font-medium text-ink cursor-pointer truncate">
+                  2D Projective Keystone Warp
+                </label>
+                <input
+                  id="toggle-keystone-warp"
+                  type="checkbox"
+                  {...SWITCH_ATTR}
+                  checked={keystoneEnabled}
+                  onChange={(e) =>
+                    onChangeConfig((prev) => ({
+                      ...prev,
+                      keystoneWarpEnabled: e.target.checked,
+                    }))
+                  }
+                  className="h-4 w-4 rounded cursor-pointer shrink-0"
+                />
+              </div>
+
+              <div className="mt-2">
+                <div className="flex items-center justify-between gap-2 text-xs">
+                  <label htmlFor="slider-manual-keystone" className="text-muted">
+                    Keystone Vertical
+                  </label>
+                  <div className="flex items-center gap-2 shrink-0">
+                    {manualKeystoneDeg !== 0 && (
+                      <button
+                        type="button"
+                        onClick={() =>
+                          onChangeConfig((prev) => ({ ...prev, manualKeystoneDeg: 0 }))
+                        }
+                        className="btn btn--quiet btn--sm font-mono text-xs"
+                      >
+                        Reset 0°
+                      </button>
+                    )}
+                    <span
+                      className="font-mono text-ink tabular-nums"
+                      data-testid="keystone-angle-val"
+                    >
+                      {formatSignedDegrees(totalKeystoneDeg, 2)}
+                    </span>
+                  </div>
+                </div>
+                <input
+                  id="slider-manual-keystone"
+                  type="range"
+                  min={-12}
+                  max={12}
+                  step={0.1}
+                  value={manualKeystoneDeg}
+                  onChange={(e) =>
+                    onChangeConfig((prev) => ({
+                      ...prev,
+                      manualKeystoneDeg: parseFloat(e.target.value),
+                    }))
+                  }
+                  className="mt-1.5 h-1.5 w-full cursor-pointer rounded-pill bg-paper-3 accent-accent"
+                />
+              </div>
+            </div>
+
             {/* Inscribed Auto-Crop Controls */}
             <div className="pt-2.5 border-t border-rule">
               <div className="flex items-center justify-between gap-2">
@@ -340,37 +416,86 @@ export const InspectorSidebar: React.FC<InspectorSidebarProps> = ({
               </div>
 
               {autoCorrectEnabled && (
-                <div className="mt-2">
-                  <div className="flex items-center justify-between text-xs">
-                    <label htmlFor="slider-auto-correct-strength" className="text-muted">
-                      Correction Intensity
-                    </label>
-                    <span className="font-mono text-ink tabular-nums" data-testid="auto-correct-strength-val">
-                      {autoCorrectStrength}%
-                    </span>
+                <div className="mt-2 space-y-2.5">
+                  <div
+                    className="grid grid-cols-2 divide-x divide-rule border border-rule bg-paper"
+                    role="group"
+                    aria-label="White Balance Profile"
+                  >
+                    <button
+                      type="button"
+                      data-testid="wb-profile-ambient"
+                      aria-pressed={wbProfile === 'ambient'}
+                      onClick={() =>
+                        onChangeConfig((prev) => ({ ...prev, wbProfile: 'ambient' }))
+                      }
+                      className={`min-h-[32px] px-2 py-1 text-xs font-medium transition-colors whitespace-nowrap truncate ${
+                        wbProfile === 'ambient'
+                          ? 'bg-ink text-paper'
+                          : 'bg-paper text-ink-2 hover:bg-paper-3 hover:text-ink'
+                      }`}
+                    >
+                      Golden Hour
+                    </button>
+                    <button
+                      type="button"
+                      data-testid="wb-profile-neutral"
+                      aria-pressed={wbProfile === 'neutral'}
+                      onClick={() =>
+                        onChangeConfig((prev) => ({ ...prev, wbProfile: 'neutral' }))
+                      }
+                      className={`min-h-[32px] px-2 py-1 text-xs font-medium transition-colors whitespace-nowrap truncate ${
+                        wbProfile === 'neutral'
+                          ? 'bg-ink text-paper'
+                          : 'bg-paper text-ink-2 hover:bg-paper-3 hover:text-ink'
+                      }`}
+                    >
+                      Studio Neutral
+                    </button>
                   </div>
-                  <input
-                    id="slider-auto-correct-strength"
-                    type="range"
-                    min={0}
-                    max={100}
-                    step={5}
-                    value={autoCorrectStrength}
-                    onChange={(e) =>
-                      onChangeConfig((prev) => ({
-                        ...prev,
-                        autoCorrectStrength: parseInt(e.target.value, 10),
-                      }))
-                    }
-                    className="mt-1.5 h-1.5 w-full cursor-pointer rounded-pill bg-paper-3 accent-accent"
-                  />
+
+                  <div>
+                    <div className="flex items-center justify-between text-xs">
+                      <label htmlFor="slider-auto-correct-strength" className="text-muted">
+                        Correction Intensity
+                      </label>
+                      <span className="font-mono text-ink tabular-nums" data-testid="auto-correct-strength-val">
+                        {autoCorrectStrength}%
+                      </span>
+                    </div>
+                    <input
+                      id="slider-auto-correct-strength"
+                      type="range"
+                      min={0}
+                      max={100}
+                      step={5}
+                      value={autoCorrectStrength}
+                      onChange={(e) =>
+                        onChangeConfig((prev) => ({
+                          ...prev,
+                          autoCorrectStrength: parseInt(e.target.value, 10),
+                        }))
+                      }
+                      className="mt-1.5 h-1.5 w-full cursor-pointer rounded-pill bg-paper-3 accent-accent"
+                    />
+                  </div>
+
                   {autoCorrect && (
-                    <div className="mt-2 grid grid-cols-3 divide-x divide-rule border border-rule bg-paper py-1 text-center text-xs text-muted font-mono tabular-nums">
-                      <span className="truncate px-1">
+                    <div className="grid grid-cols-2 divide-x divide-y divide-rule border border-rule bg-paper text-center text-xs text-muted font-mono tabular-nums">
+                      <span className="truncate px-1.5 py-1">
                         EV {autoCorrect.exposureEv >= 0 ? `+${autoCorrect.exposureEv.toFixed(2)}` : autoCorrect.exposureEv.toFixed(2)}
                       </span>
-                      <span className="truncate px-1">Contrast +{autoCorrect.contrast}</span>
-                      <span className="truncate px-1">DR {autoCorrect.dynamicRangeStops}</span>
+                      <span className="truncate px-1.5 py-1 border-t-0">
+                        Contrast +{autoCorrect.contrast}
+                      </span>
+                      <span className="truncate px-1.5 py-1 border-l-0" data-testid="wb-kelvin-val">
+                        Est. {autoCorrect.estimatedKelvin ?? 5500}K ({autoCorrect.wbTempShift >= 0 ? `+${autoCorrect.wbTempShift}` : autoCorrect.wbTempShift})
+                      </span>
+                      <span className="truncate px-1.5 py-1" data-testid="wb-ambient-val">
+                        {wbProfile === 'ambient'
+                          ? `${autoCorrect.ambientWarmthRetainedPercent ?? 35}% ambient retained`
+                          : '0% ambient retained'}
+                      </span>
                     </div>
                   )}
                 </div>

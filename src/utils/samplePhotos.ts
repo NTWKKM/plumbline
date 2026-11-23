@@ -88,6 +88,6 @@ export const BACKGROUND_COLOR_PRESETS: BackgroundColorPreset[] = [
   { id: 'pure-white', label: 'Pure White', hex: '#FFFFFF', textColorHex: '#27272A' },
   { id: 'gallery-warm', label: 'Warm Archive', hex: '#F6F4EF', textColorHex: '#27272A' },
   { id: 'museum-alabaster', label: 'Alabaster Gray', hex: '#EAECEF', textColorHex: '#18181B' },
-  { id: 'obsidian-black', label: 'Darkroom Black', hex: '#0D0D0F', textColorHex: '#A1A1AA' },
+  { id: 'obsidian-black', label: 'Obsidian Black', hex: '#0D0D0F', textColorHex: '#A1A1AA' },
   { id: 'charcoal-matte', label: 'Carbon Matte', hex: '#1C1D21', textColorHex: '#D4D4D8' },
 ];

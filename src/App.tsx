@@ -7,9 +7,9 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { Grid, ImagePlus, ZoomIn, ZoomOut } from 'lucide-react';
 import {
   CanvasViewMode,
-  DarkroomCanvas,
+  StudioCanvas,
   renderPhotoToFramedCanvas,
-} from './components/DarkroomCanvas';
+} from './components/StudioCanvas';
 import { InspectorSidebar } from './components/InspectorSidebar';
 import {
   SUPPORTED_IMAGE_ACCEPT,
@@ -43,10 +43,13 @@ const DEFAULT_PIPELINE_CONFIG: PipelineConfig = {
   autoLevelEnabled: true,
   maxAutoAngleDeg: 15.0,
   manualAngleOffsetDeg: 0,
+  keystoneWarpEnabled: true,
+  manualKeystoneDeg: 0,
   autoCropEnabled: true,
   preserveAspectRatioInCrop: true,
   autoCorrectEnabled: true,
   autoCorrectStrength: 75,
+  wbProfile: 'ambient',
   aspectPreset: '1:1',
   paddingPercent: 10,
   backgroundColor: '#FFFFFF',
@@ -75,6 +78,14 @@ function loadPersistedConfig(): PipelineConfig {
         typeof obj.manualAngleOffsetDeg === 'number' && Number.isFinite(obj.manualAngleOffsetDeg)
           ? clamp(obj.manualAngleOffsetDeg, -15, 15)
           : DEFAULT_PIPELINE_CONFIG.manualAngleOffsetDeg,
+      keystoneWarpEnabled:
+        typeof obj.keystoneWarpEnabled === 'boolean'
+          ? obj.keystoneWarpEnabled
+          : DEFAULT_PIPELINE_CONFIG.keystoneWarpEnabled,
+      manualKeystoneDeg:
+        typeof obj.manualKeystoneDeg === 'number' && Number.isFinite(obj.manualKeystoneDeg)
+          ? clamp(obj.manualKeystoneDeg, -12, 12)
+          : DEFAULT_PIPELINE_CONFIG.manualKeystoneDeg,
       autoCropEnabled:
         typeof obj.autoCropEnabled === 'boolean'
           ? obj.autoCropEnabled
@@ -91,6 +102,10 @@ function loadPersistedConfig(): PipelineConfig {
         typeof obj.autoCorrectStrength === 'number' && Number.isFinite(obj.autoCorrectStrength)
           ? clamp(Math.round(obj.autoCorrectStrength), 0, 100)
           : DEFAULT_PIPELINE_CONFIG.autoCorrectStrength,
+      wbProfile:
+        obj.wbProfile === 'ambient' || obj.wbProfile === 'neutral'
+          ? obj.wbProfile
+          : DEFAULT_PIPELINE_CONFIG.wbProfile,
       aspectPreset:
         typeof obj.aspectPreset === 'string' &&
         VALID_ASPECT_PRESETS.includes(obj.aspectPreset as AspectRatioPreset)
@@ -939,7 +954,7 @@ export default function App() {
 
           {/* Canvas Stage */}
           <div className="flex-1 min-h-0 flex items-center justify-center overflow-hidden p-2 sm:p-4">
-            <DarkroomCanvas
+            <StudioCanvas
               key={activePhoto.id}
               photo={activePhoto}
               config={config}

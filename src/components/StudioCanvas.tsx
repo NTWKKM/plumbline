@@ -11,9 +11,11 @@ import {
   PipelineTelemetryUpdate,
   analyzeAutoCorrection,
   applyAutoCorrectionToRgba,
+  applyProjectiveKeystoneWarpToRgba,
   clamp,
   computeFrameLayout,
   computeInscribedCrop,
+  computeSmartInscribedCrop,
   computeSplitDividerX,
   detectHorizonTiltFromGrayscale,
   formatExifSummaryLine,
@@ -32,10 +34,18 @@ const ATELIER_CANVAS_ACCENT = '#3b5878';
 const ATELIER_CANVAS_ACCENT_SOFT = '#93b4d4';
 const ATELIER_CANVAS_MAT = '#e6e1d7';
 
+interface SaliencyBuffer {
+  gray: Uint8Array;
+  rgba: Uint8ClampedArray;
+  width: number;
+  height: number;
+}
+
 interface SensorAnalysisResult {
   sensorCanvas: HTMLCanvasElement;
   analysis: LevelingAnalysis;
   autoCorrect: AutoCorrectAnalysis;
+  saliency: SaliencyBuffer | null;
 }
 
 interface ProcessedFramePipeline {
@@ -50,7 +60,8 @@ function buildSensorAndAnalysis(
   img: HTMLImageElement,
   photo: StudioPhotoItem,
   maxAutoAngleDeg: number,
-  pixelAreaBudget?: number
+  pixelAreaBudget?: number,
+  wbProfile: PipelineConfig['wbProfile'] = 'ambient'
 ): SensorAnalysisResult | null {
   const rawW = img.naturalWidth || 1600;
   const rawH = img.naturalHeight || 1200;
@@ -86,6 +97,7 @@ function buildSensorAndAnalysis(
   const dCtx = detectCanvas.getContext('2d');
   let detected: LevelingAnalysis = DEFAULT_LEVELING_ANALYSIS;
   let autoCorr: AutoCorrectAnalysis = DEFAULT_AUTO_CORRECT_ANALYSIS;
+  let saliency: SaliencyBuffer | null = null;
 
   if (dCtx) {
     dCtx.drawImage(offscreen, 0, 0, dw, dh);
@@ -97,11 +109,12 @@ function buildSensorAndAnalysis(
         0.299 * imgData[idx] + 0.587 * imgData[idx + 1] + 0.114 * imgData[idx + 2]
       );
     }
+    saliency = { gray, rgba: imgData, width: dw, height: dh };
     detected = detectHorizonTiltFromGrayscale(gray, dw, dh, maxAutoAngleDeg);
-    autoCorr = analyzeAutoCorrection(imgData, dw, dh);
+    autoCorr = analyzeAutoCorrection(imgData, dw, dh, wbProfile);
   }
 
-  return { sensorCanvas: offscreen, analysis: detected, autoCorrect: autoCorr };
+  return { sensorCanvas: offscreen, analysis: detected, autoCorrect: autoCorr, saliency };
 }
 
 function buildProcessedFramePipeline(
@@ -109,18 +122,33 @@ function buildProcessedFramePipeline(
   photo: StudioPhotoItem,
   config: PipelineConfig,
   analysis: LevelingAnalysis,
-  autoCorrect: AutoCorrectAnalysis
+  autoCorrect: AutoCorrectAnalysis,
+  saliency?: { gray: Uint8Array; width: number; height: number } | null
 ): ProcessedFramePipeline | null {
   const srcW = sensorCanvas.width;
   const srcH = sensorCanvas.height;
 
   const autoRot = config.autoLevelEnabled ? analysis.appliedRotationDeg : 0;
   const totalRotDeg = Number((autoRot + config.manualAngleOffsetDeg).toFixed(2));
+  const autoKeystone =
+    (config.keystoneWarpEnabled ?? true) ? (analysis.appliedKeystoneDeg ?? 0) : 0;
+  const totalKeystoneDeg = Number(
+    (autoKeystone + (config.manualKeystoneDeg ?? 0)).toFixed(2)
+  );
   const corrEnabled = config.autoCorrectEnabled ?? true;
   const corrStrength = config.autoCorrectStrength ?? 75;
 
   const crop = config.autoCropEnabled
-    ? computeInscribedCrop(srcW, srcH, totalRotDeg, config.preserveAspectRatioInCrop)
+    ? computeSmartInscribedCrop(
+        srcW,
+        srcH,
+        totalRotDeg,
+        config.preserveAspectRatioInCrop,
+        undefined,
+        saliency?.gray,
+        saliency?.width,
+        saliency?.height
+      )
     : {
         x: 0,
         y: 0,
@@ -153,15 +181,27 @@ function buildProcessedFramePipeline(
   rCtx.drawImage(sensorCanvas, -srcW / 2, -srcH / 2);
   rCtx.restore();
 
-  if (corrEnabled && corrStrength > 0 && crop.width > 0 && crop.height > 0) {
+  const needsKeystone = Math.abs(totalKeystoneDeg) >= 0.02;
+  const needsAutoCorr = corrEnabled && corrStrength > 0;
+  if ((needsKeystone || needsAutoCorr) && crop.width > 0 && crop.height > 0) {
     const croppedData = rCtx.getImageData(crop.x, crop.y, crop.width, crop.height);
-    applyAutoCorrectionToRgba(
-      croppedData.data,
-      crop.width,
-      crop.height,
-      autoCorrect,
-      corrStrength
-    );
+    if (needsKeystone) {
+      applyProjectiveKeystoneWarpToRgba(
+        croppedData.data,
+        crop.width,
+        crop.height,
+        totalKeystoneDeg
+      );
+    }
+    if (needsAutoCorr) {
+      applyAutoCorrectionToRgba(
+        croppedData.data,
+        crop.width,
+        crop.height,
+        autoCorrect,
+        corrStrength
+      );
+    }
     rCtx.putImageData(croppedData, crop.x, crop.y);
   }
 
@@ -244,7 +284,7 @@ function buildProcessedFramePipeline(
 }
 
 /**
- * Renders a queued photo offscreen through the full leveling, inscribed-crop,
+ * Renders a queued photo offscreen through the full leveling, keystone warp, smart inscribed-crop,
  * tone-correction, and framing pipeline for batch JPEG export.
  */
 export async function renderPhotoToFramedCanvas(
@@ -264,7 +304,8 @@ export async function renderPhotoToFramedCanvas(
     img,
     photo,
     config.maxAutoAngleDeg,
-    config.pixelAreaBudget
+    config.pixelAreaBudget,
+    config.wbProfile ?? 'ambient'
   );
   if (!sensorResult) {
     throw new Error(`Canvas context unavailable for ${photo.fileName}`);
@@ -275,7 +316,8 @@ export async function renderPhotoToFramedCanvas(
     photo,
     config,
     sensorResult.analysis,
-    sensorResult.autoCorrect
+    sensorResult.autoCorrect,
+    sensorResult.saliency
   );
   if (!pipeline) {
     throw new Error(`Unable to render framed output for ${photo.fileName}`);
@@ -290,7 +332,7 @@ export async function renderPhotoToFramedCanvas(
   };
 }
 
-interface DarkroomCanvasProps {
+interface StudioCanvasProps {
   photo: StudioPhotoItem;
   config: PipelineConfig;
   viewMode: CanvasViewMode;
@@ -307,7 +349,7 @@ interface DarkroomCanvasProps {
   onZoomLevelChange?: (zoom: number) => void;
 }
 
-export const DarkroomCanvas: React.FC<DarkroomCanvasProps> = ({
+export const StudioCanvas: React.FC<StudioCanvasProps> = ({
   photo,
   config,
   viewMode,
@@ -337,6 +379,13 @@ export const DarkroomCanvas: React.FC<DarkroomCanvasProps> = ({
   const panStartRef = useRef({ clientX: 0, clientY: 0, offsetX: 0, offsetY: 0 });
   const callbackRef = useRef(onAnalysisUpdate);
   callbackRef.current = onAnalysisUpdate;
+
+  const saliencyBufferRef = useRef<{
+    gray: Uint8Array;
+    rgba: Uint8ClampedArray;
+    width: number;
+    height: number;
+  } | null>(null);
 
   // Cache processed full-resolution rotCanvas and framed output across interactive split drags
   const pipelineCacheRef = useRef<{
@@ -375,6 +424,7 @@ export const DarkroomCanvas: React.FC<DarkroomCanvasProps> = ({
         config.pixelAreaBudget
       );
       if (!result) return;
+      saliencyBufferRef.current = result.saliency;
       setSensorCanvas(result.sensorCanvas);
       setAnalysis(result.analysis);
       setAutoCorrect(result.autoCorrect);
@@ -407,7 +457,7 @@ export const DarkroomCanvas: React.FC<DarkroomCanvasProps> = ({
     onImageLoaded,
   ]);
 
-  // Step 2: Render the active pipeline stage onto the visible darkroom canvas
+  // Step 2: Render the active pipeline stage onto the visible studio canvas
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas || !sensorCanvas) {
@@ -425,13 +475,30 @@ export const DarkroomCanvas: React.FC<DarkroomCanvasProps> = ({
 
     const autoRot = config.autoLevelEnabled ? analysis.appliedRotationDeg : 0;
     const totalRotDeg = Number((autoRot + config.manualAngleOffsetDeg).toFixed(2));
+    const autoKeystone =
+      (config.keystoneWarpEnabled ?? true) ? (analysis.appliedKeystoneDeg ?? 0) : 0;
+    const totalKeystoneDeg = Number(
+      (autoKeystone + (config.manualKeystoneDeg ?? 0)).toFixed(2)
+    );
     const corrEnabled = config.autoCorrectEnabled ?? true;
     const corrStrength = config.autoCorrectStrength ?? 75;
+    const activeWbProfile = config.wbProfile ?? 'ambient';
+
+    const sal = saliencyBufferRef.current;
+    const activeAutoCorrect =
+      sal && (autoCorrect.wbProfile ?? 'ambient') !== activeWbProfile
+        ? analyzeAutoCorrection(sal.rgba, sal.width, sal.height, activeWbProfile)
+        : autoCorrect;
+
+    if (activeAutoCorrect !== autoCorrect) {
+      setAutoCorrect(activeAutoCorrect);
+    }
 
     const pipelineKey = [
       photo.id,
       `${srcW}x${srcH}`,
       totalRotDeg,
+      totalKeystoneDeg,
       config.autoCropEnabled,
       config.preserveAspectRatioInCrop,
       config.aspectPreset,
@@ -441,12 +508,13 @@ export const DarkroomCanvas: React.FC<DarkroomCanvasProps> = ({
       config.backgroundColor,
       corrEnabled,
       corrStrength,
-      autoCorrect.exposureEv,
-      autoCorrect.contrast,
-      autoCorrect.shadows,
-      autoCorrect.highlights,
-      autoCorrect.wbTempShift,
-      autoCorrect.wbTintShift,
+      activeWbProfile,
+      activeAutoCorrect.exposureEv,
+      activeAutoCorrect.contrast,
+      activeAutoCorrect.shadows,
+      activeAutoCorrect.highlights,
+      activeAutoCorrect.wbTempShift,
+      activeAutoCorrect.wbTintShift,
       photo.exif.cameraModel,
       photo.exif.lensModel,
       photo.exif.focalLength,
@@ -462,14 +530,14 @@ export const DarkroomCanvas: React.FC<DarkroomCanvasProps> = ({
         photo,
         config,
         analysis,
-        autoCorrect
+        activeAutoCorrect,
+        sal
       );
       if (!pipeline) {
         if (exportCanvasRef) exportCanvasRef.current = null;
         onImageLoaded?.(false);
         return;
       }
-
       pipelineCacheRef.current = {
         sensorCanvas,
         cacheKey: pipelineKey,
@@ -485,7 +553,7 @@ export const DarkroomCanvas: React.FC<DarkroomCanvasProps> = ({
         crop: pipeline.crop,
         layout: pipeline.layout,
         sourceSize: { width: srcW, height: srcH },
-        autoCorrect,
+        autoCorrect: activeAutoCorrect,
       });
     }
 
@@ -581,7 +649,7 @@ export const DarkroomCanvas: React.FC<DarkroomCanvasProps> = ({
       ctx.stroke();
 
       // Central circular handle
-      const handleRadius = Math.max(16, Math.round(layout.canvasWidth * 0.018));
+      const handleRadius = Math.max(14, Math.round(layout.canvasWidth * 0.016));
       const centerY = layout.imageY + layout.imageHeight / 2;
       ctx.fillStyle = ATELIER_CANVAS_INK;
       ctx.beginPath();
@@ -635,7 +703,7 @@ export const DarkroomCanvas: React.FC<DarkroomCanvasProps> = ({
       ctx.textBaseline = 'middle';
       ctx.fillText(beforeText, sideMargin + padX, badgeY + boxH / 2);
 
-      // Right badge
+      // Right label
       const rightX = layout.canvasWidth - sideMargin - afterW;
       ctx.fillStyle = ATELIER_CANVAS_SCRIM;
       ctx.fillRect(rightX, badgeY, afterW, boxH);
@@ -882,7 +950,7 @@ export const DarkroomCanvas: React.FC<DarkroomCanvasProps> = ({
   return (
     <div
       ref={stageContainerRef}
-      className="relative flex h-full w-full items-center justify-center overflow-hidden p-4"
+      className="relative flex h-full w-full items-center justify-center overflow-hidden p-2 sm:p-4"
       data-state={sensorCanvas ? 'ready' : 'loading'}
       data-view-mode={viewMode}
     >
@@ -897,7 +965,7 @@ export const DarkroomCanvas: React.FC<DarkroomCanvasProps> = ({
       )}
       <canvas
         ref={canvasRef}
-        data-testid="darkroom-canvas"
+        data-testid="studio-canvas"
         aria-label={`Framed preview of ${photo.title}`}
         onPointerDown={handlePointerDown}
         onPointerMove={handlePointerMove}
@@ -929,6 +997,7 @@ export const DarkroomCanvas: React.FC<DarkroomCanvasProps> = ({
           <span aria-hidden="true" />
           <button
             type="button"
+            data-testid="pan-up-btn"
             aria-label="Pan up"
             onClick={() => nudgePan(0, 48)}
             className="hit-target-expand flex min-h-[28px] min-w-[28px] items-center justify-center rounded-pill border border-rule bg-paper text-ink hover:bg-paper-3"
@@ -938,6 +1007,7 @@ export const DarkroomCanvas: React.FC<DarkroomCanvasProps> = ({
           <span aria-hidden="true" />
           <button
             type="button"
+            data-testid="pan-left-btn"
             aria-label="Pan left"
             onClick={() => nudgePan(48, 0)}
             className="hit-target-expand flex min-h-[28px] min-w-[28px] items-center justify-center rounded-pill border border-rule bg-paper text-ink hover:bg-paper-3"
@@ -946,6 +1016,7 @@ export const DarkroomCanvas: React.FC<DarkroomCanvasProps> = ({
           </button>
           <button
             type="button"
+            data-testid="pan-reset-btn"
             aria-label="Center pan"
             onClick={() => onPanOffsetChange({ x: 0, y: 0 })}
             disabled={panOffset.x === 0 && panOffset.y === 0}
@@ -955,6 +1026,7 @@ export const DarkroomCanvas: React.FC<DarkroomCanvasProps> = ({
           </button>
           <button
             type="button"
+            data-testid="pan-right-btn"
             aria-label="Pan right"
             onClick={() => nudgePan(-48, 0)}
             className="hit-target-expand flex min-h-[28px] min-w-[28px] items-center justify-center rounded-pill border border-rule bg-paper text-ink hover:bg-paper-3"
@@ -964,6 +1036,7 @@ export const DarkroomCanvas: React.FC<DarkroomCanvasProps> = ({
           <span aria-hidden="true" />
           <button
             type="button"
+            data-testid="pan-down-btn"
             aria-label="Pan down"
             onClick={() => nudgePan(0, -48)}
             className="hit-target-expand flex min-h-[28px] min-w-[28px] items-center justify-center rounded-pill border border-rule bg-paper text-ink hover:bg-paper-3"
@@ -976,6 +1049,8 @@ export const DarkroomCanvas: React.FC<DarkroomCanvasProps> = ({
     </div>
   );
 };
+
+export const DarkroomCanvas = StudioCanvas;
 
 function isHexColorDark(hex: string): boolean {
   const clean = hex.replace('#', '');
