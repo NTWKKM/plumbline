@@ -4,7 +4,17 @@
  */
 
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { Grid, ImagePlus, ZoomIn, ZoomOut } from 'lucide-react';
+import { Grid, ImagePlus, Keyboard, Redo2, Undo2, X, ZoomIn, ZoomOut } from 'lucide-react';
+import { ShortcutsDialog } from './components/ShortcutsDialog';
+import {
+  HistoryState,
+  canRedo,
+  canUndo,
+  createHistory,
+  pushHistory,
+  redoHistory,
+  undoHistory,
+} from './utils/history';
 import {
   CanvasViewMode,
   StudioCanvas,
@@ -38,6 +48,12 @@ const CONFIG_STORAGE_KEY = 'plumbline.pipelineConfig.v1';
 const VIEW_STORAGE_KEY = 'plumbline.viewState.v1';
 const VALID_ASPECT_PRESETS: AspectRatioPreset[] = ['1:1', '4:5', '16:9', '3:2', 'original'];
 const VALID_VIEW_MODES: CanvasViewMode[] = ['framed', 'split', 'geometry', 'original'];
+const VIEW_MODE_OPTIONS: { value: CanvasViewMode; label: string; short: string }[] = [
+  { value: 'framed', label: 'Framed output', short: 'Framed' },
+  { value: 'split', label: 'Before and after', short: 'Split' },
+  { value: 'geometry', label: 'Crop box', short: 'Crop' },
+  { value: 'original', label: 'Original', short: 'Original' },
+];
 
 const DEFAULT_PIPELINE_CONFIG: PipelineConfig = {
   autoLevelEnabled: true,
@@ -184,14 +200,77 @@ function getInitialPhotos(tiltOverrides: Record<string, number>): StudioPhotoIte
   );
 }
 
+/** One undoable step: the global pipeline config plus per-photo sensor tilt. */
+interface EditSnapshot {
+  config: PipelineConfig;
+  tilts: Record<string, number>;
+}
+
+/** Names of the config fields that differ, used to coalesce slider drags into one undo step. */
+function diffConfigKeys(a: PipelineConfig, b: PipelineConfig): string {
+  return (Object.keys(b) as (keyof PipelineConfig)[])
+    .filter((k) => !Object.is(a[k], b[k]))
+    .sort()
+    .join(',');
+}
+
+type DirectoryHandle = {
+  getFileHandle: (
+    name: string,
+    options: { create: boolean }
+  ) => Promise<{ createWritable: () => Promise<{ write: (b: Blob) => Promise<void>; close: () => Promise<void> }> }>;
+};
+
+function supportsDirectoryPicker(): boolean {
+  return typeof window !== 'undefined' && 'showDirectoryPicker' in window;
+}
+
+function uniqueFileName(name: string, used: Set<string>): string {
+  if (!used.has(name)) {
+    used.add(name);
+    return name;
+  }
+  const dot = name.lastIndexOf('.');
+  const stem = dot > 0 ? name.slice(0, dot) : name;
+  const ext = dot > 0 ? name.slice(dot) : '';
+  let n = 2;
+  while (used.has(`${stem}-${n}${ext}`)) n += 1;
+  const out = `${stem}-${n}${ext}`;
+  used.add(out);
+  return out;
+}
+
+function downloadBlob(blob: Blob, fileName: string): void {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = fileName;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
 export default function App() {
   const initialView = useRef(loadPersistedViewState()).current;
   const [photos, setPhotos] = useState<StudioPhotoItem[]>(() =>
     getInitialPhotos(initialView.tiltOverrides)
   );
   const [selectedId, setSelectedId] = useState<string>(INITIAL_SAMPLE_PHOTOS[0].id);
-  const [config, setConfig] = useState<PipelineConfig>(() => loadPersistedConfig());
+  const [history, setHistory] = useState<HistoryState<EditSnapshot>>(() =>
+    createHistory<EditSnapshot>({
+      config: loadPersistedConfig(),
+      tilts: Object.fromEntries(
+        getInitialPhotos(initialView.tiltOverrides).map((p) => [p.id, p.simulatedSensorTiltDeg])
+      ),
+    })
+  );
+  const config = history.present.config;
+  const historyTilts = history.present.tilts;
   const [viewMode, setViewMode] = useState<CanvasViewMode>(initialView.viewMode);
+  const [isPeekingOriginal, setIsPeekingOriginal] = useState<boolean>(false);
+  const [isShortcutsOpen, setIsShortcutsOpen] = useState<boolean>(false);
+  const [exportedIds, setExportedIds] = useState<Set<string>>(() => new Set());
   const [mobileTab, setMobileTab] = useState<'canvas' | 'adjust' | 'queue'>('canvas');
   const [splitPercent, setSplitPercent] = useState<number>(50);
   const [showHorizonGrid, setShowHorizonGrid] = useState<boolean>(initialView.showHorizonGrid);
@@ -239,6 +318,42 @@ export default function App() {
   const dragDepthRef = useRef<number>(0);
 
   const activePhoto = photos.find((p) => p.id === selectedId) || photos[0];
+  const effectiveViewMode: CanvasViewMode = isPeekingOriginal ? 'original' : viewMode;
+
+  // Config edits go through the undo history; same-field edits in quick succession coalesce.
+  const setConfig = useCallback(
+    (updater: PipelineConfig | ((prev: PipelineConfig) => PipelineConfig)) => {
+      setHistory((h) => {
+        const prev = h.present.config;
+        const next = typeof updater === 'function' ? updater(prev) : updater;
+        const key = diffConfigKeys(prev, next);
+        if (!key) return h;
+        return pushHistory(h, { ...h.present, config: next }, { key: `config:${key}` });
+      });
+    },
+    []
+  );
+
+  // Photos follow the tilt values held in history, so undo/redo restores tilt too.
+  useEffect(() => {
+    setPhotos((prev) => {
+      let changed = false;
+      const next = prev.map((item) => {
+        const t = historyTilts[item.id];
+        if (typeof t === 'number' && t !== item.simulatedSensorTiltDeg) {
+          changed = true;
+          return { ...item, simulatedSensorTiltDeg: t };
+        }
+        return item;
+      });
+      return changed ? next : prev;
+    });
+  }, [historyTilts]);
+
+  const handleUndo = useCallback(() => setHistory((h) => undoHistory(h)), []);
+  const handleRedo = useCallback(() => setHistory((h) => redoHistory(h)), []);
+  const undoAvailable = canUndo(history);
+  const redoAvailable = canRedo(history);
 
   // Persist pipeline config and workspace preferences locally
   useEffect(() => {
@@ -289,22 +404,56 @@ export default function App() {
 
   const handleChangeSimulatedTilt = useCallback(
     (deg: number) => {
-      setPhotos((prev) =>
-        prev.map((item) =>
-          item.id === activePhoto.id ? { ...item, simulatedSensorTiltDeg: deg } : item
-        )
-      );
+      const id = activePhoto.id;
+      setHistory((h) => {
+        if (h.present.tilts[id] === deg) return h;
+        return pushHistory(
+          h,
+          { ...h.present, tilts: { ...h.present.tilts, [id]: deg } },
+          { key: `tilt:${id}` }
+        );
+      });
     },
     [activePhoto.id]
   );
 
+  // Reset is one undo step (config and the active photo's tilt together), so R is never destructive.
   const handleResetAll = useCallback(() => {
-    setConfig(DEFAULT_PIPELINE_CONFIG);
+    const id = activePhoto.id;
+    setHistory((h) =>
+      pushHistory(h, {
+        config: DEFAULT_PIPELINE_CONFIG,
+        tilts: { ...h.present.tilts, [id]: 0 },
+      })
+    );
     setSplitPercent(50);
     setZoomLevel(1);
     setPanOffset({ x: 0, y: 0 });
-    handleChangeSimulatedTilt(0);
-  }, [handleChangeSimulatedTilt]);
+  }, [activePhoto.id]);
+
+  const handleRemovePhoto = useCallback(
+    (id: string) => {
+      if (photos.length <= 1) return;
+      const idx = photos.findIndex((p) => p.id === id);
+      if (idx < 0) return;
+      const removed = photos[idx];
+      const next = photos.filter((p) => p.id !== id);
+      if (id === activePhoto.id) {
+        setSelectedId(next[Math.min(idx, next.length - 1)].id);
+      }
+      setPhotos(next);
+      if (removed.id.startsWith('imported-') && removed.src.startsWith('blob:')) {
+        URL.revokeObjectURL(removed.src);
+      }
+      setExportedIds((prev) => {
+        if (!prev.has(id)) return prev;
+        const next = new Set(prev);
+        next.delete(id);
+        return next;
+      });
+    },
+    [activePhoto.id, photos]
+  );
 
   const importFiles = useCallback(async (files: File[]) => {
     const imageFiles = files.filter((file) =>
@@ -383,11 +532,72 @@ export default function App() {
     e.target.value = '';
   };
 
+  // Paste images straight from the clipboard into the queue
+  useEffect(() => {
+    const onPaste = (e: ClipboardEvent) => {
+      const files = Array.from(e.clipboardData?.files ?? []);
+      if (files.length === 0) return;
+      e.preventDefault();
+      void importFiles(files);
+    };
+    window.addEventListener('paste', onPaste);
+    return () => window.removeEventListener('paste', onPaste);
+  }, [importFiles]);
+
+  // Hold backslash to peek at the untouched original; release to return
+  useEffect(() => {
+    const isPeekKey = (e: KeyboardEvent) => e.key === '\\' && !e.metaKey && !e.ctrlKey && !e.altKey;
+    const onDown = (e: KeyboardEvent) => {
+      const t = e.target as HTMLElement | null;
+      if (t && (t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
+      if (isPeekKey(e)) {
+        e.preventDefault();
+        if (!e.repeat) setIsPeekingOriginal(true);
+      }
+    };
+    const onUp = (e: KeyboardEvent) => {
+      if (e.key === '\\') setIsPeekingOriginal(false);
+    };
+    const onBlur = () => setIsPeekingOriginal(false);
+    window.addEventListener('keydown', onDown);
+    window.addEventListener('keyup', onUp);
+    window.addEventListener('blur', onBlur);
+    return () => {
+      window.removeEventListener('keydown', onDown);
+      window.removeEventListener('keyup', onUp);
+      window.removeEventListener('blur', onBlur);
+    };
+  }, []);
+
   // Global keyboard shortcuts for studio navigation and inspection
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
-      if (e.metaKey || e.ctrlKey || e.altKey) return;
       const target = e.target as HTMLElement | null;
+      const isTextEntry =
+        !!target &&
+        (target.tagName === 'TEXTAREA' ||
+          target.isContentEditable ||
+          (target.tagName === 'INPUT' &&
+            ['text', 'search', 'email', 'url', 'number', 'password'].includes(
+              (target as HTMLInputElement).type
+            )));
+
+      // Undo / redo work from anywhere except text entry, including while a slider has focus
+      if ((e.metaKey || e.ctrlKey) && !e.altKey && !isTextEntry) {
+        const key = e.key.toLowerCase();
+        if (key === 'z' && !e.shiftKey) {
+          e.preventDefault();
+          handleUndo();
+          return;
+        }
+        if ((key === 'z' && e.shiftKey) || key === 'y') {
+          e.preventDefault();
+          handleRedo();
+          return;
+        }
+      }
+
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
       if (
         target &&
         (target.tagName === 'INPUT' ||
@@ -397,12 +607,16 @@ export default function App() {
       ) {
         return;
       }
+      if (isShortcutsOpen) return;
 
       if (e.key === ' ' && target && (target.tagName === 'BUTTON' || target.tagName === 'SUMMARY' || target.tagName === 'A')) {
         return;
       }
 
-      if (e.key === 'g' || e.key === 'G') {
+      if (e.key === '?') {
+        e.preventDefault();
+        setIsShortcutsOpen(true);
+      } else if (e.key === 'g' || e.key === 'G') {
         e.preventDefault();
         setShowHorizonGrid((prev) => !prev);
       } else if (e.key === 'b' || e.key === 'B' || e.key === ' ') {
@@ -433,13 +647,31 @@ export default function App() {
 
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [activePhoto.id, handleResetAll, handleZoomChange, photos, zoomLevel]);
+  }, [
+    activePhoto.id,
+    handleRedo,
+    handleResetAll,
+    handleUndo,
+    handleZoomChange,
+    isShortcutsOpen,
+    photos,
+    zoomLevel,
+  ]);
 
-  const encodeAndDownloadFramedCanvas = async (
+  const markExported = useCallback((id: string) => {
+    setExportedIds((prev) => {
+      if (prev.has(id)) return prev;
+      const next = new Set(prev);
+      next.add(id);
+      return next;
+    });
+  }, []);
+
+  const encodeFramedCanvas = async (
     canvas: HTMLCanvasElement,
     photoItem: StudioPhotoItem,
     photoSourceSize: { width: number; height: number }
-  ): Promise<{ outName: string; exifPreserved: boolean }> => {
+  ): Promise<{ blob: Blob; outName: string; exifPreserved: boolean }> => {
     const quality = Math.max(0.7, Math.min(1.0, config.jpegQuality / 100));
     const blob = await new Promise<Blob | null>((resolve) =>
       canvas.toBlob((b) => resolve(b), 'image/jpeg', quality)
@@ -467,18 +699,10 @@ export default function App() {
       exifPreserved = injectResult.exifPreserved;
     }
 
-    const url = URL.createObjectURL(finalBlob);
-    const a = document.createElement('a');
     const baseName = photoItem.fileName.replace(/\.[^.]+$/, '');
     const outName = `${baseName}_whiteborder_${config.aspectPreset.replace(':', 'x')}.jpg`;
-    a.href = url;
-    a.download = outName;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    setTimeout(() => URL.revokeObjectURL(url), 1000);
 
-    return { outName, exifPreserved };
+    return { blob: finalBlob, outName, exifPreserved };
   };
 
   const handleExportJpeg = async () => {
@@ -493,11 +717,13 @@ export default function App() {
         return;
       }
 
-      const { outName, exifPreserved } = await encodeAndDownloadFramedCanvas(
+      const { blob, outName, exifPreserved } = await encodeFramedCanvas(
         canvas,
         activePhoto,
         sourceSize
       );
+      downloadBlob(blob, outName);
+      markExported(activePhoto.id);
 
       setExportBanner(
         `Exported ${outName} (${canvas.width} × ${canvas.height} px, ${
@@ -514,21 +740,51 @@ export default function App() {
 
   const handleBatchExportAll = async () => {
     if (photos.length === 0) return;
+
+    // Where the browser allows it, write the whole queue into one chosen folder
+    // instead of firing a download per photo (which browsers throttle or block).
+    let directory: DirectoryHandle | null = null;
+    if (supportsDirectoryPicker()) {
+      try {
+        directory = await (
+          window as unknown as {
+            showDirectoryPicker: (o: { mode: 'readwrite'; id?: string }) => Promise<DirectoryHandle>;
+          }
+        ).showDirectoryPicker({ mode: 'readwrite', id: 'plumbline-export' });
+      } catch (err) {
+        if (err instanceof DOMException && err.name === 'AbortError') return;
+        directory = null;
+      }
+    }
+
     setIsBatchExporting(true);
     setExportBanner(null);
     setErrorNotice(null);
 
     let exportedCount = 0;
+    const usedNames = new Set<string>();
     try {
       for (let i = 0; i < photos.length; i++) {
         const item = photos[i];
-        setExportBanner(`Batch exporting ${i + 1} of ${photos.length}: ${item.title}…`);
+        setExportBanner(`Exporting ${i + 1} of ${photos.length}: ${item.title}…`);
         const { canvas, sourceSize: itemSourceSize } = await renderPhotoToFramedCanvas(item, config);
-        await encodeAndDownloadFramedCanvas(canvas, item, itemSourceSize);
+        const { blob, outName } = await encodeFramedCanvas(canvas, item, itemSourceSize);
+        const fileName = uniqueFileName(outName, usedNames);
+        if (directory) {
+          const handle = await directory.getFileHandle(fileName, { create: true });
+          const writable = await handle.createWritable();
+          await writable.write(blob);
+          await writable.close();
+        } else {
+          downloadBlob(blob, fileName);
+        }
+        markExported(item.id);
         exportedCount += 1;
       }
       setExportBanner(
-        `Triggered ${exportedCount} framed JPEG download ${exportedCount === 1 ? 'request' : 'requests'} (${config.aspectPreset}). Your browser may prompt for or block additional downloads.`
+        directory
+          ? `Saved ${exportedCount} framed ${exportedCount === 1 ? 'JPEG' : 'JPEGs'} (${config.aspectPreset}) to the chosen folder.`
+          : `Triggered ${exportedCount} framed JPEG download ${exportedCount === 1 ? 'request' : 'requests'} (${config.aspectPreset}). Your browser may prompt for or block additional downloads.`
       );
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -637,9 +893,6 @@ export default function App() {
           <span className="border-l border-rule pl-3 font-mono tabular-nums whitespace-nowrap">
             {sourceSize.width} × {sourceSize.height} px
           </span>
-          <span className="border-l border-rule pl-3 whitespace-nowrap text-muted">
-            Keys: B split, G grid, R reset
-          </span>
         </div>
 
         {/* Mobile View Switcher Tabs (Only visible on screens < 1024px) */}
@@ -675,13 +928,48 @@ export default function App() {
 
         {/* Zone 3: Primary Import Action (quiet hairline button in masthead; filled primary lives on Export) */}
         <div className="flex items-center gap-2 shrink-0">
+          <div className="flex items-center rounded-pill border border-rule bg-paper p-0.5" role="group" aria-label="History">
+            <button
+              type="button"
+              onClick={handleUndo}
+              disabled={!undoAvailable}
+              aria-label="Undo"
+              title="Undo"
+              className="icon-btn"
+            >
+              <Undo2 className="h-3.5 w-3.5" aria-hidden="true" />
+            </button>
+            <button
+              type="button"
+              onClick={handleRedo}
+              disabled={!redoAvailable}
+              aria-label="Redo"
+              title="Redo"
+              className="icon-btn"
+            >
+              <Redo2 className="h-3.5 w-3.5" aria-hidden="true" />
+            </button>
+          </div>
+          {/* Wrapper carries the breakpoint: unlayered .btn display would beat a layered `hidden` utility */}
+          <span className="hidden md:contents">
+            <button
+              type="button"
+              onClick={() => setIsShortcutsOpen(true)}
+              aria-label="Keyboard shortcuts"
+              title="Keyboard shortcuts (?)"
+              className="btn btn--quiet btn--sm shrink-0"
+            >
+              <Keyboard className="h-3.5 w-3.5" aria-hidden="true" />
+              <span className="hidden xl:inline">Shortcuts</span>
+            </button>
+          </span>
           <button
             type="button"
             onClick={() => fileInputRef.current?.click()}
             className="btn btn--quiet btn--sm shrink-0"
           >
             <ImagePlus className="h-3.5 w-3.5" aria-hidden="true" />
-            <span className="hidden sm:inline">Import Photo</span>
+            <span className="hidden sm:inline">Import photos</span>
             <span className="sm:hidden">Import</span>
           </button>
         </div>
@@ -743,7 +1031,7 @@ export default function App() {
         >
           <div className="flex items-center justify-between border-b border-rule px-4 py-3 shrink-0">
             <h2 className="font-display text-sm font-normal text-ink">
-              Filmstrip Queue ({photos.length})
+              Filmstrip queue ({photos.length})
             </h2>
             <button
               type="button"
@@ -757,16 +1045,17 @@ export default function App() {
           <div className="flex lg:flex-col gap-2.5 overflow-x-auto lg:overflow-y-auto p-3 flex-1 min-h-0">
             {photos.map((item) => {
               const isSelected = item.id === activePhoto.id;
+              const isExported = exportedIds.has(item.id);
               return (
+                <div key={item.id} className="filmstrip-item relative w-56 lg:w-full shrink-0 min-w-0">
                 <button
-                  key={item.id}
                   type="button"
                   aria-pressed={isSelected}
                   onClick={() => {
                     setSelectedId(item.id);
                     if (mobileTab === 'queue') setMobileTab('canvas');
                   }}
-                  className={`flex w-56 lg:w-full shrink-0 flex-col p-2 text-left transition-colors min-w-0 ${
+                  className={`flex w-full flex-col p-2 text-left transition-colors min-w-0 ${
                     isSelected
                       ? 'atelier-stock border-ink text-ink'
                       : 'border border-rule bg-paper hover:bg-paper-3 hover:border-ink-2 text-ink-2'
@@ -783,8 +1072,13 @@ export default function App() {
                     />
                   </div>
                   <div className="mt-2 min-w-0 w-full">
-                    <div className="truncate text-xs font-medium text-ink">
-                      {item.title}
+                    <div className="flex items-baseline justify-between gap-2 min-w-0">
+                      <span className="truncate text-xs font-medium text-ink min-w-0">
+                        {item.title}
+                      </span>
+                      {isExported && (
+                        <span className="shrink-0 text-xs text-success">Exported</span>
+                      )}
                     </div>
                     <div className="mt-1 flex items-center justify-between gap-2 text-xs text-muted font-mono tabular-nums">
                       <span className="truncate min-w-0">{item.fileName}</span>
@@ -794,15 +1088,28 @@ export default function App() {
                     </div>
                   </div>
                 </button>
+                {photos.length > 1 && (
+                  <button
+                    type="button"
+                    onClick={() => handleRemovePhoto(item.id)}
+                    aria-label={`Remove ${item.title} from the queue`}
+                    title="Remove from queue"
+                    className="filmstrip-remove icon-btn absolute right-3.5 top-3.5 z-raised border border-rule bg-paper"
+                  >
+                    <X className="h-3.5 w-3.5" aria-hidden="true" />
+                  </button>
+                )}
+                </div>
               );
             })}
 
             <button
               type="button"
               onClick={() => fileInputRef.current?.click()}
-              className="hidden lg:flex w-full shrink-0 items-center justify-center border border-dashed border-rule bg-paper px-3 py-3 text-center text-xs text-muted whitespace-nowrap transition-colors hover:border-ink-2 hover:text-ink"
+              className="hidden lg:flex w-full shrink-0 flex-col items-center justify-center gap-0.5 border border-dashed border-rule bg-paper px-3 py-3 text-center text-xs text-muted transition-colors hover:border-ink-2 hover:text-ink"
             >
-              Drop or browse files
+              <span>Drop or browse files</span>
+              <span className="text-muted">or paste an image</span>
             </button>
           </div>
         </aside>
@@ -822,54 +1129,27 @@ export default function App() {
               role="group"
               aria-label="Canvas Inspection Mode"
             >
-              <button
-                type="button"
-                aria-pressed={viewMode === 'framed'}
-                onClick={() => setViewMode('framed')}
-                className={`min-h-[32px] rounded-pill px-2.5 py-1 text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${
-                  viewMode === 'framed'
-                    ? 'bg-ink text-paper'
-                    : 'text-muted hover:text-ink'
-                }`}
-              >
-                Framed Output
-              </button>
-              <button
-                type="button"
-                aria-pressed={viewMode === 'split'}
-                onClick={() => setViewMode('split')}
-                className={`min-h-[32px] rounded-pill px-2.5 py-1 text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${
-                  viewMode === 'split'
-                    ? 'bg-accent text-accent-ink'
-                    : 'text-muted hover:text-ink'
-                }`}
-              >
-                Before / After Split
-              </button>
-              <button
-                type="button"
-                aria-pressed={viewMode === 'geometry'}
-                onClick={() => setViewMode('geometry')}
-                className={`min-h-[32px] rounded-pill px-2.5 py-1 text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${
-                  viewMode === 'geometry'
-                    ? 'bg-ink text-paper'
-                    : 'text-muted hover:text-ink'
-                }`}
-              >
-                Inscribed Crop Box
-              </button>
-              <button
-                type="button"
-                aria-pressed={viewMode === 'original'}
-                onClick={() => setViewMode('original')}
-                className={`min-h-[32px] rounded-pill px-2.5 py-1 text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${
-                  viewMode === 'original'
-                    ? 'bg-ink text-paper'
-                    : 'text-muted hover:text-ink'
-                }`}
-              >
-                Original Sensor
-              </button>
+              {VIEW_MODE_OPTIONS.map((opt) => {
+                const active = viewMode === opt.value;
+                return (
+                  <button
+                    key={opt.value}
+                    type="button"
+                    aria-pressed={active}
+                    onClick={() => setViewMode(opt.value)}
+                    className={`min-h-[32px] rounded-pill px-2.5 py-1 text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${
+                      active
+                        ? opt.value === 'split'
+                          ? 'bg-accent text-accent-ink'
+                          : 'bg-ink text-paper'
+                        : 'text-muted hover:text-ink'
+                    }`}
+                  >
+                    <span className="hidden md:inline">{opt.label}</span>
+                    <span className="md:hidden">{opt.short}</span>
+                  </button>
+                );
+              })}
             </div>
 
             <div className="flex flex-wrap items-center gap-2 shrink-0">
@@ -947,19 +1227,24 @@ export default function App() {
                 }`}
               >
                 <Grid className="h-3.5 w-3.5" aria-hidden="true" />
-                <span className="hidden sm:inline">Horizon Grid</span>
+                <span className="hidden sm:inline">Horizon grid</span>
                 <span className="sm:hidden">Grid</span>
               </button>
             </div>
           </div>
 
           {/* Canvas Stage */}
-          <div className="flex-1 min-h-0 flex items-center justify-center overflow-hidden p-2 sm:p-4">
+          <div className="relative flex-1 min-h-0 flex items-center justify-center overflow-hidden p-2 sm:p-4">
+            {isPeekingOriginal && (
+              <p role="status" className="peek-note">
+                Original, release \ to return
+              </p>
+            )}
             <StudioCanvas
               key={activePhoto.id}
               photo={activePhoto}
               config={config}
-              viewMode={viewMode}
+              viewMode={effectiveViewMode}
               splitPercent={splitPercent}
               onSplitPercentChange={setSplitPercent}
               showHorizonGrid={showHorizonGrid}
@@ -991,15 +1276,15 @@ export default function App() {
                 </span>
               )}
             </div>
-            <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+            <div className="grid grid-cols-1 sm:flex sm:flex-wrap sm:items-center gap-x-3 gap-y-1">
               <span>
-                Horizon Tilt: {formatSignedDegrees(analysis.detectedTiltDeg, 2)}
+                Tilt {formatSignedDegrees(analysis.detectedTiltDeg, 2)}
               </span>
-              <span className="border-l border-rule pl-3">
-                Inscribed Crop: {cropRect.width}×{cropRect.height} ({cropRect.areaRetainedPercent}%)
+              <span className="sm:border-l sm:border-rule sm:pl-3">
+                Crop {cropRect.width} × {cropRect.height} ({cropRect.areaRetainedPercent}%)
               </span>
-              <span className="border-l border-rule pl-3">
-                Frame: {frameLayout.canvasWidth}×{frameLayout.canvasHeight} ({config.aspectPreset})
+              <span className="sm:border-l sm:border-rule sm:pl-3">
+                Frame {frameLayout.canvasWidth} × {frameLayout.canvasHeight} ({config.aspectPreset})
               </span>
             </div>
           </footer>
@@ -1024,11 +1309,14 @@ export default function App() {
           isBatchExporting={isBatchExporting}
           queueCount={photos.length}
           isImageLoaded={isImageLoaded}
+          canSaveToFolder={supportsDirectoryPicker()}
           className={`w-full lg:w-[364px] shrink-0 border-t lg:border-t-0 lg:border-l border-rule bg-paper-2 ${
             mobileTab === 'adjust' ? 'flex flex-1 overflow-y-auto' : 'hidden lg:flex'
           }`}
         />
       </main>
+
+      <ShortcutsDialog open={isShortcutsOpen} onClose={() => setIsShortcutsOpen(false)} />
     </div>
   );
 }

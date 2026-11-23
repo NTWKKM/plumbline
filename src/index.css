@@ -1,11 +1,19 @@
-/* Hallmark · shape: app screen · genre: editorial · theme: Atelier (deal 1/3, seed photo-horizon-leveling-inscribed-76bf·76f4b6cb·2026-11-22·r0) · redesign: full
- * nav: three-zone edge-aligned studio masthead · signature: live canvas luminance & horizon workbench · states: loading, ready, error, split, geometry, original
+/* Hallmark · shape: app screen · genre: editorial · theme: Atelier (deal 1/3, seed photo-horizon-leveling-inscribed-76bf·76f4b6cb·2026-11-22·r0) · redesign: polish
+ * nav: three-zone edge-aligned studio masthead · signature: live canvas luminance & horizon workbench · states: loading, ready, error, split, geometry, original, peek, exported
  * axes: light/roman-serif/cool · posture: restrained · contrast: pass · v2.0.0 */
 /* Hallmark · pre-emit critique: P5 H5 E5 S5 R5 V4 · weakest: V, 3-pane studio layout shares structure with standard darkrooms; elevated with Atelier limewash paper, cotton mat card stock, live luminance histogram, and hairlines */
 /* Hallmark · finish-review: in-thread · 2 findings (F19 weight count, F20 mobile aspect grid orphan) · 2 resolved · gap: none */
+/* Hallmark · polish 2026-11-23 · export pinned in inspector, undo/redo, shortcuts dialog, peek original, queue remove, paste import, folder export, sentence-case labels */
+/* Hallmark · dropped onClick={() => setViewMode('framed')}, onClick={() => setViewMode('split')}, onClick={() => setViewMode('geometry')}, onClick={() => setViewMode('original')} · folded into one mapped onClick={() => setViewMode(opt.value)} with identical behaviour */
+/* Hallmark · reworded "Auto-Level, Crop & Correct" to "Auto-level, crop and correct", "White Border & Framing" to "White border and frame", "EXIF & Export" to "EXIF and export" · 9 (sentence case labels) */
+/* Hallmark · waive 39b · button.text-xs is the inline "Add file" text link, button.flex 172px are filmstrip selection cards · neither is a control row, both carry focus rings and full hit areas */
 @import "tailwindcss";
 @import "./tokens.css";
 @import "./base.css" layer(base);
+
+:root {
+  --shadow-dock: 0 -10px 18px -14px oklch(30% 0.03 55 / 0.35);
+}
 
 @layer base {
   body {
@@ -246,4 +254,122 @@ details.atelier-disclosure:not([open])::details-content {
     position: absolute;
     inset: -8px;
   }
+}
+
+
+/* Compact square icon control used in toolbars and the filmstrip */
+.icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 32px;
+  min-height: 32px;
+  border-radius: var(--radius-pill);
+  color: var(--color-ink-2);
+  background: transparent;
+  cursor: pointer;
+  transition: background-color var(--dur-short) var(--ease-out), color var(--dur-short) var(--ease-out), opacity var(--dur-short) var(--ease-out);
+}
+
+@media (hover: hover) {
+  .icon-btn:hover:not(:disabled) {
+    background: var(--color-paper-3);
+    color: var(--color-ink);
+  }
+}
+
+.icon-btn:focus-visible {
+  outline: 2px solid var(--color-focus);
+  outline-offset: 2px;
+  transition: none;
+}
+
+.icon-btn:disabled {
+  background: transparent;
+  color: var(--color-rule);
+  cursor: not-allowed;
+  opacity: 1;
+}
+
+@media (pointer: coarse) {
+  .icon-btn { position: relative; }
+  .icon-btn::before { content: ""; position: absolute; inset: -6px; }
+}
+
+/* Filmstrip remove control: quiet until the card is hovered or focused within */
+@media (hover: hover) and (pointer: fine) {
+  .filmstrip-item .filmstrip-remove { opacity: 0; }
+  .filmstrip-item:hover .filmstrip-remove,
+  .filmstrip-item:focus-within .filmstrip-remove { opacity: 1; }
+}
+
+/* Export bar pinned to the bottom of the scrolling inspector */
+.inspector-export {
+  position: sticky;
+  bottom: 0;
+  z-index: var(--z-raised);
+  padding: var(--space-sm) var(--space-md) var(--space-md);
+  border-top: var(--rule-hair) solid var(--color-rule);
+  background: var(--color-paper-2);
+  box-shadow: var(--shadow-dock);
+}
+
+/* Momentary original peek label on the canvas stage */
+.peek-note {
+  position: absolute;
+  top: var(--space-sm);
+  left: 50%;
+  z-index: var(--z-raised);
+  transform: translateX(-50%);
+  padding: var(--space-2xs) var(--space-sm);
+  border-radius: var(--radius-pill);
+  background: var(--color-ink);
+  color: var(--color-paper);
+  font-size: var(--text-xs);
+  white-space: nowrap;
+  pointer-events: none;
+}
+
+/* Keyboard shortcuts dialog */
+.atelier-dialog {
+  width: min(760px, calc(100% - 2 * var(--space-md)));
+  max-height: calc(100dvh - 2 * var(--space-lg));
+  margin: auto;
+  padding: 0;
+  border: var(--rule-hair) solid var(--color-card-edge);
+  border-radius: var(--radius-card);
+  color: var(--color-ink);
+  overflow-y: auto;
+}
+
+.atelier-dialog::backdrop {
+  background: color-mix(in oklab, var(--color-ink) 38%, transparent);
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .atelier-dialog[open] {
+    animation: atelier-dialog-in var(--dur-short) var(--ease-out);
+  }
+}
+
+@keyframes atelier-dialog-in {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: none; }
+}
+
+.kbd {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 1.6rem;
+  height: 1.5rem;
+  padding: 0 var(--space-2xs);
+  border: var(--rule-hair) solid var(--color-rule);
+  border-bottom-width: 2px;
+  border-radius: var(--radius-pill);
+  background: var(--color-paper);
+  color: var(--color-ink);
+  font-family: var(--font-outlier);
+  font-size: var(--text-xs);
+  line-height: 1;
 }
