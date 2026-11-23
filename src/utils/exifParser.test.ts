@@ -12,6 +12,7 @@ import {
   MAX_RAW_PREVIEW_DECODE_ATTEMPTS,
   readJpegExifOrientation,
   scanJpegStreamForTest,
+  scanRawBufferForTest,
 } from './exifParser';
 
 test('parseExifFromArrayBuffer returns empty fields for missing metadata instead of fabricated Sony defaults', () => {
@@ -1437,6 +1438,59 @@ test('scan budget stops a stream walk at the exact entropy-byte boundary', () =>
   assert.equal(cut.budgetExhausted, true);
 });
 
+test('scan budget charges exactly one unit per entropy byte, independent of the walker', () => {
+  // Two streams identical except for N extra entropy bytes: their cost must differ by exactly N
+  const extraEntropy = 1_000;
+  const small = makeFrameJpeg(600);
+  const large = makeFrameJpeg(600 + extraEntropy);
+  const cost = (jpeg: Uint8Array) => {
+    const budget = { remaining: 100_000 };
+    assert.equal(scanJpegStreamForTest(jpeg, 0, jpeg.length, budget).valid, true);
+    return 100_000 - budget.remaining;
+  };
+  assert.equal(cost(large) - cost(small), extraEntropy);
+});
+
+test('every stream walk in one buffer scan shares a single budget and stops when it is spent', () => {
+  // k SOI+APP1 headers funnel into one long entropy run ended by a nested SOI, so the scan walks
+  // the same long run once per header: k walks of roughly `entropyLen` units each.
+  const k = 8;
+  const header = 6;
+  const entropyLen = 20_000;
+  const tailStart = k * header;
+  const buf = new Uint8Array(tailStart + 40 + entropyLen + 6);
+  for (let i = 0; i < k; i++) {
+    const at = i * header;
+    const segLen = tailStart - at - 4;
+    buf.set([0xff, 0xd8, 0xff, 0xe1, (segLen >> 8) & 0xff, segLen & 0xff], at);
+  }
+  buf.set(
+    [0xff, 0xc0, 0x00, 0x11, 0x08, 0x00, 0x10, 0x00, 0x10, 0x03, 0x01, 0x11, 0x00, 0x02, 0x11, 0x00, 0x03, 0x11, 0x00],
+    tailStart
+  );
+  buf.set([0xff, 0xda, 0x00, 0x0c, 0x03, 0x01, 0x00, 0x02, 0x00, 0x03, 0x00, 0x00, 0x3f, 0x00], tailStart + 19);
+  buf.fill(0x5a, tailStart + 33, tailStart + 33 + entropyLen);
+  buf.set([0xff, 0xd8, 0xff, 0xd9], buf.length - 4);
+
+  // Cost of one walk from the first header, measured alone
+  const single = { remaining: 10_000_000 };
+  scanJpegStreamForTest(buf, 0, buf.length, single);
+  const oneWalk = 10_000_000 - single.remaining;
+  assert.ok(oneWalk > entropyLen, `one walk should cross the entropy run, cost ${oneWalk}`);
+
+  // A budget worth one and a half walks: the second walk must exhaust it, proving the walks
+  // draw from the same budget, and the scan stops immediately at the first unit past zero
+  const shared = { remaining: Math.floor(oneWalk * 1.5) };
+  const result = scanRawBufferForTest(buf, shared);
+  assert.equal(result.budgetExhausted, true);
+  assert.equal(shared.remaining, -1);
+  assert.equal(result.candidateCount, 0);
+
+  // With enough budget for every walk the same scan completes without exhausting it
+  const ample = { remaining: oneWalk * (k + 2) };
+  assert.equal(scanRawBufferForTest(buf, ample).budgetExhausted, false);
+});
+
 test('scan budget charges every 0xFF fill byte, in marker padding and before EOI', () => {
   const fill = 64;
   const base = makeFrameJpeg(600);
@@ -1453,7 +1507,8 @@ test('scan budget charges every 0xFF fill byte, in marker padding and before EOI
   const paddedBudget = { remaining: 10_000 };
   assert.equal(scanJpegStreamForTest(padded, 0, padded.length, paddedBudget).valid, true);
   const extra = (10_000 - paddedBudget.remaining) - (10_000 - baseBudget.remaining);
-  assert.ok(extra >= fill * 2, `fill bytes cost ${extra} units, expected at least ${fill * 2}`);
+  // Exactly one unit per fill byte: `fill` before SOF plus `fill` before EOI
+  assert.equal(extra, fill * 2);
 
   const tooSmall = { remaining: 10_000 - baseBudget.remaining };
   const res = scanJpegStreamForTest(padded, 0, padded.length, tooSmall);

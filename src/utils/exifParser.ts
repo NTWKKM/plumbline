@@ -549,6 +549,19 @@ function scanRawBufferForJpegCandidates(
   return { candidates, deferred };
 }
 
+/**
+ * Test-only entry to the buffer scan with a caller-owned budget, so tests can assert that every
+ * stream walk in one scan draws from the same budget and stops when it is spent.
+ */
+export function scanRawBufferForTest(
+  bytes: Uint8Array,
+  budget: { remaining: number }
+): { candidateCount: number; budgetExhausted: boolean } {
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const { candidates } = scanRawBufferForJpegCandidates(bytes, view, new Set<string>(), budget);
+  return { candidateCount: candidates.length, budgetExhausted: budget.remaining < 0 };
+}
+
 /** Finds decodable streams that start and end inside deferred APP payload ranges. */
 function scanDeferredRanges(
   bytes: Uint8Array,

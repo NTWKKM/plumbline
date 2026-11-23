@@ -27,12 +27,20 @@ echo "Building release binary (v${APP_VERSION})..."
 # Take the executable path from Cargo's compiler-artifact messages, so the bundle always packages
 # the binary this build produced, wherever CARGO_TARGET_DIR or build.target-dir points.
 # json-render-diagnostics keeps human-readable warnings and errors on stderr.
-BUILD_JSON="$(cargo build --release --bin "${BIN_NAME}" --message-format=json-render-diagnostics)"
-BIN_PATH="$(printf '%s\n' "${BUILD_JSON}" \
-    | grep '"reason":"compiler-artifact"' \
-    | grep '"kind":\["bin"\]' \
-    | sed -n 's/.*"executable":"\([^"]*\/'"${BIN_NAME}"'\)".*/\1/p' \
-    | tail -n 1)"
+# Each message is parsed as real JSON with macOS plutil, so escaped characters in the path
+# (backslashes, quotes, unicode escapes) decode correctly.
+json_field() {
+    printf '%s' "$1" | plutil -extract "$2" raw -o - - 2>/dev/null
+}
+
+BIN_PATH=""
+while IFS= read -r message; do
+    [[ "$(json_field "${message}" reason)" == "compiler-artifact" ]] || continue
+    [[ "$(json_field "${message}" target.name)" == "${BIN_NAME}" ]] || continue
+    [[ "$(json_field "${message}" target.kind.0)" == "bin" ]] || continue
+    executable="$(json_field "${message}" executable)" || continue
+    [[ -n "${executable}" ]] && BIN_PATH="${executable}"
+done < <(cargo build --release --bin "${BIN_NAME}" --message-format=json-render-diagnostics)
 if [[ -z "${BIN_PATH}" || ! -x "${BIN_PATH}" ]]; then
     echo "error: cargo did not report an executable for ${BIN_NAME}" >&2
     exit 1

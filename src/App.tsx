@@ -227,9 +227,14 @@ async function directoryHasFile(directory: DirectoryHandle, name: string): Promi
     await directory.getFileHandle(name);
     return true;
   } catch (err) {
-    if (err instanceof DOMException && err.name === 'NotFoundError') return false;
-    // TypeMismatchError (a folder with that name) also means the name is taken
-    return true;
+    if (err instanceof DOMException) {
+      if (err.name === 'NotFoundError') return false;
+      // A folder with that name exists, so the name is taken
+      if (err.name === 'TypeMismatchError') return true;
+    }
+    // NotAllowedError and anything else: rethrow so the batch stops and reports it
+    // instead of probing suffixes forever
+    throw err;
   }
 }
 
