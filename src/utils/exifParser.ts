@@ -118,6 +118,124 @@ export function parseExifFromArrayBuffer(
   return { exif, rawApp1Segment, isRawContainer };
 }
 
+interface JpegStreamScanResult {
+  valid: boolean;
+  endOffset: number;
+  nestedSoiOffset: number;
+}
+
+/**
+ * Walks a JPEG stream from `start` up to `maxEnd`, supporting both single-scan
+ * and progressive/multi-scan JPEGs with length-delimited markers between scans.
+ */
+function scanJpegStream(
+  bytes: Uint8Array,
+  view: DataView,
+  start: number,
+  maxEnd: number
+): JpegStreamScanResult {
+  const invalid: JpegStreamScanResult = { valid: false, endOffset: -1, nestedSoiOffset: -1 };
+  if (
+    start < 0 ||
+    maxEnd - start < 16 ||
+    maxEnd > bytes.length ||
+    bytes[start] !== 0xff ||
+    bytes[start + 1] !== 0xd8 ||
+    bytes[start + 2] !== 0xff
+  ) {
+    return invalid;
+  }
+
+  let cursor = start + 2;
+  let hasSof = false;
+  let hasSos = false;
+
+  while (cursor + 1 < maxEnd) {
+    if (bytes[cursor] !== 0xff) return invalid;
+    while (cursor < maxEnd && bytes[cursor] === 0xff) {
+      cursor++;
+    }
+    if (cursor >= maxEnd) return invalid;
+
+    const marker = bytes[cursor];
+    cursor++;
+
+    if (marker === 0x00) return invalid;
+    if (marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7)) {
+      continue;
+    }
+    if (marker === 0xd8) {
+      return { valid: false, endOffset: -1, nestedSoiOffset: cursor - 2 };
+    }
+    if (marker === 0xd9) {
+      return hasSof && hasSos
+        ? { valid: true, endOffset: cursor, nestedSoiOffset: -1 }
+        : invalid;
+    }
+    if (marker < 0xc0 || marker > 0xfe) {
+      return invalid;
+    }
+
+    if (cursor + 2 > maxEnd) return invalid;
+    const segLen = view.getUint16(cursor, false);
+    if (segLen < 2 || cursor + segLen > maxEnd) return invalid;
+
+    const isSofMarker =
+      marker >= 0xc0 &&
+      marker <= 0xcf &&
+      marker !== 0xc4 &&
+      marker !== 0xc8 &&
+      marker !== 0xcc;
+
+    if (isSofMarker) {
+      if (segLen < 7 || cursor + 7 > maxEnd) return invalid;
+      const frameHeight = view.getUint16(cursor + 3, false);
+      const frameWidth = view.getUint16(cursor + 5, false);
+      if (frameWidth <= 0 || frameHeight <= 0) return invalid;
+      hasSof = true;
+      cursor += segLen;
+    } else if (marker === 0xda) {
+      if (!hasSof || segLen < 6) return invalid;
+      hasSos = true;
+      let scan = cursor + segLen;
+      let nextMarkerCursor = -1;
+
+      while (scan + 1 < maxEnd) {
+        if (bytes[scan] === 0xff) {
+          let nextPos = scan + 1;
+          while (nextPos < maxEnd && bytes[nextPos] === 0xff) {
+            nextPos++;
+          }
+          if (nextPos >= maxEnd) return invalid;
+          const next = bytes[nextPos];
+          if (next === 0x00 || (next >= 0xd0 && next <= 0xd7)) {
+            scan = nextPos + 1;
+            continue;
+          }
+          if (next === 0xd8) {
+            // Unescaped nested SOI inside entropy data indicates a truncated/corrupt stream
+            return { valid: false, endOffset: -1, nestedSoiOffset: nextPos - 1 };
+          }
+          if (next === 0xd9) {
+            return { valid: true, endOffset: nextPos + 1, nestedSoiOffset: -1 };
+          }
+          // Non-RST marker ends current scan's entropy data; resume marker loop to skip its segment
+          nextMarkerCursor = nextPos - 1;
+          break;
+        }
+        scan++;
+      }
+
+      if (nextMarkerCursor < 0) return invalid;
+      cursor = nextMarkerCursor;
+    } else {
+      cursor += segLen;
+    }
+  }
+
+  return invalid;
+}
+
 /**
  * Validates that a byte slice contains a structurally complete JPEG stream:
  * SOI (0xFFD8), at least one SOF frame header with non-zero dimensions,
@@ -130,82 +248,10 @@ export function isValidJpegSlice(
   length: number
 ): boolean {
   const end = start + length;
-  if (
-    start < 0 ||
-    length < 16 ||
-    end > bytes.length ||
-    bytes[start] !== 0xff ||
-    bytes[start + 1] !== 0xd8 ||
-    bytes[start + 2] !== 0xff
-  ) {
+  if (start < 0 || length < 16 || end > bytes.length) {
     return false;
   }
-
-  let cursor = start + 2;
-  let hasSof = false;
-
-  while (cursor + 1 < end) {
-    if (bytes[cursor] !== 0xff) return false;
-    while (cursor < end && bytes[cursor] === 0xff) {
-      cursor++;
-    }
-    if (cursor >= end) return false;
-
-    const marker = bytes[cursor];
-    cursor++;
-
-    if (marker === 0x00 || marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7)) {
-      continue;
-    }
-    if (marker === 0xd9) {
-      // EOI reached before SOS scan
-      return false;
-    }
-
-    if (cursor + 2 > end) return false;
-    const segLen = view.getUint16(cursor, false);
-    if (segLen < 2 || cursor + segLen > end) return false;
-
-    const isSofMarker =
-      marker >= 0xc0 &&
-      marker <= 0xcf &&
-      marker !== 0xc4 &&
-      marker !== 0xc8 &&
-      marker !== 0xcc;
-
-    if (isSofMarker) {
-      if (segLen < 7 || cursor + 7 > end) return false;
-      const frameHeight = view.getUint16(cursor + 3, false);
-      const frameWidth = view.getUint16(cursor + 5, false);
-      if (frameWidth <= 0 || frameHeight <= 0) return false;
-      hasSof = true;
-    } else if (marker === 0xda) {
-      if (!hasSof || segLen < 6) return false;
-      let scan = cursor + segLen;
-      while (scan + 1 < end) {
-        if (bytes[scan] === 0xff) {
-          const next = bytes[scan + 1];
-          if (next === 0x00 || (next >= 0xd0 && next <= 0xd7)) {
-            scan += 2;
-            continue;
-          }
-          if (next === 0xd8) {
-            // Unescaped nested SOI inside entropy data indicates a truncated/corrupt stream
-            return false;
-          }
-          if (next === 0xd9) {
-            return true;
-          }
-        }
-        scan++;
-      }
-      return false;
-    }
-
-    cursor += segLen;
-  }
-
-  return false;
+  return scanJpegStream(bytes, view, start, end).valid;
 }
 
 /**
@@ -323,91 +369,20 @@ export function extractEmbeddedJpegCandidatesFromRawBuffer(buffer: ArrayBuffer):
     }
 
     let pos = 0;
+    const scanBound = Math.min(bytes.length, lastEoiOffset + 2);
     while (pos + 4 < bytes.length && pos < lastEoiOffset) {
       if (bytes[pos] === 0xff && bytes[pos + 1] === 0xd8 && bytes[pos + 2] === 0xff) {
-        let cursor = pos + 2;
-        let hasSof = false;
-        let foundEoi = -1;
-        let nestedSoi = -1;
-
-        while (cursor + 1 < bytes.length) {
-          if (bytes[cursor] !== 0xff) {
-            cursor++;
-            continue;
-          }
-          let markerPos = cursor + 1;
-          while (markerPos < bytes.length && bytes[markerPos] === 0xff) {
-            markerPos++;
-          }
-          if (markerPos >= bytes.length) break;
-
-          const marker = bytes[markerPos];
-          if (marker === 0x00 || marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7)) {
-            cursor = markerPos + 1;
-            continue;
-          }
-          if (marker === 0xd9) {
-            // EOI before SOS cannot form a valid JPEG stream
-            break;
-          }
-          if (markerPos + 3 > bytes.length) break;
-          const segLen = view.getUint16(markerPos + 1, false);
-          if (segLen < 2 || markerPos + 1 + segLen > bytes.length) break;
-
-          const isSofMarker =
-            marker >= 0xc0 &&
-            marker <= 0xcf &&
-            marker !== 0xc4 &&
-            marker !== 0xc8 &&
-            marker !== 0xcc;
-          if (isSofMarker) {
-            if (segLen < 7 || markerPos + 8 > bytes.length) break;
-            const frameHeight = view.getUint16(markerPos + 4, false);
-            const frameWidth = view.getUint16(markerPos + 6, false);
-            if (frameWidth <= 0 || frameHeight <= 0) break;
-            hasSof = true;
-          } else if (marker === 0xda) {
-            if (!hasSof || segLen < 6) break;
-            const scanStart = markerPos + 1 + segLen;
-            if (scanStart > lastEoiOffset) break;
-            // Scan entropy-coded data after SOS header for EOI (0xFF 0xD9) up to lastEoiOffset
-            let scan = scanStart;
-            const scanLimit = Math.min(bytes.length - 1, lastEoiOffset + 1);
-            while (scan < scanLimit) {
-              if (bytes[scan] === 0xff) {
-                const next = bytes[scan + 1];
-                if (next === 0x00 || (next >= 0xd0 && next <= 0xd7)) {
-                  scan += 2;
-                  continue;
-                }
-                if (next === 0xd8) {
-                  // Unescaped nested SOI before EOI: restart candidate search at nested SOI
-                  nestedSoi = scan;
-                  break;
-                }
-                if (next === 0xd9) {
-                  foundEoi = scan + 2;
-                  break;
-                }
-              }
-              scan++;
-            }
-            break;
-          }
-          cursor = markerPos + 1 + segLen;
-        }
-
-        if (nestedSoi > pos) {
-          pos = nestedSoi;
+        const res = scanJpegStream(bytes, view, pos, scanBound);
+        if (res.nestedSoiOffset > pos) {
+          pos = res.nestedSoiOffset;
           continue;
         }
-
-        if (foundEoi > pos) {
-          const streamLen = foundEoi - pos;
+        if (res.valid && res.endOffset > pos) {
+          const streamLen = res.endOffset - pos;
           if (streamLen >= 512) {
             recordCandidate(pos, streamLen);
           }
-          pos = foundEoi;
+          pos = res.endOffset;
           continue;
         }
       }

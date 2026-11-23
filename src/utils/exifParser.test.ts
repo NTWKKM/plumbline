@@ -1027,6 +1027,44 @@ test('extractEmbeddedJpegFromRawBuffer rejects SOF-missing and SOS-missing candi
   assert.ok(recoveredFromTruncated instanceof Blob);
   assert.equal(recoveredFromTruncated.size, fallbackPreview.length);
 
+  // Multi-scan / progressive JPEG: SOI + SOF2 + SOS (scan 1) + DHT + SOS (scan 2, with 0xFF 0x00) + EOI
+  const progressiveJpeg = new Uint8Array(560);
+  progressiveJpeg[0] = 0xff;
+  progressiveJpeg[1] = 0xd8; // SOI
+  progressiveJpeg[2] = 0xff;
+  progressiveJpeg[3] = 0xc2; // SOF2 (progressive)
+  progressiveJpeg.set([0x00, 0x11, 0x08, 0x00, 0x10, 0x00, 0x10, 0x03, 0x01, 0x11, 0x00, 0x02, 0x11, 0x00, 0x03, 0x11, 0x00], 4);
+  progressiveJpeg[21] = 0xff;
+  progressiveJpeg[22] = 0xda; // SOS scan 1
+  progressiveJpeg.set([0x00, 0x0c, 0x03, 0x01, 0x00, 0x02, 0x00, 0x03, 0x00, 0x00, 0x3f, 0x00], 23);
+  progressiveJpeg[35] = 0x12;
+  progressiveJpeg[36] = 0x34;
+  // Length-delimited DHT segment between scans (contains 0xFF 0xD8 payload bytes inside segment body)
+  progressiveJpeg[37] = 0xff;
+  progressiveJpeg[38] = 0xc4; // DHT
+  progressiveJpeg[39] = 0x00;
+  progressiveJpeg[40] = 0x08; // 8-byte segment
+  progressiveJpeg[41] = 0x10;
+  progressiveJpeg[42] = 0xff;
+  progressiveJpeg[43] = 0xd8; // payload bytes inside DHT (must be skipped by segLen, not treated as nested SOI)
+  progressiveJpeg[47] = 0xff;
+  progressiveJpeg[48] = 0xda; // SOS scan 2
+  progressiveJpeg.set([0x00, 0x08, 0x01, 0x01, 0x00, 0x01, 0x3f, 0x00], 49);
+  progressiveJpeg[60] = 0xff;
+  progressiveJpeg[61] = 0x00; // stuffed 0xFF inside scan 2 entropy data
+  progressiveJpeg[558] = 0xff;
+  progressiveJpeg[559] = 0xd9; // EOI
+
+  const progIfdResult = extractEmbeddedJpegFromRawBuffer(makeSingleIfdRaw(progressiveJpeg));
+  assert.ok(progIfdResult instanceof Blob);
+  assert.equal(progIfdResult.size, progressiveJpeg.length);
+
+  const progFallbackBuf = new Uint8Array(16 + progressiveJpeg.length + 16);
+  progFallbackBuf.set(progressiveJpeg, 16);
+  const progFallbackResult = extractEmbeddedJpegFromRawBuffer(progFallbackBuf.buffer);
+  assert.ok(progFallbackResult instanceof Blob);
+  assert.equal(progFallbackResult.size, progressiveJpeg.length);
+
   // Test browser-decoder verification with valid and failing decode responses
   const origDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'createImageBitmap');
   try {

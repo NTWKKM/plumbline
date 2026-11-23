@@ -682,13 +682,13 @@ export default function App() {
       {exportError && (
         <div
           role="alert"
-          className="flex items-center justify-between border-b border-error bg-paper px-5 py-2 text-xs text-error shrink-0"
+          className="flex items-start sm:items-center justify-between gap-3 border-b border-error bg-paper px-5 py-2 text-xs text-error shrink-0"
         >
-          <span className="truncate">Export error: {exportError}</span>
+          <span className="min-w-0 flex-1 break-words">Export error: {exportError}</span>
           <button
             type="button"
             onClick={() => setExportError(null)}
-            className="font-medium underline underline-offset-2 hover:text-ink shrink-0 ml-2"
+            className="font-medium underline underline-offset-2 hover:text-ink shrink-0"
           >
             Dismiss
           </button>
@@ -699,17 +699,17 @@ export default function App() {
         <div
           role="status"
           aria-live="polite"
-          className={`flex items-center justify-between border-b border-rule bg-paper-2 px-5 py-2 text-xs shrink-0 ${
+          className={`flex items-start sm:items-center justify-between gap-3 border-b border-rule bg-paper-2 px-5 py-2 text-xs shrink-0 ${
             exportBanner.startsWith('Export failed.')
               ? 'text-error'
               : 'text-ink'
           }`}
         >
-          <span className="truncate">{exportBanner}</span>
+          <span className="min-w-0 flex-1 break-words">{exportBanner}</span>
           <button
             type="button"
             onClick={() => setExportBanner(null)}
-            className="font-medium text-muted underline underline-offset-2 hover:text-ink shrink-0 ml-2"
+            className="font-medium text-muted underline underline-offset-2 hover:text-ink shrink-0"
           >
             Dismiss
           </button>
