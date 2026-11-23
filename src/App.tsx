@@ -8,6 +8,7 @@ import { Grid, ImagePlus, Keyboard, Redo2, Undo2, X, ZoomIn, ZoomOut } from 'luc
 import { ShortcutsDialog } from './components/ShortcutsDialog';
 import {
   HistoryState,
+  PushOptions,
   canRedo,
   canUndo,
   createHistory,
@@ -217,27 +218,45 @@ function diffConfigKeys(a: PipelineConfig, b: PipelineConfig): string {
 type DirectoryHandle = {
   getFileHandle: (
     name: string,
-    options: { create: boolean }
+    options?: { create?: boolean }
   ) => Promise<{ createWritable: () => Promise<{ write: (b: Blob) => Promise<void>; close: () => Promise<void> }> }>;
 };
+
+async function directoryHasFile(directory: DirectoryHandle, name: string): Promise<boolean> {
+  try {
+    await directory.getFileHandle(name);
+    return true;
+  } catch (err) {
+    if (err instanceof DOMException && err.name === 'NotFoundError') return false;
+    // TypeMismatchError (a folder with that name) also means the name is taken
+    return true;
+  }
+}
 
 function supportsDirectoryPicker(): boolean {
   return typeof window !== 'undefined' && 'showDirectoryPicker' in window;
 }
 
-function uniqueFileName(name: string, used: Set<string>): string {
-  if (!used.has(name)) {
-    used.add(name);
-    return name;
-  }
+/**
+ * Keeps `name` when free, otherwise the first `stem-N.ext` that is neither allocated earlier in
+ * this batch nor (when `isTaken` is given) already present in the destination.
+ */
+async function uniqueFileName(
+  name: string,
+  used: Set<string>,
+  isTaken?: (candidate: string) => Promise<boolean>
+): Promise<string> {
   const dot = name.lastIndexOf('.');
   const stem = dot > 0 ? name.slice(0, dot) : name;
   const ext = dot > 0 ? name.slice(dot) : '';
-  let n = 2;
-  while (used.has(`${stem}-${n}${ext}`)) n += 1;
-  const out = `${stem}-${n}${ext}`;
-  used.add(out);
-  return out;
+  let candidate = name;
+  let n = 1;
+  while (used.has(candidate) || (isTaken && (await isTaken(candidate)))) {
+    n += 1;
+    candidate = `${stem}-${n}${ext}`;
+  }
+  used.add(candidate);
+  return candidate;
 }
 
 function downloadBlob(blob: Blob, fileName: string): void {
@@ -267,10 +286,15 @@ export default function App() {
   );
   const config = history.present.config;
   const historyTilts = history.present.tilts;
+  // Initial tilts captured once on mount; imported photos have no entry and default to 0°
+  const baselineTiltsRef = useRef<Record<string, number>>(history.present.tilts);
+  // Pointer gestures on range sliders: one gesture is one undo step, however long it pauses
+  const sliderGestureRef = useRef<{ id: number; active: boolean }>({ id: 0, active: false });
   const [viewMode, setViewMode] = useState<CanvasViewMode>(initialView.viewMode);
   const [isPeekingOriginal, setIsPeekingOriginal] = useState<boolean>(false);
   const [isShortcutsOpen, setIsShortcutsOpen] = useState<boolean>(false);
-  const [exportedIds, setExportedIds] = useState<Set<string>>(() => new Set());
+  // 'exported' = written and closed in a chosen folder; 'requested' = a browser download was triggered
+  const [exportStatus, setExportStatus] = useState<Record<string, 'exported' | 'requested'>>({});
   const [mobileTab, setMobileTab] = useState<'canvas' | 'adjust' | 'queue'>('canvas');
   const [splitPercent, setSplitPercent] = useState<number>(50);
   const [showHorizonGrid, setShowHorizonGrid] = useState<boolean>(initialView.showHorizonGrid);
@@ -320,6 +344,39 @@ export default function App() {
   const activePhoto = photos.find((p) => p.id === selectedId) || photos[0];
   const effectiveViewMode: CanvasViewMode = isPeekingOriginal ? 'original' : viewMode;
 
+  // During a slider drag, edits merge by gesture id with no time window, so pauses stay one step
+  // and a new drag always starts a new step. Keyboard nudges fall back to the timed merge.
+  const historyPushOptions = (key: string): PushOptions => {
+    const gesture = sliderGestureRef.current;
+    return gesture.active
+      ? { key: `${key}:gesture-${gesture.id}`, coalesceMs: Number.POSITIVE_INFINITY }
+      : { key };
+  };
+
+  useEffect(() => {
+    const onPointerDown = (e: PointerEvent) => {
+      const t = e.target as HTMLElement | null;
+      if (t instanceof HTMLInputElement && t.type === 'range') {
+        sliderGestureRef.current = { id: sliderGestureRef.current.id + 1, active: true };
+      }
+    };
+    const onPointerEnd = () => {
+      if (sliderGestureRef.current.active) {
+        sliderGestureRef.current = { ...sliderGestureRef.current, active: false };
+      }
+    };
+    window.addEventListener('pointerdown', onPointerDown, true);
+    window.addEventListener('pointerup', onPointerEnd, true);
+    window.addEventListener('pointercancel', onPointerEnd, true);
+    window.addEventListener('blur', onPointerEnd);
+    return () => {
+      window.removeEventListener('pointerdown', onPointerDown, true);
+      window.removeEventListener('pointerup', onPointerEnd, true);
+      window.removeEventListener('pointercancel', onPointerEnd, true);
+      window.removeEventListener('blur', onPointerEnd);
+    };
+  }, []);
+
   // Config edits go through the undo history; same-field edits in quick succession coalesce.
   const setConfig = useCallback(
     (updater: PipelineConfig | ((prev: PipelineConfig) => PipelineConfig)) => {
@@ -328,7 +385,7 @@ export default function App() {
         const next = typeof updater === 'function' ? updater(prev) : updater;
         const key = diffConfigKeys(prev, next);
         if (!key) return h;
-        return pushHistory(h, { ...h.present, config: next }, { key: `config:${key}` });
+        return pushHistory(h, { ...h.present, config: next }, historyPushOptions(`config:${key}`));
       });
     },
     []
@@ -339,8 +396,9 @@ export default function App() {
     setPhotos((prev) => {
       let changed = false;
       const next = prev.map((item) => {
-        const t = historyTilts[item.id];
-        if (typeof t === 'number' && t !== item.simulatedSensorTiltDeg) {
+        // No entry means the photo is at its immutable baseline: 0° for imports, the initial tilt for samples
+        const t = historyTilts[item.id] ?? baselineTiltsRef.current[item.id] ?? 0;
+        if (t !== item.simulatedSensorTiltDeg) {
           changed = true;
           return { ...item, simulatedSensorTiltDeg: t };
         }
@@ -410,7 +468,7 @@ export default function App() {
         return pushHistory(
           h,
           { ...h.present, tilts: { ...h.present.tilts, [id]: deg } },
-          { key: `tilt:${id}` }
+          historyPushOptions(`tilt:${id}`)
         );
       });
     },
@@ -420,12 +478,16 @@ export default function App() {
   // Reset is one undo step (config and the active photo's tilt together), so R is never destructive.
   const handleResetAll = useCallback(() => {
     const id = activePhoto.id;
-    setHistory((h) =>
-      pushHistory(h, {
+    setHistory((h) => {
+      const alreadyDefault =
+        diffConfigKeys(h.present.config, DEFAULT_PIPELINE_CONFIG) === '' &&
+        (h.present.tilts[id] ?? baselineTiltsRef.current[id] ?? 0) === 0;
+      if (alreadyDefault) return h;
+      return pushHistory(h, {
         config: DEFAULT_PIPELINE_CONFIG,
         tilts: { ...h.present.tilts, [id]: 0 },
-      })
-    );
+      });
+    });
     setSplitPercent(50);
     setZoomLevel(1);
     setPanOffset({ x: 0, y: 0 });
@@ -433,7 +495,8 @@ export default function App() {
 
   const handleRemovePhoto = useCallback(
     (id: string) => {
-      if (photos.length <= 1) return;
+      // The batch iterates a snapshot of the queue; revoking a URL mid-batch would break its render
+      if (isBatchExporting || photos.length <= 1) return;
       const idx = photos.findIndex((p) => p.id === id);
       if (idx < 0) return;
       const removed = photos[idx];
@@ -445,14 +508,14 @@ export default function App() {
       if (removed.id.startsWith('imported-') && removed.src.startsWith('blob:')) {
         URL.revokeObjectURL(removed.src);
       }
-      setExportedIds((prev) => {
-        if (!prev.has(id)) return prev;
-        const next = new Set(prev);
-        next.delete(id);
+      setExportStatus((prev) => {
+        if (!(id in prev)) return prev;
+        const next = { ...prev };
+        delete next[id];
         return next;
       });
     },
-    [activePhoto.id, photos]
+    [activePhoto.id, isBatchExporting, photos]
   );
 
   const importFiles = useCallback(async (files: File[]) => {
@@ -544,21 +607,31 @@ export default function App() {
     return () => window.removeEventListener('paste', onPaste);
   }, [importFiles]);
 
-  // Hold backslash to peek at the untouched original; release to return
+  // Hold backslash to peek at the untouched original; release to return.
+  // The release is matched by KeyboardEvent.code, since `key` can differ on keyup (layout, modifiers).
+  const peekCodeRef = useRef<string | null>(null);
   useEffect(() => {
     const isPeekKey = (e: KeyboardEvent) => e.key === '\\' && !e.metaKey && !e.ctrlKey && !e.altKey;
+    const endPeek = () => {
+      peekCodeRef.current = null;
+      setIsPeekingOriginal(false);
+    };
     const onDown = (e: KeyboardEvent) => {
+      if (isShortcutsOpen) return;
       const t = e.target as HTMLElement | null;
       if (t && (t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
       if (isPeekKey(e)) {
         e.preventDefault();
-        if (!e.repeat) setIsPeekingOriginal(true);
+        if (!e.repeat && peekCodeRef.current === null) {
+          peekCodeRef.current = e.code;
+          setIsPeekingOriginal(true);
+        }
       }
     };
     const onUp = (e: KeyboardEvent) => {
-      if (e.key === '\\') setIsPeekingOriginal(false);
+      if (peekCodeRef.current !== null && e.code === peekCodeRef.current) endPeek();
     };
-    const onBlur = () => setIsPeekingOriginal(false);
+    const onBlur = endPeek;
     window.addEventListener('keydown', onDown);
     window.addEventListener('keyup', onUp);
     window.addEventListener('blur', onBlur);
@@ -567,11 +640,13 @@ export default function App() {
       window.removeEventListener('keyup', onUp);
       window.removeEventListener('blur', onBlur);
     };
-  }, []);
+  }, [isShortcutsOpen]);
 
   // Global keyboard shortcuts for studio navigation and inspection
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
+      // While the shortcuts dialog is open, no workspace action (undo included) may run behind it
+      if (isShortcutsOpen) return;
       const target = e.target as HTMLElement | null;
       const isTextEntry =
         !!target &&
@@ -607,7 +682,6 @@ export default function App() {
       ) {
         return;
       }
-      if (isShortcutsOpen) return;
 
       if (e.key === ' ' && target && (target.tagName === 'BUTTON' || target.tagName === 'SUMMARY' || target.tagName === 'A')) {
         return;
@@ -658,12 +732,11 @@ export default function App() {
     zoomLevel,
   ]);
 
-  const markExported = useCallback((id: string) => {
-    setExportedIds((prev) => {
-      if (prev.has(id)) return prev;
-      const next = new Set(prev);
-      next.add(id);
-      return next;
+  const markExportStatus = useCallback((id: string, status: 'exported' | 'requested') => {
+    setExportStatus((prev) => {
+      // A confirmed folder write is never downgraded by a later download request
+      if (prev[id] === status || (prev[id] === 'exported' && status === 'requested')) return prev;
+      return { ...prev, [id]: status };
     });
   }, []);
 
@@ -723,10 +796,10 @@ export default function App() {
         sourceSize
       );
       downloadBlob(blob, outName);
-      markExported(activePhoto.id);
+      markExportStatus(activePhoto.id, 'requested');
 
       setExportBanner(
-        `Exported ${outName} (${canvas.width} × ${canvas.height} px, ${
+        `Download requested for ${outName} (${canvas.width} × ${canvas.height} px, ${
           exifPreserved ? 'EXIF Preserved' : 'EXIF Stripped'
         })`
       );
@@ -739,7 +812,9 @@ export default function App() {
   };
 
   const handleBatchExportAll = async () => {
-    if (photos.length === 0) return;
+    if (photos.length === 0 || isBatchExporting) return;
+    // Lock the queue (removal disabled) from the moment the folder picker opens
+    setIsBatchExporting(true);
 
     // Where the browser allows it, write the whole queue into one chosen folder
     // instead of firing a download per photo (which browsers throttle or block).
@@ -752,12 +827,14 @@ export default function App() {
           }
         ).showDirectoryPicker({ mode: 'readwrite', id: 'plumbline-export' });
       } catch (err) {
-        if (err instanceof DOMException && err.name === 'AbortError') return;
+        if (err instanceof DOMException && err.name === 'AbortError') {
+          setIsBatchExporting(false);
+          return;
+        }
         directory = null;
       }
     }
 
-    setIsBatchExporting(true);
     setExportBanner(null);
     setErrorNotice(null);
 
@@ -769,16 +846,18 @@ export default function App() {
         setExportBanner(`Exporting ${i + 1} of ${photos.length}: ${item.title}…`);
         const { canvas, sourceSize: itemSourceSize } = await renderPhotoToFramedCanvas(item, config);
         const { blob, outName } = await encodeFramedCanvas(canvas, item, itemSourceSize);
-        const fileName = uniqueFileName(outName, usedNames);
         if (directory) {
-          const handle = await directory.getFileHandle(fileName, { create: true });
+          const dir = directory;
+          const fileName = await uniqueFileName(outName, usedNames, (c) => directoryHasFile(dir, c));
+          const handle = await dir.getFileHandle(fileName, { create: true });
           const writable = await handle.createWritable();
           await writable.write(blob);
           await writable.close();
+          markExportStatus(item.id, 'exported');
         } else {
-          downloadBlob(blob, fileName);
+          downloadBlob(blob, await uniqueFileName(outName, usedNames));
+          markExportStatus(item.id, 'requested');
         }
-        markExported(item.id);
         exportedCount += 1;
       }
       setExportBanner(
@@ -1045,7 +1124,7 @@ export default function App() {
           <div className="flex lg:flex-col gap-2.5 overflow-x-auto lg:overflow-y-auto p-3 flex-1 min-h-0">
             {photos.map((item) => {
               const isSelected = item.id === activePhoto.id;
-              const isExported = exportedIds.has(item.id);
+              const status = exportStatus[item.id];
               return (
                 <div key={item.id} className="filmstrip-item relative w-56 lg:w-full shrink-0 min-w-0">
                 <button
@@ -1076,8 +1155,10 @@ export default function App() {
                       <span className="truncate text-xs font-medium text-ink min-w-0">
                         {item.title}
                       </span>
-                      {isExported && (
-                        <span className="shrink-0 text-xs text-success">Exported</span>
+                      {status && (
+                        <span className={`shrink-0 text-xs ${status === 'exported' ? 'text-success' : 'text-muted'}`}>
+                          {status === 'exported' ? 'Exported' : 'Download requested'}
+                        </span>
                       )}
                     </div>
                     <div className="mt-1 flex items-center justify-between gap-2 text-xs text-muted font-mono tabular-nums">
@@ -1092,6 +1173,7 @@ export default function App() {
                   <button
                     type="button"
                     onClick={() => handleRemovePhoto(item.id)}
+                    disabled={isBatchExporting}
                     aria-label={`Remove ${item.title} from the queue`}
                     title="Remove from queue"
                     className="filmstrip-remove icon-btn absolute right-3.5 top-3.5 z-raised border border-rule bg-paper"

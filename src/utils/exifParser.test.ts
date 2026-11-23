@@ -10,6 +10,8 @@ import {
   readRawContainerOrientation,
   withJpegOrientation,
   MAX_RAW_PREVIEW_DECODE_ATTEMPTS,
+  readJpegExifOrientation,
+  scanJpegStreamForTest,
 } from './exifParser';
 
 test('parseExifFromArrayBuffer returns empty fields for missing metadata instead of fabricated Sony defaults', () => {
@@ -1129,9 +1131,12 @@ test('extractEmbeddedJpegFromRawBuffer rejects SOF-missing and SOS-missing candi
   acceptedEnclosingBuf[encStart + acceptedEnclosingLen - 2] = 0xff;
   acceptedEnclosingBuf[encStart + acceptedEnclosingLen - 1] = 0xd9; // EOI
 
+  // The accepted enclosing stream comes first; the preview inside its APP1 payload is kept as a
+  // deferred fallback, offered only after every enclosing candidate has been tried
   const fastPathCandidates = extractEmbeddedJpegCandidatesFromRawBuffer(acceptedEnclosingBuf.buffer);
-  assert.equal(fastPathCandidates.length, 1);
+  assert.equal(fastPathCandidates.length, 2);
   assert.equal(fastPathCandidates[0].size, acceptedEnclosingLen);
+  assert.equal(fastPathCandidates[1].size, fallbackPreview.length);
 
   // Test browser-decoder verification with valid and failing decode responses
   const origDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'createImageBitmap');
@@ -1269,22 +1274,45 @@ const makeFrameJpeg = (size: number, sofMarker = 0xc0, tagByte = 0x11): Uint8Arr
   return jpeg;
 };
 
-/** Little-endian TIFF-family container whose IFD0 holds Orientation plus JPEG pointers to each payload. */
+/**
+ * Little-endian TIFF-family container whose IFD0 holds Orientation plus one pointer pair per named
+ * slot: `strip` via StripOffsets/StripByteCounts, `preview` via JPEGInterchangeFormat(Length),
+ * and `jpgFromRaw` via the Panasonic RW2 0x002E UNDEFINED tag. Each tag appears at most once.
+ */
 const makeTiffContainer = (
-  payloads: Uint8Array[],
+  {
+    strip,
+    preview,
+    jpgFromRaw,
+  }: { strip?: Uint8Array; preview?: Uint8Array; jpgFromRaw?: Uint8Array },
   { magic = 42, orientation }: { magic?: number; orientation?: number } = {}
 ): ArrayBuffer => {
-  const entryCount = payloads.length * 2 + (orientation ? 1 : 0);
+  const pairs = [
+    strip ? { payload: strip, offTag: 0x0111, lenTag: 0x0117 } : null,
+    preview ? { payload: preview, offTag: 0x0201, lenTag: 0x0202 } : null,
+  ].filter((p): p is { payload: Uint8Array; offTag: number; lenTag: number } => p !== null);
+  const entryCount = pairs.length * 2 + (jpgFromRaw ? 1 : 0) + (orientation ? 1 : 0);
   const ifdSize = 2 + entryCount * 12 + 4;
   const dataStart = 8 + ifdSize;
-  const total = dataStart + payloads.reduce((sum, p) => sum + p.length, 0);
-  const out = new Uint8Array(total);
+  const payloadBytes =
+    pairs.reduce((sum, p) => sum + p.payload.length, 0) + (jpgFromRaw?.length ?? 0);
+  const out = new Uint8Array(dataStart + payloadBytes);
   const v = new DataView(out.buffer);
   v.setUint16(0, 0x4949, false);
   v.setUint16(2, magic, true);
   v.setUint32(4, 8, true);
   v.setUint16(8, entryCount, true);
   let entry = 10;
+  let offset = dataStart;
+  if (jpgFromRaw) {
+    v.setUint16(entry, 0x002e, true);
+    v.setUint16(entry + 2, 7, true); // UNDEFINED
+    v.setUint32(entry + 4, jpgFromRaw.length, true);
+    v.setUint32(entry + 8, offset, true);
+    entry += 12;
+    out.set(jpgFromRaw, offset);
+    offset += jpgFromRaw.length;
+  }
   if (orientation) {
     v.setUint16(entry, 0x0112, true);
     v.setUint16(entry + 2, 3, true);
@@ -1292,11 +1320,7 @@ const makeTiffContainer = (
     v.setUint16(entry + 8, orientation, true);
     entry += 12;
   }
-  // Only the last pointer pair per IFD wins, so chain one IFD per payload via SubIFD-free layout:
-  // use StripOffsets/StripByteCounts for payload 0 and JPEGInterchangeFormat for payload 1.
-  let offset = dataStart;
-  payloads.forEach((payload, i) => {
-    const [offTag, lenTag] = i === 0 ? [0x0111, 0x0117] : [0x0201, 0x0202];
+  for (const { payload, offTag, lenTag } of pairs) {
     v.setUint16(entry, offTag, true);
     v.setUint16(entry + 2, 4, true);
     v.setUint32(entry + 4, 1, true);
@@ -1308,7 +1332,7 @@ const makeTiffContainer = (
     entry += 24;
     out.set(payload, offset);
     offset += payload.length;
-  });
+  }
   v.setUint32(entry, 0, true); // next IFD
   return out.buffer;
 };
@@ -1340,7 +1364,7 @@ const withMockedImageBitmap = async (
 test('RAW preview candidates skip lossless SOF3 sensor strips so the real preview is tried first', () => {
   const losslessStrip = makeFrameJpeg(4000, 0xc3); // larger, structurally valid, not browser-decodable
   const preview = makeFrameJpeg(900, 0xc0);
-  const candidates = extractEmbeddedJpegCandidatesFromRawBuffer(makeTiffContainer([losslessStrip, preview]));
+  const candidates = extractEmbeddedJpegCandidatesFromRawBuffer(makeTiffContainer({ strip: losslessStrip, preview }));
   assert.equal(candidates.length, 1);
   assert.equal(candidates[0].size, preview.length);
 });
@@ -1390,26 +1414,162 @@ test('fallback scan stays linear on a crafted buffer of nested APP segments over
   // Unescaped nested SOI ends the run (rejecting every enclosing stream), then the only EOI
   buf.set([0xff, 0xd8, 0xff, 0xd9], buf.length - 4);
 
-  const started = performance.now();
-  extractEmbeddedJpegCandidatesFromRawBuffer(buf.buffer);
-  const elapsedMs = performance.now() - started;
-  assert.ok(elapsedMs < 2000, `scan took ${elapsedMs.toFixed(0)} ms`);
+  // Every enclosing stream is rejected by the nested SOI, so the scan finds nothing and terminates
+  assert.deepEqual(extractEmbeddedJpegCandidatesFromRawBuffer(buf.buffer), []);
+});
+
+test('scan budget stops a stream walk at the exact entropy-byte boundary', () => {
+  const jpeg = makeFrameJpeg(600);
+  // Marker steps: SOI->SOF, SOF->SOS; then one unit per entropy byte until the EOI
+  const generous = { remaining: 10_000 };
+  const full = scanJpegStreamForTest(jpeg, 0, jpeg.length, generous);
+  assert.equal(full.valid, true);
+  assert.equal(full.endOffset, jpeg.length);
+  const spent = 10_000 - generous.remaining;
+
+  const exact = { remaining: spent };
+  assert.equal(scanJpegStreamForTest(jpeg, 0, jpeg.length, exact).valid, true);
+  assert.equal(exact.remaining, 0);
+
+  const short = { remaining: spent - 1 };
+  const cut = scanJpegStreamForTest(jpeg, 0, jpeg.length, short);
+  assert.equal(cut.valid, false);
+  assert.equal(cut.budgetExhausted, true);
+});
+
+test('scan budget charges every 0xFF fill byte, in marker padding and before EOI', () => {
+  const fill = 64;
+  const base = makeFrameJpeg(600);
+  // Same stream with `fill` extra 0xFF fill bytes before the SOF marker and before EOI
+  const padded = new Uint8Array(base.length + fill * 2);
+  padded.set(base.subarray(0, 2), 0);
+  padded.fill(0xff, 2, 2 + fill);
+  padded.set(base.subarray(2, base.length - 2), 2 + fill);
+  padded.fill(0xff, padded.length - 2 - fill, padded.length - 2);
+  padded.set([0xff, 0xd9], padded.length - 2);
+
+  const baseBudget = { remaining: 10_000 };
+  assert.equal(scanJpegStreamForTest(base, 0, base.length, baseBudget).valid, true);
+  const paddedBudget = { remaining: 10_000 };
+  assert.equal(scanJpegStreamForTest(padded, 0, padded.length, paddedBudget).valid, true);
+  const extra = (10_000 - paddedBudget.remaining) - (10_000 - baseBudget.remaining);
+  assert.ok(extra >= fill * 2, `fill bytes cost ${extra} units, expected at least ${fill * 2}`);
+
+  const tooSmall = { remaining: 10_000 - baseBudget.remaining };
+  const res = scanJpegStreamForTest(padded, 0, padded.length, tooSmall);
+  assert.equal(res.budgetExhausted, true);
 });
 
 test('ORF and RW2 vendor TIFF magic numbers still use the IFD fast path', () => {
   const preview = makeFrameJpeg(300); // < 512 bytes: only IFD discovery can find it, not the scan
   for (const magic of [0x4f52, 0x5352, 0x0055]) {
     const candidates = extractEmbeddedJpegCandidatesFromRawBuffer(
-      makeTiffContainer([new Uint8Array(0), preview], { magic })
+      makeTiffContainer({ preview }, { magic })
     );
     assert.equal(candidates.length, 1, `magic 0x${magic.toString(16)}`);
     assert.equal(candidates[0].size, preview.length);
   }
 });
 
+test('RW2 JpgFromRaw (tag 0x002E) previews are found through the IFD, even below the scan minimum', () => {
+  const preview = makeFrameJpeg(300); // < 512 bytes: the fallback scan would skip it
+  const candidates = extractEmbeddedJpegCandidatesFromRawBuffer(
+    makeTiffContainer({ jpgFromRaw: preview }, { magic: 0x0055 })
+  );
+  assert.equal(candidates.length, 1);
+  assert.equal(candidates[0].size, preview.length);
+});
+
+test('indexed previews with padding after EOI dedupe against the scanned stream', () => {
+  const preview = makeFrameJpeg(900);
+  const padded = new Uint8Array(preview.length + 64);
+  padded.set(preview, 0);
+  const candidates = extractEmbeddedJpegCandidatesFromRawBuffer(makeTiffContainer({ preview: padded }));
+  assert.equal(candidates.length, 1);
+  assert.equal(candidates[0].size, preview.length);
+});
+
+test('a preview nested in an APP payload is offered only after its enclosing stream', async () => {
+  const inner = makeFrameJpeg(700, 0xc0, 0x22);
+  // Outer: SOI, APP2 holding the inner JPEG, then the frame of a normal stream
+  const outerBody = makeFrameJpeg(1200, 0xc0, 0x33);
+  const app = new Uint8Array(4 + inner.length);
+  app.set([0xff, 0xe2, ((inner.length + 2) >> 8) & 0xff, (inner.length + 2) & 0xff], 0);
+  app.set(inner, 4);
+  const outer = new Uint8Array(outerBody.length + app.length);
+  outer.set(outerBody.subarray(0, 2), 0);
+  outer.set(app, 2);
+  outer.set(outerBody.subarray(2), 2 + app.length);
+  const wrapper = new Uint8Array(16 + outer.length + 16);
+  wrapper.set(outer, 16);
+
+  const sizes = extractEmbeddedJpegCandidatesFromRawBuffer(wrapper.buffer).map((b) => b.size);
+  assert.deepEqual(sizes, [outer.length, inner.length]);
+
+  const tried: number[] = [];
+  await withMockedImageBitmap(
+    (bytes) => {
+      tried.push(bytes.length);
+      return true;
+    },
+    async () => {
+      const blob = await extractDecodableEmbeddedJpegFromRawBuffer(wrapper.buffer);
+      assert.equal(blob?.size, outer.length);
+    }
+  );
+  assert.deepEqual(tried, [outer.length]);
+});
+
+test('decode cap is checked before the iterator resumes, keeping the last attempt for the scan', async () => {
+  // Seven indexed-equivalent failures leave the eighth attempt for a scanned stream
+  const streams = Array.from({ length: MAX_RAW_PREVIEW_DECODE_ATTEMPTS }, (_, i) =>
+    makeFrameJpeg(600 + i * 10, 0xc0, 0x40 + i)
+  );
+  const wrapper = new Uint8Array(16 + streams.reduce((s, p) => s + p.length + 8, 0));
+  let offset = 16;
+  for (const s of streams) {
+    wrapper.set(s, offset);
+    offset += s.length + 8;
+  }
+  let calls = 0;
+  await withMockedImageBitmap(
+    () => {
+      calls += 1;
+      return calls === MAX_RAW_PREVIEW_DECODE_ATTEMPTS;
+    },
+    async () => {
+      assert.ok(await extractDecodableEmbeddedJpegFromRawBuffer(wrapper.buffer));
+    }
+  );
+  assert.equal(calls, MAX_RAW_PREVIEW_DECODE_ATTEMPTS);
+});
+
+test('previews with Exif but no Orientation get the container Orientation; valid ones are kept', () => {
+  const preview = makeFrameJpeg(900);
+  // Exif APP1 with an empty IFD0 (no Orientation entry)
+  const app1 = new Uint8Array([
+    0xff, 0xe1, 0x00, 0x14, 0x45, 0x78, 0x69, 0x66, 0x00, 0x00,
+    0x49, 0x49, 0x2a, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  ]);
+  const withExif = new Uint8Array(preview.length + app1.length);
+  withExif.set(preview.subarray(0, 2), 0);
+  withExif.set(app1, 2);
+  withExif.set(preview.subarray(2), 2 + app1.length);
+  assert.equal(readJpegExifOrientation(withExif), 0);
+
+  const tagged = withJpegOrientation(withExif, 6);
+  assert.equal(tagged.length, withExif.length + 36);
+  assert.equal(readJpegExifOrientation(tagged), 6);
+  assert.deepEqual([...tagged.subarray(38)], [...withExif.subarray(2)]);
+
+  const alreadyOriented = withJpegOrientation(preview, 8);
+  assert.equal(readJpegExifOrientation(alreadyOriented), 8);
+  assert.equal(withJpegOrientation(alreadyOriented, 3), alreadyOriented);
+});
+
 test('RAW container Orientation is applied to the decoded embedded preview', async () => {
   const preview = makeFrameJpeg(900);
-  const buffer = makeTiffContainer([new Uint8Array(0), preview], { orientation: 6 });
+  const buffer = makeTiffContainer({ preview }, { orientation: 6 });
   assert.equal(readRawContainerOrientation(buffer), 6);
   assert.equal(readRawContainerOrientation(new Uint8Array(32).buffer), 1);
 

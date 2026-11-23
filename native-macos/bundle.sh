@@ -24,11 +24,17 @@ if [[ -z "${APP_VERSION}" ]]; then
 fi
 
 echo "Building release binary (v${APP_VERSION})..."
-cargo build --release
-
-BIN_PATH="${SCRIPT_DIR}/target/release/${BIN_NAME}"
-if [[ ! -x "${BIN_PATH}" ]]; then
-    echo "error: release binary not found at ${BIN_PATH}" >&2
+# Take the executable path from Cargo's compiler-artifact messages, so the bundle always packages
+# the binary this build produced, wherever CARGO_TARGET_DIR or build.target-dir points.
+# json-render-diagnostics keeps human-readable warnings and errors on stderr.
+BUILD_JSON="$(cargo build --release --bin "${BIN_NAME}" --message-format=json-render-diagnostics)"
+BIN_PATH="$(printf '%s\n' "${BUILD_JSON}" \
+    | grep '"reason":"compiler-artifact"' \
+    | grep '"kind":\["bin"\]' \
+    | sed -n 's/.*"executable":"\([^"]*\/'"${BIN_NAME}"'\)".*/\1/p' \
+    | tail -n 1)"
+if [[ -z "${BIN_PATH}" || ! -x "${BIN_PATH}" ]]; then
+    echo "error: cargo did not report an executable for ${BIN_NAME}" >&2
     exit 1
 fi
 

@@ -32,6 +32,7 @@ cd native-macos
 This compiles an optimized release binary, packages it into `native-macos/dist/Plumb_Line.app` (git-ignored), performs ad-hoc codesigning, and installs it into `~/Applications/Plumb_Line.app` (launchable via Spotlight or Finder).
 
 - The bundle version (`CFBundleShortVersionString` / `CFBundleVersion`) is read from `Cargo.toml`.
+- The packaged binary path comes from Cargo's `compiler-artifact` JSON output, so a custom `CARGO_TARGET_DIR` or `build.target-dir` is honoured.
 - `~/Applications` is created if missing; any existing `~/Applications/Plumb_Line.app` is replaced on each run.
 - The ad-hoc signature is local-only: it is not notarized and is not intended for distribution to other Macs.
 

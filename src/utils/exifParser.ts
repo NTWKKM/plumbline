@@ -140,6 +140,8 @@ interface JpegStreamScanResult {
   /** Marker byte of the first SOF frame header (0xC0..0xCF), or -1 when none was seen. */
   sofMarker: number;
   budgetExhausted: boolean;
+  /** APPn payload ranges of a valid stream; nested previews may live there (e.g. MPF in APP2). */
+  appRanges: ByteRange[];
 }
 
 /**
@@ -160,6 +162,7 @@ function scanJpegStream(
     skippedRanges: [],
     sofMarker: -1,
     budgetExhausted: false,
+    appRanges: [],
   };
   if (
     start < 0 ||
@@ -177,12 +180,15 @@ function scanJpegStream(
   let hasSos = false;
   let sofMarker = -1;
   const skippedRanges: ByteRange[] = [];
+  const appRanges: ByteRange[] = [];
   const exhausted = (): JpegStreamScanResult => ({ ...invalid, budgetExhausted: true });
 
   while (cursor + 1 < maxEnd) {
     if (budget && --budget.remaining < 0) return exhausted();
     if (bytes[cursor] !== 0xff) return invalid;
     while (cursor < maxEnd && bytes[cursor] === 0xff) {
+      // Every 0xFF fill byte costs one unit, so long fill runs cannot bypass the budget
+      if (budget && --budget.remaining < 0) return exhausted();
       cursor++;
     }
     if (cursor >= maxEnd) return invalid;
@@ -198,7 +204,9 @@ function scanJpegStream(
       return { ...invalid, nestedSoiOffset: cursor - 2, skippedRanges };
     }
     if (marker === 0xd9) {
-      return hasSof && hasSos ? { ...invalid, valid: true, endOffset: cursor, sofMarker } : invalid;
+      return hasSof && hasSos
+        ? { ...invalid, valid: true, endOffset: cursor, sofMarker, appRanges }
+        : invalid;
     }
     if (marker < 0xc0 || marker > 0xfe) {
       return invalid;
@@ -240,6 +248,7 @@ function scanJpegStream(
         if (bytes[scan] === 0xff) {
           let nextPos = scan + 1;
           while (nextPos < maxEnd && bytes[nextPos] === 0xff) {
+            if (budget && --budget.remaining < 0) return exhausted();
             nextPos++;
           }
           if (nextPos >= maxEnd) return invalid;
@@ -253,7 +262,7 @@ function scanJpegStream(
             return { ...invalid, nestedSoiOffset: nextPos - 1, skippedRanges };
           }
           if (next === 0xd9) {
-            return { ...invalid, valid: true, endOffset: nextPos + 1, sofMarker };
+            return { ...invalid, valid: true, endOffset: nextPos + 1, sofMarker, appRanges };
           }
           // Non-RST marker ends current scan's entropy data; resume marker loop to skip its segment
           nextMarkerCursor = nextPos - 1;
@@ -267,12 +276,27 @@ function scanJpegStream(
     } else {
       if (segLen > 2) {
         skippedRanges.push({ start: cursor + 2, end: cursor + segLen });
+        if (marker >= 0xe0 && marker <= 0xef) {
+          appRanges.push({ start: cursor + 2, end: cursor + segLen });
+        }
       }
       cursor += segLen;
     }
   }
 
   return invalid;
+}
+
+/** Test-only access to the stream walker so budget behaviour can be asserted deterministically. */
+export function scanJpegStreamForTest(
+  bytes: Uint8Array,
+  start: number,
+  maxEnd: number,
+  budget?: { remaining: number }
+): { valid: boolean; endOffset: number; budgetExhausted: boolean } {
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const res = scanJpegStream(bytes, view, start, maxEnd, budget);
+  return { valid: res.valid, endOffset: res.endOffset, budgetExhausted: res.budgetExhausted };
 }
 
 /**
@@ -344,14 +368,17 @@ function collectTiffIfdJpegCandidates(
 ): CandidateSlice[] {
   const candidates: CandidateSlice[] = [];
   const recordCandidate = (start: number, length: number) => {
-    const key = `${start}:${length}`;
-    if (seenOffsets.has(key)) return;
     const end = start + length;
     if (start < 0 || length < 16 || end > bytes.length) return;
     // Rejects lossless (SOF3) raw sensor strips so the real preview is tried first
-    if (!isDecodablePreviewScan(scanJpegStream(bytes, view, start, end))) return;
+    const res = scanJpegStream(bytes, view, start, end);
+    if (!isDecodablePreviewScan(res)) return;
+    // Trim padding after EOI so the slice and its key match the same stream found by the scan
+    const streamLength = res.endOffset - start;
+    const key = `${start}:${streamLength}`;
+    if (seenOffsets.has(key)) return;
     seenOffsets.add(key);
-    candidates.push({ start, length });
+    candidates.push({ start, length: streamLength });
   };
 
   // Inspect TIFF-based RAW IFD directories (IFD0, SubIFDs 0x014A, and chained IFDs)
@@ -397,6 +424,9 @@ function collectTiffIfdJpegCandidates(
           stripOffsets = readUintArray(view, 0, entryPos, type, count, littleEndian, bytes.length);
         } else if (tag === 0x0117 && (type === 3 || type === 4)) {
           stripCounts = readUintArray(view, 0, entryPos, type, count, littleEndian, bytes.length);
+        } else if (tag === 0x002e && type === 7 && count > 4) {
+          // Panasonic RW2 JpgFromRaw: UNDEFINED bytes whose value field is the preview offset
+          recordCandidate(view.getUint32(entryPos + 8, littleEndian), count);
         } else if (tag === 0x014a && (type === 3 || type === 4 || type === 13)) {
           const subOffsets = readUintArray(
             view,
@@ -436,12 +466,25 @@ function collectTiffIfdJpegCandidates(
   return candidates;
 }
 
+function createScanBudget(bytes: Uint8Array): ScanBudget {
+  // Linear work cap across all stream walks; once spent, keep what was found so far
+  return { remaining: 4 * bytes.length + (1 << 20) };
+}
+
+interface BufferScanResult {
+  candidates: CandidateSlice[];
+  /** APP payloads inside accepted streams, revisited only if earlier candidates fail to decode. */
+  deferred: ByteRange[];
+}
+
 function scanRawBufferForJpegCandidates(
   bytes: Uint8Array,
   view: DataView,
-  seenOffsets: Set<string>
-): CandidateSlice[] {
+  seenOffsets: Set<string>,
+  budget: ScanBudget = createScanBudget(bytes)
+): BufferScanResult {
   const candidates: CandidateSlice[] = [];
+  const deferred: ByteRange[] = [];
 
   // Locate the last EOI (0xFF 0xD9) once so candidates after it are rejected without rescanning
   let lastEoiOffset = -1;
@@ -451,11 +494,9 @@ function scanRawBufferForJpegCandidates(
       break;
     }
   }
-  if (lastEoiOffset <= 0) return candidates;
+  if (lastEoiOffset <= 0) return { candidates, deferred };
 
   const scanBound = Math.min(bytes.length, lastEoiOffset + 2);
-  // Linear work cap across all stream walks; once spent, keep what was found so far
-  const budget: ScanBudget = { remaining: 4 * bytes.length + (1 << 20) };
   let maxAcceptedEnd = 0;
   const stack: ByteRange[] = [{ start: 0, end: lastEoiOffset }];
 
@@ -494,6 +535,7 @@ function scanRawBufferForJpegCandidates(
               candidates.push({ start: pos, length: streamLen });
             }
           }
+          deferred.push(...res.appRanges);
           maxAcceptedEnd = Math.max(maxAcceptedEnd, res.endOffset);
           pos = res.endOffset;
           continue;
@@ -503,6 +545,44 @@ function scanRawBufferForJpegCandidates(
     }
   }
 
+  candidates.sort((a, b) => b.length - a.length);
+  return { candidates, deferred };
+}
+
+/** Finds decodable streams that start and end inside deferred APP payload ranges. */
+function scanDeferredRanges(
+  bytes: Uint8Array,
+  view: DataView,
+  ranges: ByteRange[],
+  seenOffsets: Set<string>,
+  budget: ScanBudget
+): CandidateSlice[] {
+  const candidates: CandidateSlice[] = [];
+  outer: for (const range of ranges) {
+    let pos = range.start;
+    while (pos + 4 < range.end) {
+      if (bytes[pos] === 0xff && bytes[pos + 1] === 0xd8 && bytes[pos + 2] === 0xff) {
+        const res = scanJpegStream(bytes, view, pos, range.end, budget);
+        if (res.budgetExhausted) break outer;
+        if (res.valid && res.endOffset > pos) {
+          const streamLen = res.endOffset - pos;
+          const key = `${pos}:${streamLen}`;
+          if (
+            streamLen >= MIN_SCANNED_PREVIEW_BYTES &&
+            isDecodablePreviewScan(res) &&
+            !seenOffsets.has(key)
+          ) {
+            seenOffsets.add(key);
+            candidates.push({ start: pos, length: streamLen });
+          }
+          pos = res.endOffset;
+          continue;
+        }
+      }
+      if (budget && --budget.remaining < 0) break outer;
+      pos++;
+    }
+  }
   candidates.sort((a, b) => b.length - a.length);
   return candidates;
 }
@@ -532,13 +612,17 @@ export function readRawContainerOrientation(buffer: ArrayBuffer): number {
   return 1;
 }
 
-function jpegHasExifApp1(jpeg: Uint8Array): boolean {
+/**
+ * Returns the Orientation (1..8) from the first Exif APP1 of a JPEG, or 0 when there is no
+ * Exif APP1, no Orientation entry in IFD0, or the entry is malformed or out of range.
+ */
+export function readJpegExifOrientation(jpeg: Uint8Array): number {
   let offset = 2;
   while (offset + 4 <= jpeg.length && jpeg[offset] === 0xff) {
     const marker = jpeg[offset + 1];
-    if (marker === 0xda || marker === 0xd9) return false;
+    if (marker === 0xda || marker === 0xd9) return 0;
     const segLen = (jpeg[offset + 2] << 8) | jpeg[offset + 3];
-    if (segLen < 2) return false;
+    if (segLen < 2) return 0;
     if (
       marker === 0xe1 &&
       offset + 10 <= jpeg.length &&
@@ -549,18 +633,36 @@ function jpegHasExifApp1(jpeg: Uint8Array): boolean {
       jpeg[offset + 8] === 0x00 &&
       jpeg[offset + 9] === 0x00
     ) {
-      return true;
+      const segEnd = Math.min(jpeg.length, offset + 2 + segLen);
+      const tiff = offset + 10;
+      if (tiff + 8 > segEnd) return 0;
+      const v = new DataView(jpeg.buffer, jpeg.byteOffset, jpeg.byteLength);
+      const le = jpeg[tiff] === 0x49 && jpeg[tiff + 1] === 0x49;
+      if (!le && !(jpeg[tiff] === 0x4d && jpeg[tiff + 1] === 0x4d)) return 0;
+      const ifd0 = tiff + v.getUint32(tiff + 4, le);
+      if (ifd0 + 2 > segEnd) return 0;
+      const entries = v.getUint16(ifd0, le);
+      for (let i = 0; i < entries; i++) {
+        const e = ifd0 + 2 + i * 12;
+        if (e + 12 > segEnd) return 0;
+        if (v.getUint16(e, le) !== 0x0112) continue;
+        if (v.getUint16(e + 2, le) !== 3 || v.getUint32(e + 4, le) !== 1) return 0;
+        const value = v.getUint16(e + 8, le);
+        return value >= 1 && value <= 8 ? value : 0;
+      }
+      return 0;
     }
     offset += 2 + segLen;
   }
-  return false;
+  return 0;
 }
 
 /**
  * Losslessly tags an embedded RAW preview with the container's EXIF Orientation by inserting a
  * minimal APP1 Exif segment right after SOI, so browsers rotate it on decode (image-orientation:
- * from-image). Previews that already carry their own Exif APP1 are returned unchanged, since the
- * camera wrote their orientation for that stream.
+ * from-image). Previews whose own Exif APP1 carries a valid Orientation are returned unchanged,
+ * since the camera wrote it for that stream. When a preview has Exif but no valid Orientation,
+ * the minimal segment goes first: decoders read orientation from the first Exif APP1.
  */
 export function withJpegOrientation(
   jpeg: Uint8Array<ArrayBuffer>,
@@ -568,7 +670,7 @@ export function withJpegOrientation(
 ): Uint8Array<ArrayBuffer> {
   if (orientation < 2 || orientation > 8) return jpeg;
   if (jpeg.length < 4 || jpeg[0] !== 0xff || jpeg[1] !== 0xd8) return jpeg;
-  if (jpegHasExifApp1(jpeg)) return jpeg;
+  if (readJpegExifOrientation(jpeg) > 0) return jpeg;
 
   // FFE1 + len(34) + "Exif\0\0" + TIFF header (II, 42, IFD0@8) + 1 entry + next-IFD 0
   const app1 = new Uint8Array(36);
@@ -610,7 +712,13 @@ function* iterateRawPreviewCandidates(bytes: Uint8Array): Generator<CandidateSli
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const seenOffsets = new Set<string>();
   yield* collectTiffIfdJpegCandidates(bytes, view, seenOffsets);
-  yield* scanRawBufferForJpegCandidates(bytes, view, seenOffsets);
+  const budget = createScanBudget(bytes);
+  const { candidates, deferred } = scanRawBufferForJpegCandidates(bytes, view, seenOffsets, budget);
+  yield* candidates;
+  // Reached only when every enclosing candidate above failed to decode (or none existed)
+  if (deferred.length > 0) {
+    yield* scanDeferredRanges(bytes, view, deferred, seenOffsets, budget);
+  }
 }
 
 /**
@@ -646,12 +754,13 @@ export async function extractDecodableEmbeddedJpegFromRawBuffer(
   const orientation = readRawContainerOrientation(buffer);
   let attempts = 0;
   for (const candidate of iterateRawPreviewCandidates(bytes)) {
-    if (attempts >= MAX_RAW_PREVIEW_DECODE_ATTEMPTS) break;
     attempts += 1;
     const blob = sliceToJpegBlob(bytes, candidate, orientation);
     if (await verifyDecodableImageBlob(blob)) {
       return blob;
     }
+    // Break before for...of resumes the generator, so no further scan work runs past the cap
+    if (attempts >= MAX_RAW_PREVIEW_DECODE_ATTEMPTS) break;
   }
   return null;
 }
