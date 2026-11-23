@@ -320,6 +320,11 @@ test('analyzeAutoCorrection and applyAutoCorrectionToRgba optimize underexposed 
   assert.ok(corr.exposureEv > 0.1, `Expected positive EV boost, got ${corr.exposureEv}`);
   assert.ok(corr.contrast >= 12, `Expected contrast boost >= 12, got ${corr.contrast}`);
   assert.ok(corr.wbTempShift > 0, `Expected warm WB shift to neutralize blue cast, got ${corr.wbTempShift}`);
+  assert.equal(corr.lumaHistogram.length, 64, 'Expected 64-bin luminance histogram');
+  assert.ok(
+    corr.lumaHistogram.every((bin) => bin >= 0 && bin <= 1) && corr.lumaHistogram.some((bin) => bin > 0),
+    'Expected normalized luminance histogram bins in [0, 1] with non-zero peaks'
+  );
 
   // Test zero, intermediate (50%), and full (100%) strength using separate copies
   const rgbaOriginal = new Uint8ClampedArray(rgba);

@@ -3,6 +3,9 @@ import assert from 'node:assert/strict';
 import {
   parseExifFromArrayBuffer,
   injectApp1ExifIntoJpegBlob,
+  extractEmbeddedJpegFromRawBuffer,
+  extractEmbeddedJpegCandidatesFromRawBuffer,
+  verifyDecodableImageBlob,
 } from './exifParser';
 
 test('parseExifFromArrayBuffer returns empty fields for missing metadata instead of fabricated Sony defaults', () => {
@@ -870,5 +873,228 @@ test('injectApp1ExifIntoJpegBlob clamps thumbnail range ending past segment', as
   // The in-bounds portion of thumbnail range (byte 60..80) should be cleared
   for (let i = 2 + tiffStart + 50; i < 2 + totalLen; i++) {
     assert.equal(injected[i], 0x00, `Expected byte at ${i} to be zeroed`);
+  }
+});
+
+test('extractEmbeddedJpegFromRawBuffer rejects SOF-missing and SOS-missing candidates independently and handles fallback scanning', async () => {
+  // Valid minimal structural JPEG stream: SOI + SOF0 (16x16) + SOS + scan data + EOI
+  const validJpeg = new Uint8Array([
+    0xff, 0xd8, // SOI
+    0xff, 0xc0, 0x00, 0x11, 0x08, 0x00, 0x10, 0x00, 0x10, 0x03, // SOF0: 16x16, 3 components
+    0x01, 0x11, 0x00, 0x02, 0x11, 0x00, 0x03, 0x11, 0x00,
+    0xff, 0xda, 0x00, 0x0c, 0x03, 0x01, 0x00, 0x02, 0x00, 0x03, 0x00, 0x00, 0x3f, 0x00, // SOS
+    0xab, 0xcd, 0xef, // entropy scan bytes
+    0xff, 0xd9, // EOI
+  ]);
+
+  // Well-formed JPEG marker sequence with APP0 + SOS + EOI, but missing SOF (reaches !hasSof check)
+  const missingSofCandidate = new Uint8Array([
+    0xff, 0xd8, // SOI
+    0xff, 0xe0, 0x00, 0x10, // APP0 (16 bytes total)
+    0x4a, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00,
+    0xff, 0xda, 0x00, 0x0c, 0x03, 0x01, 0x00, 0x02, 0x00, 0x03, 0x00, 0x00, 0x3f, 0x00, // SOS
+    0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, // scan bytes (makes fixture larger than validJpeg)
+    0xff, 0xd9, // EOI
+  ]);
+
+  // Well-formed JPEG marker sequence with SOF0 + APP0 + EOI, but missing SOS (reaches EOI-before-SOS check)
+  const missingSosCandidate = new Uint8Array([
+    0xff, 0xd8, // SOI
+    0xff, 0xc0, 0x00, 0x11, 0x08, 0x00, 0x10, 0x00, 0x10, 0x03, // SOF0: 16x16
+    0x01, 0x11, 0x00, 0x02, 0x11, 0x00, 0x03, 0x11, 0x00,
+    0xff, 0xe0, 0x00, 0x10, // APP0 (16 bytes total)
+    0x4a, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00,
+    0xff, 0xd9, // EOI before any SOS
+  ]);
+
+  const makeSingleIfdRaw = (payload: Uint8Array): ArrayBuffer => {
+    const out = new Uint8Array(40 + payload.length);
+    const v = new DataView(out.buffer);
+    v.setUint16(0, 0x4949, false);
+    v.setUint16(2, 42, true);
+    v.setUint32(4, 8, true);
+    v.setUint16(8, 2, true);
+    v.setUint16(10, 0x0201, true);
+    v.setUint16(12, 4, true);
+    v.setUint32(14, 1, true);
+    v.setUint32(18, 40, true);
+    v.setUint16(22, 0x0202, true);
+    v.setUint16(24, 4, true);
+    v.setUint32(26, 1, true);
+    v.setUint32(30, payload.length, true);
+    v.setUint32(34, 0, true);
+    out.set(payload, 40);
+    return out.buffer;
+  };
+
+  // Independently verify missing-SOF and missing-SOS rejection
+  assert.equal(extractEmbeddedJpegFromRawBuffer(makeSingleIfdRaw(missingSofCandidate)), null);
+  assert.equal(extractEmbeddedJpegFromRawBuffer(makeSingleIfdRaw(missingSosCandidate)), null);
+
+  // Construct synthetic TIFF/DNG buffer:
+  // IFD0 points to the larger missingSofCandidate; IFD1 points to the valid structural JPEG.
+  const buf = new Uint8Array(74 + missingSofCandidate.length + validJpeg.length);
+  const view = new DataView(buf.buffer);
+  view.setUint16(0, 0x4949, false); // 'II'
+  view.setUint16(2, 42, true);
+  view.setUint32(4, 8, true); // IFD0 at 8
+
+  const invalidOffset = 74;
+  const validOffset = invalidOffset + missingSofCandidate.length;
+
+  // IFD0 at 8: 2 entries pointing to missingSofCandidate, next IFD at 44
+  view.setUint16(8, 2, true);
+  view.setUint16(10, 0x0201, true);
+  view.setUint16(12, 4, true);
+  view.setUint32(14, 1, true);
+  view.setUint32(18, invalidOffset, true);
+  view.setUint16(22, 0x0202, true);
+  view.setUint16(24, 4, true);
+  view.setUint32(26, 1, true);
+  view.setUint32(30, missingSofCandidate.length, true);
+  view.setUint32(34, 44, true); // IFD1 at 44
+
+  // IFD1 at 44: 2 entries pointing to validJpeg
+  view.setUint16(44, 2, true);
+  view.setUint16(46, 0x0201, true);
+  view.setUint16(48, 4, true);
+  view.setUint32(50, 1, true);
+  view.setUint32(54, validOffset, true);
+  view.setUint16(58, 0x0202, true);
+  view.setUint16(60, 4, true);
+  view.setUint32(62, 1, true);
+  view.setUint32(66, validJpeg.length, true);
+  view.setUint32(70, 0, true);
+
+  buf.set(missingSofCandidate, invalidOffset);
+  buf.set(validJpeg, validOffset);
+
+  const candidates = extractEmbeddedJpegCandidatesFromRawBuffer(buf.buffer);
+  assert.equal(candidates.length, 1);
+  assert.equal(candidates[0].size, validJpeg.length);
+
+  const preview = extractEmbeddedJpegFromRawBuffer(buf.buffer);
+  assert.ok(preview instanceof Blob);
+  assert.equal(preview.type, 'image/jpeg');
+  assert.equal(preview.size, validJpeg.length);
+
+  // Fallback stream scan (>= 512 bytes): malformed candidate followed by valid JPEG with consecutive 0xFF fill bytes
+  const fallbackPreview = new Uint8Array(560);
+  fallbackPreview[0] = 0xff;
+  fallbackPreview[1] = 0xd8;
+  fallbackPreview[2] = 0xff;
+  fallbackPreview[3] = 0xff; // 0xFF fill byte before SOF0
+  fallbackPreview[4] = 0xc0;
+  fallbackPreview.set([0x00, 0x11, 0x08, 0x00, 0x10, 0x00, 0x10, 0x03, 0x01, 0x11, 0x00, 0x02, 0x11, 0x00, 0x03, 0x11, 0x00], 5);
+  fallbackPreview[22] = 0xff;
+  fallbackPreview[23] = 0xda;
+  fallbackPreview.set([0x00, 0x0c, 0x03, 0x01, 0x00, 0x02, 0x00, 0x03, 0x00, 0x00, 0x3f, 0x00], 24);
+  fallbackPreview[558] = 0xff;
+  fallbackPreview[559] = 0xd9;
+
+  const rafWrapper = new Uint8Array(24 + fallbackPreview.length + 32);
+  // Precede with a malformed SOI header before the real stream
+  rafWrapper[8] = 0xff;
+  rafWrapper[9] = 0xd8;
+  rafWrapper[10] = 0xff;
+  rafWrapper[11] = 0xe1;
+  rafWrapper[12] = 0xff; // huge invalid segLen that breaks header parse
+  rafWrapper[13] = 0xff;
+  rafWrapper.set(fallbackPreview, 24);
+  // Trailing SOI after the last EOI must not hang or match
+  rafWrapper[24 + fallbackPreview.length + 4] = 0xff;
+  rafWrapper[24 + fallbackPreview.length + 5] = 0xd8;
+  rafWrapper[24 + fallbackPreview.length + 6] = 0xff;
+
+  const fallbackFound = extractEmbeddedJpegFromRawBuffer(rafWrapper.buffer);
+  assert.ok(fallbackFound instanceof Blob);
+  assert.equal(fallbackFound.size, fallbackPreview.length);
+
+  // Truncated-scan candidate (valid SOI + SOF0 + SOS + scan data, missing EOI) followed by valid JPEG
+  const truncatedScanPrefix = new Uint8Array([
+    0xff, 0xd8, // SOI
+    0xff, 0xc0, 0x00, 0x11, 0x08, 0x00, 0x10, 0x00, 0x10, 0x03, // SOF0: 16x16
+    0x01, 0x11, 0x00, 0x02, 0x11, 0x00, 0x03, 0x11, 0x00,
+    0xff, 0xda, 0x00, 0x0c, 0x03, 0x01, 0x00, 0x02, 0x00, 0x03, 0x00, 0x00, 0x3f, 0x00, // SOS
+    0x12, 0x34, 0x56, 0x78, // truncated scan without EOI
+  ]);
+
+  const truncatedScanWrapper = new Uint8Array(16 + truncatedScanPrefix.length + fallbackPreview.length + 16);
+  truncatedScanWrapper.set(truncatedScanPrefix, 16);
+  truncatedScanWrapper.set(fallbackPreview, 16 + truncatedScanPrefix.length);
+
+  const recoveredFromTruncated = extractEmbeddedJpegFromRawBuffer(truncatedScanWrapper.buffer);
+  assert.ok(recoveredFromTruncated instanceof Blob);
+  assert.equal(recoveredFromTruncated.size, fallbackPreview.length);
+
+  // Multi-scan / progressive JPEG: SOI + SOF2 + SOS (scan 1) + DHT + SOS (scan 2, with 0xFF 0x00) + EOI
+  const progressiveJpeg = new Uint8Array(560);
+  progressiveJpeg[0] = 0xff;
+  progressiveJpeg[1] = 0xd8; // SOI
+  progressiveJpeg[2] = 0xff;
+  progressiveJpeg[3] = 0xc2; // SOF2 (progressive)
+  progressiveJpeg.set([0x00, 0x11, 0x08, 0x00, 0x10, 0x00, 0x10, 0x03, 0x01, 0x11, 0x00, 0x02, 0x11, 0x00, 0x03, 0x11, 0x00], 4);
+  progressiveJpeg[21] = 0xff;
+  progressiveJpeg[22] = 0xda; // SOS scan 1
+  progressiveJpeg.set([0x00, 0x0c, 0x03, 0x01, 0x00, 0x02, 0x00, 0x03, 0x00, 0x00, 0x3f, 0x00], 23);
+  progressiveJpeg[35] = 0x12;
+  progressiveJpeg[36] = 0x34;
+  // Length-delimited DHT segment between scans (contains 0xFF 0xD8 payload bytes inside segment body)
+  progressiveJpeg[37] = 0xff;
+  progressiveJpeg[38] = 0xc4; // DHT
+  progressiveJpeg[39] = 0x00;
+  progressiveJpeg[40] = 0x08; // 8-byte segment
+  progressiveJpeg[41] = 0x10;
+  progressiveJpeg[42] = 0xff;
+  progressiveJpeg[43] = 0xd8; // payload bytes inside DHT (must be skipped by segLen, not treated as nested SOI)
+  progressiveJpeg[47] = 0xff;
+  progressiveJpeg[48] = 0xda; // SOS scan 2
+  progressiveJpeg.set([0x00, 0x08, 0x01, 0x01, 0x00, 0x01, 0x3f, 0x00], 49);
+  progressiveJpeg[60] = 0xff;
+  progressiveJpeg[61] = 0x00; // stuffed 0xFF inside scan 2 entropy data
+  progressiveJpeg[558] = 0xff;
+  progressiveJpeg[559] = 0xd9; // EOI
+
+  const progIfdResult = extractEmbeddedJpegFromRawBuffer(makeSingleIfdRaw(progressiveJpeg));
+  assert.ok(progIfdResult instanceof Blob);
+  assert.equal(progIfdResult.size, progressiveJpeg.length);
+
+  const progFallbackBuf = new Uint8Array(16 + progressiveJpeg.length + 16);
+  progFallbackBuf.set(progressiveJpeg, 16);
+  const progFallbackResult = extractEmbeddedJpegFromRawBuffer(progFallbackBuf.buffer);
+  assert.ok(progFallbackResult instanceof Blob);
+  assert.equal(progFallbackResult.size, progressiveJpeg.length);
+
+  // Test browser-decoder verification with valid and failing decode responses
+  const origDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'createImageBitmap');
+  try {
+    Object.defineProperty(globalThis, 'createImageBitmap', {
+      configurable: true,
+      writable: true,
+      value: async (blob: Blob) => {
+        const bytes = new Uint8Array(await blob.arrayBuffer());
+        // Simulate real browser decoder rejecting malformed candidate bytes
+        if (bytes.length === validJpeg.length && bytes[2] === 0xff && bytes[3] === 0xc0) {
+          return { width: 16, height: 16, close: () => {} };
+        }
+        throw new Error('Invalid image bitstream');
+      },
+    });
+
+    assert.equal(await verifyDecodableImageBlob(preview), true);
+    assert.equal(
+      await verifyDecodableImageBlob(new Blob([missingSofCandidate], { type: 'image/jpeg' })),
+      false
+    );
+    assert.equal(
+      await verifyDecodableImageBlob(new Blob([missingSosCandidate], { type: 'image/jpeg' })),
+      false
+    );
+  } finally {
+    if (origDescriptor) {
+      Object.defineProperty(globalThis, 'createImageBitmap', origDescriptor);
+    } else {
+      delete (globalThis as { createImageBitmap?: unknown }).createImageBitmap;
+    }
   }
 });

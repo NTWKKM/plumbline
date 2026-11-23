@@ -85,6 +85,7 @@ export interface AutoCorrectAnalysis {
   estimatedKelvin?: number; // Estimated scene CCT (e.g. 5500K)
   wbProfile?: WbProfileMode;
   ambientWarmthRetainedPercent?: number; // % of original Golden Hour / ambient tone preserved
+  lumaHistogram: number[]; // Normalized 64-bin luminance distribution [0..1]
 }
 
 export interface PipelineTelemetryUpdate {
@@ -119,6 +120,7 @@ export const DEFAULT_AUTO_CORRECT_ANALYSIS: AutoCorrectAnalysis = {
   estimatedKelvin: 5500,
   wbProfile: 'ambient',
   ambientWarmthRetainedPercent: 35,
+  lumaHistogram: new Array<number>(64).fill(0),
 };
 
 export const MAX_AUTO_ANGLE_LIMIT_DEG = 15.0;
@@ -1395,6 +1397,7 @@ export function analyzeAutoCorrection(
       estimatedKelvin: 5500,
       wbProfile,
       ambientWarmthRetainedPercent: wbProfile === 'ambient' ? 35 : 0,
+      lumaHistogram: new Array<number>(64).fill(0),
     };
   }
 
@@ -1487,6 +1490,7 @@ export function analyzeAutoCorrection(
       estimatedKelvin: 5500,
       wbProfile,
       ambientWarmthRetainedPercent: wbProfile === 'ambient' ? 35 : 0,
+      lumaHistogram: new Array<number>(64).fill(0),
     };
   }
 
@@ -1592,6 +1596,13 @@ export function analyzeAutoCorrection(
     clamp(Math.log2(Math.max(2, p995 - p005 + 1)) * 1.42, 1.0, 11.5).toFixed(1)
   );
 
+  const lumaBins = new Array<number>(64).fill(0);
+  for (let i = 0; i < 256; i++) {
+    lumaBins[i >> 2] += lumaHist[i];
+  }
+  const maxBin = Math.max(1, ...lumaBins);
+  const lumaHistogram = lumaBins.map((count) => Number((count / maxBin).toFixed(3)));
+
   return {
     exposureEv,
     contrast,
@@ -1606,6 +1617,7 @@ export function analyzeAutoCorrection(
     estimatedKelvin,
     wbProfile,
     ambientWarmthRetainedPercent,
+    lumaHistogram,
   };
 }
 

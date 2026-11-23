@@ -22,6 +22,35 @@ const DEFAULT_FALLBACK_EXIF: ExifData = {
   colorSpace: 'sRGB',
 };
 
+export const SUPPORTED_RAW_EXTENSIONS = [
+  'cr2',
+  'nef',
+  'arw',
+  'dng',
+  'raf',
+  'orf',
+  'rw2',
+] as const;
+
+export const SUPPORTED_IMAGE_EXTENSIONS = [
+  'jpg',
+  'jpeg',
+  'png',
+  'webp',
+  ...SUPPORTED_RAW_EXTENSIONS,
+] as const;
+
+export const SUPPORTED_IMAGE_ACCEPT = SUPPORTED_IMAGE_EXTENSIONS.map((ext) => `.${ext}`).join(',');
+
+export function isRawFileExtension(ext: string): boolean {
+  return (SUPPORTED_RAW_EXTENSIONS as readonly string[]).includes(ext.toLowerCase());
+}
+
+export function isSupportedImageOrRawFileName(fileName: string): boolean {
+  const ext = fileName.split('.').pop()?.toLowerCase() || '';
+  return (SUPPORTED_IMAGE_EXTENSIONS as readonly string[]).includes(ext);
+}
+
 export function parseExifFromArrayBuffer(
   buffer: ArrayBuffer,
   fileName: string
@@ -29,7 +58,7 @@ export function parseExifFromArrayBuffer(
   const bytes = new Uint8Array(buffer);
   const view = new DataView(buffer);
   const ext = fileName.split('.').pop()?.toLowerCase() || 'jpg';
-  const isRawContainer = ['cr2', 'nef', 'arw', 'dng', 'raf', 'orf', 'rw2'].includes(ext);
+  const isRawContainer = isRawFileExtension(ext);
 
   let rawApp1Segment: Uint8Array | null = null;
   let tiffOffset = -1;
@@ -87,6 +116,331 @@ export function parseExifFromArrayBuffer(
   };
 
   return { exif, rawApp1Segment, isRawContainer };
+}
+
+interface JpegStreamScanResult {
+  valid: boolean;
+  endOffset: number;
+  nestedSoiOffset: number;
+}
+
+/**
+ * Walks a JPEG stream from `start` up to `maxEnd`, supporting both single-scan
+ * and progressive/multi-scan JPEGs with length-delimited markers between scans.
+ */
+function scanJpegStream(
+  bytes: Uint8Array,
+  view: DataView,
+  start: number,
+  maxEnd: number
+): JpegStreamScanResult {
+  const invalid: JpegStreamScanResult = { valid: false, endOffset: -1, nestedSoiOffset: -1 };
+  if (
+    start < 0 ||
+    maxEnd - start < 16 ||
+    maxEnd > bytes.length ||
+    bytes[start] !== 0xff ||
+    bytes[start + 1] !== 0xd8 ||
+    bytes[start + 2] !== 0xff
+  ) {
+    return invalid;
+  }
+
+  let cursor = start + 2;
+  let hasSof = false;
+  let hasSos = false;
+
+  while (cursor + 1 < maxEnd) {
+    if (bytes[cursor] !== 0xff) return invalid;
+    while (cursor < maxEnd && bytes[cursor] === 0xff) {
+      cursor++;
+    }
+    if (cursor >= maxEnd) return invalid;
+
+    const marker = bytes[cursor];
+    cursor++;
+
+    if (marker === 0x00) return invalid;
+    if (marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7)) {
+      continue;
+    }
+    if (marker === 0xd8) {
+      return { valid: false, endOffset: -1, nestedSoiOffset: cursor - 2 };
+    }
+    if (marker === 0xd9) {
+      return hasSof && hasSos
+        ? { valid: true, endOffset: cursor, nestedSoiOffset: -1 }
+        : invalid;
+    }
+    if (marker < 0xc0 || marker > 0xfe) {
+      return invalid;
+    }
+
+    if (cursor + 2 > maxEnd) return invalid;
+    const segLen = view.getUint16(cursor, false);
+    if (segLen < 2 || cursor + segLen > maxEnd) return invalid;
+
+    const isSofMarker =
+      marker >= 0xc0 &&
+      marker <= 0xcf &&
+      marker !== 0xc4 &&
+      marker !== 0xc8 &&
+      marker !== 0xcc;
+
+    if (isSofMarker) {
+      if (segLen < 7 || cursor + 7 > maxEnd) return invalid;
+      const frameHeight = view.getUint16(cursor + 3, false);
+      const frameWidth = view.getUint16(cursor + 5, false);
+      if (frameWidth <= 0 || frameHeight <= 0) return invalid;
+      hasSof = true;
+      cursor += segLen;
+    } else if (marker === 0xda) {
+      if (!hasSof || segLen < 6) return invalid;
+      hasSos = true;
+      let scan = cursor + segLen;
+      let nextMarkerCursor = -1;
+
+      while (scan + 1 < maxEnd) {
+        if (bytes[scan] === 0xff) {
+          let nextPos = scan + 1;
+          while (nextPos < maxEnd && bytes[nextPos] === 0xff) {
+            nextPos++;
+          }
+          if (nextPos >= maxEnd) return invalid;
+          const next = bytes[nextPos];
+          if (next === 0x00 || (next >= 0xd0 && next <= 0xd7)) {
+            scan = nextPos + 1;
+            continue;
+          }
+          if (next === 0xd8) {
+            // Unescaped nested SOI inside entropy data indicates a truncated/corrupt stream
+            return { valid: false, endOffset: -1, nestedSoiOffset: nextPos - 1 };
+          }
+          if (next === 0xd9) {
+            return { valid: true, endOffset: nextPos + 1, nestedSoiOffset: -1 };
+          }
+          // Non-RST marker ends current scan's entropy data; resume marker loop to skip its segment
+          nextMarkerCursor = nextPos - 1;
+          break;
+        }
+        scan++;
+      }
+
+      if (nextMarkerCursor < 0) return invalid;
+      cursor = nextMarkerCursor;
+    } else {
+      cursor += segLen;
+    }
+  }
+
+  return invalid;
+}
+
+/**
+ * Validates that a byte slice contains a structurally complete JPEG stream:
+ * SOI (0xFFD8), at least one SOF frame header with non-zero dimensions,
+ * an SOS scan header (0xFFDA), and an EOI marker (0xFFD9).
+ */
+export function isValidJpegSlice(
+  bytes: Uint8Array,
+  view: DataView,
+  start: number,
+  length: number
+): boolean {
+  const end = start + length;
+  if (start < 0 || length < 16 || end > bytes.length) {
+    return false;
+  }
+  return scanJpegStream(bytes, view, start, end).valid;
+}
+
+/**
+ * Extracts all structurally valid embedded JPEG previews from a RAW/TIFF container
+ * (e.g. .DNG, .CR2, .NEF, .ARW, .RAF, .ORF, .RW2), ordered largest-first.
+ */
+export function extractEmbeddedJpegCandidatesFromRawBuffer(buffer: ArrayBuffer): Blob[] {
+  const bytes = new Uint8Array(buffer);
+  if (bytes.length < 16) return [];
+
+  const view = new DataView(buffer);
+  const candidates: Array<{ start: number; length: number }> = [];
+  const seenOffsets = new Set<string>();
+
+  const recordCandidate = (start: number, length: number) => {
+    const key = `${start}:${length}`;
+    if (seenOffsets.has(key)) return;
+    if (!isValidJpegSlice(bytes, view, start, length)) return;
+    seenOffsets.add(key);
+    candidates.push({ start, length });
+  };
+
+  // 1. Inspect TIFF-based RAW IFD directories (IFD0, SubIFDs 0x014A, and chained IFDs)
+  const isTiffLE = bytes[0] === 0x49 && bytes[1] === 0x49;
+  const isTiffBE = bytes[0] === 0x4d && bytes[1] === 0x4d;
+  if (isTiffLE || isTiffBE) {
+    const littleEndian = isTiffLE;
+    const magic = view.getUint16(2, littleEndian);
+    if (magic === 42) {
+      const queue: number[] = [];
+      const visited = new Set<number>();
+      const firstIfd = view.getUint32(4, littleEndian);
+      if (firstIfd >= 8 && firstIfd + 2 <= bytes.length) {
+        queue.push(firstIfd);
+      }
+
+      while (queue.length > 0 && visited.size < 64) {
+        const ifdOffset = queue.shift()!;
+        if (visited.has(ifdOffset) || ifdOffset < 8 || ifdOffset + 2 > bytes.length) continue;
+        visited.add(ifdOffset);
+
+        const entries = view.getUint16(ifdOffset, littleEndian);
+        let jpegOffset = -1;
+        let jpegLength = 0;
+        let stripOffsets: number[] = [];
+        let stripCounts: number[] = [];
+
+        for (let i = 0; i < entries; i++) {
+          const entryPos = ifdOffset + 2 + i * 12;
+          if (entryPos + 12 > bytes.length) break;
+          const tag = view.getUint16(entryPos, littleEndian);
+          const type = view.getUint16(entryPos + 2, littleEndian);
+          const count = view.getUint32(entryPos + 4, littleEndian);
+
+          if (tag === 0x0201 && count === 1 && (type === 3 || type === 4)) {
+            jpegOffset =
+              type === 4
+                ? view.getUint32(entryPos + 8, littleEndian)
+                : view.getUint16(entryPos + 8, littleEndian);
+          } else if (tag === 0x0202 && count === 1 && (type === 3 || type === 4)) {
+            jpegLength =
+              type === 4
+                ? view.getUint32(entryPos + 8, littleEndian)
+                : view.getUint16(entryPos + 8, littleEndian);
+          } else if (tag === 0x0111 && (type === 3 || type === 4)) {
+            stripOffsets = readUintArray(view, 0, entryPos, type, count, littleEndian, bytes.length);
+          } else if (tag === 0x0117 && (type === 3 || type === 4)) {
+            stripCounts = readUintArray(view, 0, entryPos, type, count, littleEndian, bytes.length);
+          } else if (tag === 0x014a && (type === 3 || type === 4 || type === 13)) {
+            const subOffsets = readUintArray(
+              view,
+              0,
+              entryPos,
+              type === 13 ? 4 : type,
+              count,
+              littleEndian,
+              bytes.length
+            );
+            for (const sub of subOffsets) {
+              if (!visited.has(sub) && sub >= 8 && sub + 2 <= bytes.length) {
+                queue.push(sub);
+              }
+            }
+          }
+        }
+
+        if (jpegOffset >= 0 && jpegLength > 0) {
+          recordCandidate(jpegOffset, jpegLength);
+        }
+        if (stripOffsets.length === 1 && stripCounts.length === 1) {
+          recordCandidate(stripOffsets[0], stripCounts[0]);
+        }
+
+        const nextIfdPos = ifdOffset + 2 + entries * 12;
+        if (nextIfdPos + 4 <= bytes.length) {
+          const nextIfd = view.getUint32(nextIfdPos, littleEndian);
+          if (nextIfd >= 8 && nextIfd + 2 <= bytes.length && !visited.has(nextIfd)) {
+            queue.push(nextIfd);
+          }
+        }
+      }
+    }
+  }
+
+  // 2. Fallback scan for embedded JPEG streams (e.g. Fujifilm RAF or non-standard RAW wrappers)
+  const maxTiffLength = candidates.reduce((max, item) => Math.max(max, item.length), 0);
+  if (maxTiffLength < 512) {
+    // Locate the last EOI (0xFF 0xD9) once so candidates after it are rejected without rescanning
+    let lastEoiOffset = -1;
+    for (let i = bytes.length - 2; i >= 0; i--) {
+      if (bytes[i] === 0xff && bytes[i + 1] === 0xd9) {
+        lastEoiOffset = i;
+        break;
+      }
+    }
+
+    let pos = 0;
+    const scanBound = Math.min(bytes.length, lastEoiOffset + 2);
+    while (pos + 4 < bytes.length && pos < lastEoiOffset) {
+      if (bytes[pos] === 0xff && bytes[pos + 1] === 0xd8 && bytes[pos + 2] === 0xff) {
+        const res = scanJpegStream(bytes, view, pos, scanBound);
+        if (res.nestedSoiOffset > pos) {
+          pos = res.nestedSoiOffset;
+          continue;
+        }
+        if (res.valid && res.endOffset > pos) {
+          const streamLen = res.endOffset - pos;
+          if (streamLen >= 512) {
+            recordCandidate(pos, streamLen);
+          }
+          pos = res.endOffset;
+          continue;
+        }
+      }
+      pos++;
+    }
+  }
+
+  candidates.sort((a, b) => b.length - a.length);
+  return candidates.map(
+    (c) => new Blob([bytes.slice(c.start, c.start + c.length)], { type: 'image/jpeg' })
+  );
+}
+
+/**
+ * Extracts the largest valid embedded JPEG preview from a RAW/TIFF container.
+ * Returns null if no structurally valid embedded JPEG preview exists.
+ */
+export function extractEmbeddedJpegFromRawBuffer(buffer: ArrayBuffer): Blob | null {
+  const candidates = extractEmbeddedJpegCandidatesFromRawBuffer(buffer);
+  return candidates[0] ?? null;
+}
+
+/**
+ * Verifies with the runtime browser image decoder (createImageBitmap or Image) that a Blob
+ * decodes to non-zero pixel dimensions before adding it to the studio queue.
+ */
+export async function verifyDecodableImageBlob(blob: Blob): Promise<boolean> {
+  if (typeof globalThis.createImageBitmap === 'function') {
+    try {
+      const bitmap = await globalThis.createImageBitmap(blob);
+      const ok = bitmap.width > 0 && bitmap.height > 0;
+      if (typeof bitmap.close === 'function') {
+        bitmap.close();
+      }
+      return ok;
+    } catch {
+      return false;
+    }
+  }
+
+  if (typeof globalThis.Image === 'function' && typeof URL.createObjectURL === 'function') {
+    const tempUrl = URL.createObjectURL(blob);
+    try {
+      return await new Promise<boolean>((resolve) => {
+        const img = new globalThis.Image();
+        img.onload = () => resolve(img.naturalWidth > 0 && img.naturalHeight > 0);
+        img.onerror = () => resolve(false);
+        img.src = tempUrl;
+      });
+    } finally {
+      URL.revokeObjectURL(tempUrl);
+    }
+  }
+
+  // Fallback for non-DOM environments without createImageBitmap/Image
+  const buf = await blob.arrayBuffer();
+  const bytes = new Uint8Array(buf);
+  return isValidJpegSlice(bytes, new DataView(buf), 0, bytes.length);
 }
 
 function readTiffIfdTags(
