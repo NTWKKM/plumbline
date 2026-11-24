@@ -12,6 +12,7 @@ import {
   MAX_RAW_PREVIEW_DECODE_ATTEMPTS,
   readJpegExifOrientation,
   collectIndexedCandidatesForTest,
+  scanDeferredRangesForTest,
   scanJpegStreamForTest,
   scanRawBufferForTest,
 } from './exifParser';
@@ -1689,4 +1690,148 @@ test('repeated 0x002E entries draw from one caller-owned budget and stop when it
   assert.equal(full.budgetExhausted, false);
   assert.equal(full.candidateCount, 1);
   assert.equal(oneWalk * (repeats + 1) - ample.remaining, oneWalk * repeats);
+});
+
+/** Copies `body` with an APP2 segment holding `payload` inserted right after SOI. */
+const withAppPayload = (body: Uint8Array, payload: Uint8Array): Uint8Array<ArrayBuffer> => {
+  const out = new Uint8Array(body.length + 4 + payload.length);
+  out.set(body.subarray(0, 2), 0);
+  out.set([0xff, 0xe2, ((payload.length + 2) >> 8) & 0xff, (payload.length + 2) & 0xff], 2);
+  out.set(payload, 6);
+  out.set(body.subarray(2), 6 + payload.length);
+  return out;
+};
+
+test('previews nested two APP levels deep are offered after each enclosing level, outermost first', async () => {
+  const inner = makeFrameJpeg(700, 0xc0, 0x22);
+  const middle = withAppPayload(makeFrameJpeg(900, 0xc0, 0x33), inner);
+  const outer = withAppPayload(makeFrameJpeg(1200, 0xc0, 0x44), middle);
+  const wrapper = new Uint8Array(16 + outer.length + 16);
+  wrapper.set(outer, 16);
+
+  const sizes = extractEmbeddedJpegCandidatesFromRawBuffer(wrapper.buffer).map((b) => b.size);
+  assert.deepEqual(sizes, [outer.length, middle.length, inner.length]);
+
+  // Only the innermost decodes: every level is tried in order and the inner one is returned
+  const tried: number[] = [];
+  await withMockedImageBitmap(
+    (bytes) => {
+      tried.push(bytes.length);
+      return bytes.length === inner.length;
+    },
+    async () => {
+      const blob = await extractDecodableEmbeddedJpegFromRawBuffer(wrapper.buffer);
+      assert.equal(blob?.size, inner.length);
+    }
+  );
+  assert.deepEqual(tried, [outer.length, middle.length, inner.length]);
+});
+
+test('deferred levels are scanned lazily: a decoded shallower candidate leaves deeper levels unscanned', () => {
+  const inner = makeFrameJpeg(700, 0xc0, 0x22);
+  const middle = withAppPayload(makeFrameJpeg(900, 0xc0, 0x33), inner);
+  const host = new Uint8Array(32 + middle.length);
+  host.set(middle, 16);
+  const range = [{ start: 8, end: host.length - 8 }];
+
+  const all = scanDeferredRangesForTest(host, range, { remaining: 1_000_000 });
+  assert.deepEqual(all.map((c) => c.length), [middle.length, inner.length]);
+
+  // Pulling only the first candidate stops before the nested level is scanned at all
+  const fullCost = { remaining: 1_000_000 };
+  scanDeferredRangesForTest(host, range, fullCost);
+  const firstCost = { remaining: 1_000_000 };
+  assert.equal(scanDeferredRangesForTest(host, range, firstCost, 1).length, 1);
+  assert.ok(firstCost.remaining > fullCost.remaining, 'the nested level must not be charged');
+});
+
+/** TIFF with IFD0 holding `repeats` copies of one out-of-line StripByteCounts LONG array of `count` values. */
+const makeRepeatedArrayTiff = (repeats: number, count: number): Uint8Array => {
+  const ifdSize = 2 + repeats * 12 + 4;
+  const dataStart = 8 + ifdSize;
+  const buf = new Uint8Array(dataStart + count * 4);
+  const v = new DataView(buf.buffer);
+  v.setUint16(0, 0x4949, false);
+  v.setUint16(2, 42, true);
+  v.setUint32(4, 8, true);
+  v.setUint16(8, repeats, true);
+  for (let i = 0; i < repeats; i++) {
+    const e = 10 + i * 12;
+    v.setUint16(e, 0x0117, true);
+    v.setUint16(e + 2, 4, true);
+    v.setUint32(e + 4, count, true);
+    v.setUint32(e + 8, dataStart, true);
+  }
+  return buf;
+};
+
+test('repeated out-of-line IFD arrays are charged per value and stop once the budget is spent', () => {
+  const count = 1000;
+  const repeats = 40;
+  const buf = makeRepeatedArrayTiff(repeats, count);
+
+  const ample = { remaining: count * repeats + 10 };
+  assert.equal(collectIndexedCandidatesForTest(buf, ample).budgetExhausted, false);
+  assert.equal(count * repeats + 10 - ample.remaining, count * repeats);
+
+  const limited = { remaining: Math.floor(count * 1.5) };
+  const cut = collectIndexedCandidatesForTest(buf, limited);
+  assert.equal(cut.budgetExhausted, true);
+  assert.equal(limited.remaining, -1);
+
+  // A count too large for the buffer is rejected before charging, so it cannot drain the budget
+  const bogus = makeRepeatedArrayTiff(1, 4);
+  new DataView(bogus.buffer).setUint32(10 + 4, 0x40000000, true);
+  const untouched = { remaining: 100 };
+  assert.equal(collectIndexedCandidatesForTest(bogus, untouched).budgetExhausted, false);
+  assert.equal(untouched.remaining, 100);
+});
+
+test('SubIFD offsets are enqueued once each and traversal stops at 64 directories', () => {
+  const distinct = 100;
+  const duplicates = 1000;
+  const preview = makeFrameJpeg(64);
+  const subIfdSize = 2 + 2 * 12 + 4;
+  const arrayStart = 8 + 2 + 12 + 4;
+  const subStart = arrayStart + (distinct + duplicates) * 4;
+  const previewStart = subStart + distinct * subIfdSize;
+  const buf = new Uint8Array(previewStart + distinct * preview.length);
+  const v = new DataView(buf.buffer);
+  v.setUint16(0, 0x4949, false);
+  v.setUint16(2, 42, true);
+  v.setUint32(4, 8, true);
+  v.setUint16(8, 1, true);
+  v.setUint16(10, 0x014a, true);
+  v.setUint16(12, 4, true);
+  v.setUint32(14, distinct + duplicates, true);
+  v.setUint32(18, arrayStart, true);
+  for (let i = 0; i < distinct + duplicates; i++) {
+    // Many repeats of the first SubIFD first, so a missing dedupe would fill the 64-slot cap
+    v.setUint32(arrayStart + i * 4, subStart + (i < duplicates ? 0 : i - duplicates) * subIfdSize, true);
+  }
+  for (let i = 0; i < distinct; i++) {
+    const at = subStart + i * subIfdSize;
+    const pAt = previewStart + i * preview.length;
+    v.setUint16(at, 2, true);
+    v.setUint16(at + 2, 0x0201, true);
+    v.setUint16(at + 4, 4, true);
+    v.setUint32(at + 6, 1, true);
+    v.setUint32(at + 10, pAt, true);
+    v.setUint16(at + 14, 0x0202, true);
+    v.setUint16(at + 16, 4, true);
+    v.setUint32(at + 18, 1, true);
+    v.setUint32(at + 22, preview.length, true);
+    buf.set(preview, pAt);
+  }
+
+  const walk = { remaining: 1_000_000 };
+  scanJpegStreamForTest(buf, previewStart, previewStart + preview.length, walk);
+  const oneWalk = 1_000_000 - walk.remaining;
+
+  const budget = { remaining: 1_000_000 };
+  const res = collectIndexedCandidatesForTest(buf, budget);
+  // IFD0 plus 63 SubIFDs: one preview per SubIFD, the rest never enqueued
+  assert.equal(res.candidateCount, 63);
+  // One array read, then exactly 63 preview walks: duplicates and overflow cost nothing more
+  assert.equal(1_000_000 - budget.remaining, distinct + duplicates + 63 * oneWalk);
 });

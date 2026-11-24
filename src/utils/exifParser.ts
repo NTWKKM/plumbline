@@ -388,17 +388,34 @@ function collectTiffIfdJpegCandidates(
   const header = readTiffHeader(bytes, view);
   if (header) {
     const { littleEndian } = header;
-    const queue: number[] = [];
-    const visited = new Set<number>();
-    const firstIfd = header.firstIfd;
-    if (firstIfd >= 8 && firstIfd + 2 <= bytes.length) {
-      queue.push(firstIfd);
-    }
 
-    while (queue.length > 0 && visited.size < 64 && budget.remaining >= 0) {
+    // Out-of-line metadata arrays cost one unit per value from the shared budget. Reads that
+    // cannot fit in the buffer are rejected before charging, so one bogus count cannot spend it.
+    const readBudgetedArray = (entryPos: number, type: 3 | 4, count: number): number[] => {
+      if (count * (type === 3 ? 2 : 4) > bytes.length) return [];
+      if (count > budget.remaining) {
+        budget.remaining = -1;
+        return [];
+      }
+      budget.remaining -= count;
+      return readUintArray(view, 0, entryPos, type, count, littleEndian, bytes.length);
+    };
+
+    // Every directory is enqueued at most once, and at most 64 are ever enqueued
+    const MAX_IFDS = 64;
+    const queue: number[] = [];
+    const queued = new Set<number>();
+    const enqueue = (offset: number) => {
+      if (offset < 8 || offset + 2 > bytes.length || queued.has(offset) || queued.size >= MAX_IFDS) {
+        return;
+      }
+      queued.add(offset);
+      queue.push(offset);
+    };
+    enqueue(header.firstIfd);
+
+    while (queue.length > 0 && budget.remaining >= 0) {
       const ifdOffset = queue.shift()!;
-      if (visited.has(ifdOffset) || ifdOffset < 8 || ifdOffset + 2 > bytes.length) continue;
-      visited.add(ifdOffset);
 
       const entries = view.getUint16(ifdOffset, littleEndian);
       let jpegOffset = -1;
@@ -424,26 +441,16 @@ function collectTiffIfdJpegCandidates(
               ? view.getUint32(entryPos + 8, littleEndian)
               : view.getUint16(entryPos + 8, littleEndian);
         } else if (tag === 0x0111 && (type === 3 || type === 4)) {
-          stripOffsets = readUintArray(view, 0, entryPos, type, count, littleEndian, bytes.length);
+          stripOffsets = readBudgetedArray(entryPos, type, count);
         } else if (tag === 0x0117 && (type === 3 || type === 4)) {
-          stripCounts = readUintArray(view, 0, entryPos, type, count, littleEndian, bytes.length);
+          stripCounts = readBudgetedArray(entryPos, type, count);
         } else if (tag === 0x002e && type === 7 && count > 4) {
           // Panasonic RW2 JpgFromRaw: UNDEFINED bytes whose value field is the preview offset
           recordCandidate(view.getUint32(entryPos + 8, littleEndian), count);
         } else if (tag === 0x014a && (type === 3 || type === 4 || type === 13)) {
-          const subOffsets = readUintArray(
-            view,
-            0,
-            entryPos,
-            type === 13 ? 4 : type,
-            count,
-            littleEndian,
-            bytes.length
-          );
-          for (const sub of subOffsets) {
-            if (!visited.has(sub) && sub >= 8 && sub + 2 <= bytes.length) {
-              queue.push(sub);
-            }
+          // IFD (13) offsets are stored like LONGs
+          for (const sub of readBudgetedArray(entryPos, type === 3 ? 3 : 4, count)) {
+            enqueue(sub);
           }
         }
       }
@@ -457,10 +464,7 @@ function collectTiffIfdJpegCandidates(
 
       const nextIfdPos = ifdOffset + 2 + entries * 12;
       if (nextIfdPos + 4 <= bytes.length) {
-        const nextIfd = view.getUint32(nextIfdPos, littleEndian);
-        if (nextIfd >= 8 && nextIfd + 2 <= bytes.length && !visited.has(nextIfd)) {
-          queue.push(nextIfd);
-        }
+        enqueue(view.getUint32(nextIfdPos, littleEndian));
       }
     }
   }
@@ -575,42 +579,80 @@ export function scanRawBufferForTest(
   return { candidateCount: candidates.length, budgetExhausted: budget.remaining < 0 };
 }
 
-/** Finds decodable streams that start and end inside deferred APP payload ranges. */
-function scanDeferredRanges(
+/**
+ * Finds decodable streams that start and end inside deferred APP payload ranges, one nesting level
+ * at a time: each level is yielded largest-first, and the APP payloads of the streams it found
+ * become the next level. The consumer stops pulling once a candidate decodes, so deeper levels are
+ * scanned only when every shallower candidate failed. All levels share one budget and dedupe set.
+ */
+function* scanDeferredRanges(
   bytes: Uint8Array,
   view: DataView,
   ranges: ByteRange[],
   seenOffsets: Set<string>,
   budget: ScanBudget
-): CandidateSlice[] {
-  const candidates: CandidateSlice[] = [];
-  outer: for (const range of ranges) {
-    let pos = range.start;
-    while (pos + 4 < range.end) {
-      if (bytes[pos] === 0xff && bytes[pos + 1] === 0xd8 && bytes[pos + 2] === 0xff) {
-        const res = scanJpegStream(bytes, view, pos, range.end, budget);
-        if (res.budgetExhausted) break outer;
-        if (res.valid && res.endOffset > pos) {
-          const streamLen = res.endOffset - pos;
-          const key = `${pos}:${streamLen}`;
-          if (
-            streamLen >= MIN_SCANNED_PREVIEW_BYTES &&
-            isDecodablePreviewScan(res) &&
-            !seenOffsets.has(key)
-          ) {
-            seenOffsets.add(key);
-            candidates.push({ start: pos, length: streamLen });
+): Generator<CandidateSlice> {
+  let level = ranges;
+  while (level.length > 0) {
+    const candidates: CandidateSlice[] = [];
+    const next: ByteRange[] = [];
+    let exhausted = false;
+    outer: for (const range of level) {
+      let pos = range.start;
+      while (pos + 4 < range.end) {
+        if (bytes[pos] === 0xff && bytes[pos + 1] === 0xd8 && bytes[pos + 2] === 0xff) {
+          const res = scanJpegStream(bytes, view, pos, range.end, budget);
+          if (res.budgetExhausted) {
+            exhausted = true;
+            break outer;
           }
-          pos = res.endOffset;
-          continue;
+          if (res.valid && res.endOffset > pos) {
+            const streamLen = res.endOffset - pos;
+            const key = `${pos}:${streamLen}`;
+            if (
+              streamLen >= MIN_SCANNED_PREVIEW_BYTES &&
+              isDecodablePreviewScan(res) &&
+              !seenOffsets.has(key)
+            ) {
+              seenOffsets.add(key);
+              candidates.push({ start: pos, length: streamLen });
+            }
+            // Nested payloads lie strictly inside this stream, so each level is smaller
+            next.push(...res.appRanges);
+            pos = res.endOffset;
+            continue;
+          }
         }
+        if (--budget.remaining < 0) {
+          exhausted = true;
+          break outer;
+        }
+        pos++;
       }
-      if (budget && --budget.remaining < 0) break outer;
-      pos++;
     }
+    candidates.sort((a, b) => b.length - a.length);
+    yield* candidates;
+    if (exhausted) return;
+    level = next;
   }
-  candidates.sort((a, b) => b.length - a.length);
-  return candidates;
+}
+
+/** Test-only: up to `take` deferred-range candidates in yield order, with a caller-owned budget. */
+export function scanDeferredRangesForTest(
+  bytes: Uint8Array,
+  ranges: { start: number; end: number }[],
+  budget: { remaining: number },
+  take = Infinity
+): { start: number; length: number }[] {
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const out: CandidateSlice[] = [];
+  if (take <= 0) return out;
+  // Stops pulling after `take` candidates, as the importer does once one decodes
+  for (const c of scanDeferredRanges(bytes, view, ranges, new Set<string>(), budget)) {
+    out.push(c);
+    if (out.length >= take) break;
+  }
+  return out;
 }
 
 /**
