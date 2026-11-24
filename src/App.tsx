@@ -11,7 +11,7 @@ import { StudioHeader } from './components/StudioHeader';
 import { NoticeBar } from './components/NoticeBar';
 import { FilmstripQueue } from './components/FilmstripQueue';
 import { CanvasToolbar } from './components/CanvasToolbar';
-import { MobileTab, MobileTabBar } from './components/MobileTabBar';
+import { MOBILE_PANEL_IDS, MobileTab, MobileTabBar } from './components/MobileTabBar';
 import { useEditHistory } from './hooks/useEditHistory';
 import { useKeyboardShortcuts } from './hooks/useKeyboardShortcuts';
 import { usePersistence } from './hooks/usePersistence';
@@ -93,7 +93,10 @@ export default function App() {
   const [panOffset, setPanOffset] = useState({ x: 0, y: 0 });
   const [isDraggingFiles, setIsDraggingFiles] = useState(false);
   const [isImageLoaded, setIsImageLoaded] = useState(false);
-  const [telemetry, setTelemetry] = useState<PipelineTelemetryUpdate>(INITIAL_TELEMETRY);
+  // Telemetry is tagged with the photo that produced it, so a switch never shows the last photo's numbers
+  const [telemetryEntry, setTelemetryEntry] = useState<{ photoId: string; data: PipelineTelemetryUpdate } | null>(
+    null
+  );
   const [clipboard, setClipboard] = useState<TransferableEdit | null>(null);
   const [presets, setPresets] = useState<Preset[]>([]);
 
@@ -137,7 +140,12 @@ export default function App() {
     };
   }, [session, photos, activePhoto.id, presets, viewMode, showHorizonGrid]);
 
-  usePersistence(snapshot, ({ imported, session: saved, legacy }) => {
+  const { hydrated } = usePersistence(snapshot, ({ imported, session: saved, legacy, readFailed }) => {
+    if (readFailed) {
+      setErrorNotice(
+        "Couldn't read your saved work from this device. Changes in this visit won't be saved, so nothing stored is overwritten; reload to try again."
+      );
+    }
     const restored = saved ?? legacy;
     const byId = new Map<string, StudioPhotoItem>(
       [...imported, ...INITIAL_SAMPLE_PHOTOS].map((p) => [p.id, p])
@@ -159,6 +167,13 @@ export default function App() {
       setPresets(restored.presets ?? []);
     }
   });
+
+  const telemetry = telemetryEntry?.photoId === activePhoto.id ? telemetryEntry.data : null;
+  const shownTelemetry = telemetry ?? INITIAL_TELEMETRY;
+  const handleTelemetry = useCallback(
+    (data: PipelineTelemetryUpdate) => setTelemetryEntry({ photoId: activePhoto.id, data }),
+    [activePhoto.id]
+  );
 
   // ---- Edit commands ----
   const changeEdit = useCallback(
@@ -261,9 +276,18 @@ export default function App() {
     [queue]
   );
 
+  /** Shortcut navigation: the same resets as a filmstrip click; a no-op at either end. */
+  const selectRelative = (step: number) => {
+    const idx = photos.findIndex((p) => p.id === activePhoto.id);
+    const next = photos[idx + step];
+    if (next) selectPhoto(next.id);
+  };
+
   const openFilePicker = () => fileInputRef.current?.click();
 
   const importFiles = async (files: File[]) => {
+    // Until the saved session is restored, an import would be overwritten by the restore
+    if (!hydrated) return;
     const imported = await queue.importFiles(files);
     if (imported.length > 0) {
       setMobileTab('canvas');
@@ -281,12 +305,12 @@ export default function App() {
       reset: resetPhoto,
       zoomBy: (d) => handleZoomChange(zoomLevel + d),
       zoomReset: () => handleZoomChange(1),
-      previousPhoto: () => queue.selectRelative(-1),
-      nextPhoto: () => queue.selectRelative(1),
+      previousPhoto: () => selectRelative(-1),
+      nextPhoto: () => selectRelative(1),
       peek: setIsPeekingOriginal,
       escape: () => setStraightenActive(false),
     },
-    !isShortcutsOpen
+    !isShortcutsOpen && hydrated
   );
 
   // Paste images straight from the clipboard into the queue
@@ -316,17 +340,16 @@ export default function App() {
       (p) => prepared.get(p.id)!.config
     );
   };
-  const handleRemovePhoto = (id: string) => {
+  const handleRemovePhoto = async (id: string) => {
     if (exporter.isBatchExporting) return;
-    queue.removePhoto(id);
-    exporter.forget(id);
+    if (await queue.removePhoto(id)) exporter.forget(id);
   };
 
   // ---- Drag and drop ----
   const handleDragEnter = (e: React.DragEvent<HTMLDivElement>) => {
     e.preventDefault();
     dragDepthRef.current += 1;
-    if (e.dataTransfer.types.includes('Files')) setIsDraggingFiles(true);
+    if (hydrated && e.dataTransfer.types.includes('Files')) setIsDraggingFiles(true);
   };
   const handleDragOver = (e: React.DragEvent<HTMLDivElement>) => {
     e.preventDefault();
@@ -356,6 +379,7 @@ export default function App() {
   return (
     <div
       className="relative flex h-[100dvh] overflow-hidden flex-col bg-paper text-ink"
+      aria-busy={!hydrated}
       onDragEnter={handleDragEnter}
       onDragOver={handleDragOver}
       onDragLeave={handleDragLeave}
@@ -393,8 +417,9 @@ export default function App() {
       )}
 
       <StudioHeader
+        inert={!hydrated}
         title={activePhoto.title}
-        sourceSize={telemetry.sourceSize}
+        sourceSize={telemetry?.sourceSize ?? null}
         onHome={() => {
           setViewMode('framed');
           setMobileTab('canvas');
@@ -409,14 +434,16 @@ export default function App() {
 
       <NoticeBar
         error={errorNotice}
-        status={statusNotice}
+        status={statusNotice ?? (exporter.isBatchExporting ? 'Exporting…' : null)}
         onDismissError={() => setErrorNotice(null)}
         onDismissStatus={() => setStatusNotice(null)}
         onCancel={exporter.isBatchExporting ? exporter.cancelBatch : undefined}
       />
 
-      <main id="workspace" tabIndex={-1} className="flex flex-1 flex-col lg:flex-row overflow-hidden min-h-0 outline-none">
+      {/* Inert until the saved session is restored, so no edit can be lost to the restore */}
+      <main id="workspace" tabIndex={-1} inert={!hydrated} className="flex flex-1 flex-col lg:flex-row overflow-hidden min-h-0 outline-none">
         <FilmstripQueue
+          id={MOBILE_PANEL_IDS.queue}
           photos={photos}
           activeId={activePhoto.id}
           editedIds={editedIds}
@@ -426,7 +453,7 @@ export default function App() {
             selectPhoto(id);
             if (mobileTab === 'queue') setMobileTab('canvas');
           }}
-          onRemove={handleRemovePhoto}
+          onRemove={(id) => void handleRemovePhoto(id)}
           onImport={openFilePicker}
           className={`w-full lg:w-[258px] shrink-0 lg:border-r ${
             mobileTab === 'queue' ? 'flex flex-1 min-h-0' : 'hidden lg:flex'
@@ -434,6 +461,7 @@ export default function App() {
         />
 
         <section
+          id={MOBILE_PANEL_IDS.canvas}
           aria-label="Canvas workspace"
           className={`flex flex-1 min-w-0 min-h-0 flex-col bg-paper-3 ${mobileTab === 'canvas' ? 'flex' : 'hidden lg:flex'}`}
         >
@@ -465,7 +493,7 @@ export default function App() {
               splitPercent={splitPercent}
               onSplitPercentChange={setSplitPercent}
               showHorizonGrid={showHorizonGrid}
-              onAnalysisUpdate={setTelemetry}
+              onAnalysisUpdate={handleTelemetry}
               onImageLoaded={setIsImageLoaded}
               zoomLevel={zoomLevel}
               panOffset={panOffset}
@@ -484,27 +512,32 @@ export default function App() {
                 <span className="border-l border-rule pl-3 truncate">{activePhoto.exif.cameraModel}</span>
               )}
             </div>
-            <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
-              <span>Tilt {telemetry.analysis.detectedTiltDeg >= 0 ? '+' : ''}{telemetry.analysis.detectedTiltDeg.toFixed(2)}°</span>
-              <span className="border-l border-rule pl-3">
-                Crop {telemetry.crop.width} × {telemetry.crop.height} ({telemetry.crop.areaRetainedPercent}%)
-              </span>
-              <span className="border-l border-rule pl-3">
-                Frame {telemetry.layout.canvasWidth} × {telemetry.layout.canvasHeight} ({session.output.aspectPreset})
-              </span>
-            </div>
+            {telemetry ? (
+              <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+                <span>Tilt {telemetry.analysis.detectedTiltDeg >= 0 ? '+' : ''}{telemetry.analysis.detectedTiltDeg.toFixed(2)}°</span>
+                <span className="border-l border-rule pl-3">
+                  Crop {telemetry.crop.width} × {telemetry.crop.height} ({telemetry.crop.areaRetainedPercent}%)
+                </span>
+                <span className="border-l border-rule pl-3">
+                  Frame {telemetry.layout.canvasWidth} × {telemetry.layout.canvasHeight} ({session.output.aspectPreset})
+                </span>
+              </div>
+            ) : (
+              <span>Analysing…</span>
+            )}
           </footer>
         </section>
 
         <InspectorSidebar
+          id={MOBILE_PANEL_IDS.adjust}
           edit={edit}
           onChangeEdit={changeEdit}
           output={session.output}
           onChangeOutput={changeOutput}
-          analysis={telemetry.analysis}
-          autoCorrect={telemetry.autoCorrect}
-          cropRect={telemetry.crop}
-          frameLayout={telemetry.layout}
+          analysis={shownTelemetry.analysis}
+          autoCorrect={telemetry?.autoCorrect}
+          cropRect={shownTelemetry.crop}
+          frameLayout={shownTelemetry.layout}
           exif={activePhoto.exif}
           isSample={isSamplePhoto(activePhoto.id)}
           onResetPhoto={resetPhoto}
@@ -533,6 +566,7 @@ export default function App() {
       </main>
 
       <MobileTabBar
+        inert={!hydrated}
         tab={mobileTab}
         onTabChange={setMobileTab}
         queueCount={photos.length}

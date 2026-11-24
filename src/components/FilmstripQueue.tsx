@@ -4,6 +4,7 @@ import { StudioPhotoItem } from '../utils/samplePhotos';
 import { ExportStatus } from '../hooks/useExport';
 
 interface FilmstripQueueProps {
+  id?: string;
   photos: StudioPhotoItem[];
   activeId: string;
   editedIds: Set<string>;
@@ -25,8 +26,9 @@ export const FilmstripQueue: React.FC<FilmstripQueueProps> = ({
   onRemove,
   onImport,
   className = '',
+  id,
 }) => (
-  <aside aria-label="Filmstrip queue" className={`flex-col border-rule bg-paper-2 ${className}`}>
+  <aside id={id} aria-label="Filmstrip queue" className={`flex-col border-rule bg-paper-2 ${className}`}>
     <div className="flex items-center justify-between border-b border-rule px-4 py-3 shrink-0">
       <h2 className="font-display text-sm font-normal text-ink">Queue ({photos.length})</h2>
     </div>
@@ -37,7 +39,7 @@ export const FilmstripQueue: React.FC<FilmstripQueueProps> = ({
         const status = exportStatus[item.id];
         const notes = [
           editedIds.has(item.id) ? 'Edited' : null,
-          status === 'exported' ? 'Exported' : status === 'requested' ? 'Downloaded' : null,
+          status === 'exported' ? 'Exported' : status === 'requested' ? 'Download requested' : null,
         ].filter(Boolean);
         return (
           <li key={item.id} className="filmstrip-item relative w-full shrink-0 min-w-0">

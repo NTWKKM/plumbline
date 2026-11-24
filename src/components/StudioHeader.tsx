@@ -2,8 +2,11 @@ import React from 'react';
 import { ImagePlus, Keyboard, Redo2, Undo2 } from 'lucide-react';
 
 interface StudioHeaderProps {
+  /** Inert until the saved session is restored. */
+  inert?: boolean;
   title: string;
-  sourceSize: { width: number; height: number };
+  /** Null while the active photo is still being analysed. */
+  sourceSize: { width: number; height: number } | null;
   onHome: () => void;
   onUndo: () => void;
   onRedo: () => void;
@@ -15,6 +18,7 @@ interface StudioHeaderProps {
 
 /** One row at every width: wordmark, the active photo (desktop), history and import. */
 export const StudioHeader: React.FC<StudioHeaderProps> = ({
+  inert,
   title,
   sourceSize,
   onHome,
@@ -25,7 +29,7 @@ export const StudioHeader: React.FC<StudioHeaderProps> = ({
   onShowShortcuts,
   onImport,
 }) => (
-  <header className="flex items-center justify-between gap-3 sm:gap-6 border-b border-rule bg-paper-2 px-3 sm:px-6 py-2 sm:py-3 shrink-0">
+  <header inert={inert} className="flex items-center justify-between gap-3 sm:gap-6 border-b border-rule bg-paper-2 px-3 sm:px-6 py-2 sm:py-3 shrink-0">
     <h1 className="font-display text-lg sm:text-xl font-normal tracking-tight text-ink leading-none shrink-0">
       <a
         href="#workspace"
@@ -42,7 +46,7 @@ export const StudioHeader: React.FC<StudioHeaderProps> = ({
     <div className="hidden lg:flex items-center gap-3 text-xs text-muted min-w-0">
       <span className="font-medium text-ink truncate max-w-xs">{title}</span>
       <span className="border-l border-rule pl-3 font-mono tabular-nums whitespace-nowrap">
-        {sourceSize.width} × {sourceSize.height} px
+        {sourceSize ? `${sourceSize.width} × ${sourceSize.height} px` : 'Analysing…'}
       </span>
     </div>
 

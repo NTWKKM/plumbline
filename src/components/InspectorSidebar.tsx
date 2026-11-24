@@ -25,6 +25,7 @@ import { BACKGROUND_COLOR_PRESETS } from '../utils/samplePhotos';
 type Updater<T> = (updater: (prev: T) => T) => void;
 
 interface InspectorSidebarProps {
+  id?: string;
   edit: PhotoEdit;
   onChangeEdit: Updater<PhotoEdit>;
   output: OutputSettings;
@@ -198,6 +199,7 @@ export const InspectorSidebar: React.FC<InspectorSidebarProps> = ({
   isImageLoaded,
   canSaveToFolder,
   className = '',
+  id,
 }) => {
   const [presetName, setPresetName] = useState('');
   const [selectedPresetId, setSelectedPresetId] = useState('');
@@ -234,6 +236,7 @@ export const InspectorSidebar: React.FC<InspectorSidebarProps> = ({
 
   return (
     <aside
+      id={id}
       aria-label="Image inspector"
       className={`flex shrink-0 flex-col border-t lg:border-t-0 lg:border-l border-rule bg-paper-2 text-ink select-none ${className}`}
     >
@@ -405,7 +408,9 @@ export const InspectorSidebar: React.FC<InspectorSidebarProps> = ({
                 <span className="text-muted">Hand crop, set in Crop box view</span>
                 <button
                   type="button"
-                  onClick={() => setEdit('cropOverride', null)}
+                  onClick={() =>
+                    onChangeEdit((prev) => ({ ...prev, cropOverride: null, autoCropEnabled: true }))
+                  }
                   className="btn btn--quiet btn--sm shrink-0"
                 >
                   Back to auto

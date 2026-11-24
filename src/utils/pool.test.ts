@@ -37,6 +37,22 @@ test('runPool stops starting work once aborted', async () => {
   assert.deepEqual(started, [1, 2]);
 });
 
+test('runPool stops scheduling after the first failure and lets active tasks settle', async () => {
+  const started: number[] = [];
+  const settled: number[] = [];
+  await assert.rejects(
+    runPool([1, 2, 3, 4, 5], 2, async (n) => {
+      started.push(n);
+      if (n === 1) throw new Error('first');
+      await tick(10);
+      settled.push(n);
+    }),
+    { message: 'first' }
+  );
+  assert.deepEqual(started, [1, 2]);
+  assert.deepEqual(settled, [2]);
+});
+
 test('createMutex runs sections one at a time, even after a failure', async () => {
   const lock = createMutex();
   const order: string[] = [];

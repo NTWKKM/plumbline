@@ -21,6 +21,9 @@ export interface NormalizedCrop {
   height: number;
 }
 
+/** The smallest crop side, as a fraction of the source; shared by the editor and the sanitiser. */
+export const MIN_CROP_FRACTION = 0.05;
+
 export interface PhotoEdit {
   /** Simulated sensor tilt; only sample photos expose it (a demo of the leveller). */
   tiltDeg: number;
@@ -149,12 +152,16 @@ const num = (v: unknown, fallback: number, min: number, max: number, round = fal
 function sanitizeCrop(v: unknown): NormalizedCrop | null {
   if (!v || typeof v !== 'object') return null;
   const o = v as Loose;
-  const x = num(o.x, NaN, 0, 1);
-  const y = num(o.y, NaN, 0, 1);
-  const width = num(o.width, NaN, 0.02, 1);
-  const height = num(o.height, NaN, 0.02, 1);
+  // Origins stop MIN_CROP_FRACTION short of the far edge, so the clipped size never drops below it
+  const x = num(o.x, NaN, 0, 1 - MIN_CROP_FRACTION);
+  const y = num(o.y, NaN, 0, 1 - MIN_CROP_FRACTION);
+  const width = num(o.width, NaN, MIN_CROP_FRACTION, 1);
+  const height = num(o.height, NaN, MIN_CROP_FRACTION, 1);
   if ([x, y, width, height].some(Number.isNaN)) return null;
-  return { x, y, width: Math.min(width, 1 - x), height: Math.min(height, 1 - y) };
+  const clippedW = Math.min(width, 1 - x);
+  const clippedH = Math.min(height, 1 - y);
+  if (clippedW <= 0 || clippedH <= 0) return null;
+  return { x, y, width: clippedW, height: clippedH };
 }
 
 export function sanitizePhotoEdit(v: unknown, fallback: PhotoEdit = DEFAULT_PHOTO_EDIT): PhotoEdit {

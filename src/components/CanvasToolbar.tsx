@@ -57,8 +57,9 @@ export const CanvasToolbar: React.FC<CanvasToolbarProps> = ({
 
     <div className="flex items-center gap-2 shrink-0">
       {viewMode === 'split' && (
-        <div className="hidden sm:flex items-center gap-2 rounded-pill border border-rule bg-paper-2 px-2.5 py-1 shrink-0">
-          <label htmlFor="slider-split-position" className="text-xs text-ink-2 whitespace-nowrap shrink-0">
+        // Shown at every width so the divider stays keyboard-operable on phones too
+        <div className="flex items-center gap-2 rounded-pill border border-rule bg-paper-2 px-2 sm:px-2.5 py-1 shrink-0">
+          <label htmlFor="slider-split-position" className="hidden sm:inline text-xs text-ink-2 whitespace-nowrap shrink-0">
             Split
           </label>
           <input
@@ -68,9 +69,10 @@ export const CanvasToolbar: React.FC<CanvasToolbarProps> = ({
             max={95}
             step={1}
             value={splitPercent}
+            aria-label="Split position"
             aria-valuetext={`${Math.round(splitPercent)} percent`}
             onChange={(e) => onSplitPercentChange(parseFloat(e.target.value))}
-            className="h-1.5 w-20 cursor-pointer rounded-pill bg-paper-3 accent-accent"
+            className="h-1.5 w-14 sm:w-20 cursor-pointer rounded-pill bg-paper-3 accent-accent"
           />
         </div>
       )}

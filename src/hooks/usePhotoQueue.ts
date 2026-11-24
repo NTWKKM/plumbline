@@ -41,11 +41,14 @@ export function usePhotoQueue(notices: Notices) {
           failed.push(`${file.name} (not an image or RAW file)`);
         }
       }
-      if (imageFiles.length > 0) {
+      // Only status this import set is cleared afterwards, so an export's progress is left alone
+      const ownsStatus = imageFiles.length > 0;
+      if (ownsStatus) {
         notices.setStatus(`Importing ${imageFiles.length} ${imageFiles.length === 1 ? 'photo' : 'photos'}…`);
       }
 
       const imported: StudioPhotoItem[] = [];
+      const unsaved: string[] = [];
       for (const file of imageFiles) {
         let objectUrl: string | null = null;
         try {
@@ -77,7 +80,7 @@ export function usePhotoQueue(notices: Notices) {
             rawApp1Segment: parsed.isRawContainer ? null : parsed.rawApp1Segment,
           };
           imported.push(item);
-          void savePhoto({
+          const saved = await savePhoto({
             id: item.id,
             title: item.title,
             fileName: item.fileName,
@@ -86,36 +89,50 @@ export function usePhotoQueue(notices: Notices) {
             rawApp1Segment: item.rawApp1Segment,
             blob: displayBlob,
           });
+          // An unsaved photo still works this session; it just will not come back after a reload
+          if (!saved) unsaved.push(file.name);
         } catch (err) {
           if (objectUrl) URL.revokeObjectURL(objectUrl);
           failed.push(`${file.name} (${err instanceof Error ? err.message : 'unreadable file'})`);
         }
       }
 
-      notices.setStatus(null);
+      if (ownsStatus) notices.setStatus(null);
       if (imported.length > 0) {
         setPhotos((prev) => [...imported, ...prev]);
         setSelectedId(imported[0].id);
       }
-      notices.setError(failed.length > 0 ? `Import error: unable to import ${failed.join('; ')}` : null);
+      const problems = [
+        failed.length > 0 ? `Import error: unable to import ${failed.join('; ')}.` : '',
+        unsaved.length > 0
+          ? `Could not save ${unsaved.join(', ')} on this device; ${unsaved.length === 1 ? 'it stays' : 'they stay'} in the queue until you close the page.`
+          : '',
+      ].filter(Boolean);
+      notices.setError(problems.length > 0 ? problems.join(' ') : null);
       return imported;
     },
     [notices]
   );
 
+  /** Resolves false, keeping the photo, when its stored copy could not be deleted. */
   const removePhoto = useCallback(
-    (id: string) => {
-      if (photos.length <= 1) return;
+    async (id: string): Promise<boolean> => {
+      if (photos.length <= 1) return false;
       const idx = photos.findIndex((p) => p.id === id);
-      if (idx < 0) return;
-      const next = photos.filter((p) => p.id !== id);
-      if (id === activePhoto.id) setSelectedId(next[Math.min(idx, next.length - 1)].id);
-      setPhotos(next);
+      if (idx < 0) return false;
       const removed = photos[idx];
+      // Delete from storage first: a photo dropped only from memory would come back on reload
+      if (!isSamplePhoto(id) && !(await deletePhoto(id))) {
+        notices.setError(`Could not remove ${removed.title} from this device's storage. Try again.`);
+        return false;
+      }
+      const next = photos.filter((p) => p.id !== id);
+      setSelectedId((sel) => (sel === id ? next[Math.min(idx, next.length - 1)].id : sel));
+      setPhotos((prev) => prev.filter((p) => p.id !== id));
       if (removed.src.startsWith('blob:')) URL.revokeObjectURL(removed.src);
-      if (!isSamplePhoto(id)) void deletePhoto(id);
+      return true;
     },
-    [photos, activePhoto.id]
+    [photos, notices]
   );
 
   const selectRelative = useCallback(

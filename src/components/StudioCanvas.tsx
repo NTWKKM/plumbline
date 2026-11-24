@@ -62,11 +62,16 @@ interface StudioCanvasProps {
 
 type Pointer = { x: number; y: number };
 
-type Gesture =
+/** Every gesture belongs to the pointer that started it; other pointers are ignored until it ends. */
+type Gesture = { pointerId: number } & (
   | { kind: 'split' }
   | { kind: 'pan'; clientX: number; clientY: number; offsetX: number; offsetY: number }
   | { kind: 'crop'; handle: CropHandle; start: Pointer; origin: NormalizedCrop }
-  | { kind: 'line'; start: Pointer };
+  | { kind: 'line'; start: Pointer }
+);
+
+const sameCrop = (a: NormalizedCrop, b: NormalizedCrop) =>
+  a.x === b.x && a.y === b.y && a.width === b.width && a.height === b.height;
 
 const CROP_CURSORS: Record<CropHandle, string> = {
   move: 'move',
@@ -178,9 +183,18 @@ export const StudioCanvas: React.FC<StudioCanvasProps> = ({
     const sal = saliencyRef.current;
     if (!sal || !sensorCanvas || (autoCorrect.wbProfile ?? 'ambient') === wbProfile) return;
     let cancelled = false;
-    void reanalyzeTone(sal, wbProfile).then((next) => {
-      if (!cancelled) setAutoCorrect(next);
-    });
+    reanalyzeTone(sal, wbProfile).then(
+      (next) => {
+        if (!cancelled) setAutoCorrect(next);
+      },
+      (err) => {
+        // Superseded requests are ignored; for the current one, show the failure instead of
+        // a preview built for the other profile. Choosing a profile again retries.
+        if (cancelled) return;
+        setIsProcessing(false);
+        setLoadError(err instanceof Error ? `Tone analysis failed: ${err.message}` : 'Tone analysis failed.');
+      }
+    );
     return () => {
       cancelled = true;
     };
@@ -210,6 +224,7 @@ export const StudioCanvas: React.FC<StudioCanvasProps> = ({
           if (!result || job.generation !== generationRef.current) return;
           setPipeline(result);
           setIsProcessing(false);
+          setLoadError(null); // a successful render recovers from an earlier render failure
           callbackRef.current({
             analysis: job.analysis,
             crop: result.crop,
@@ -240,6 +255,12 @@ export const StudioCanvas: React.FC<StudioCanvasProps> = ({
       analysis,
       autoCorrect,
     });
+    return () => {
+      // Inputs changed or the canvas unmounted: the job in flight may no longer publish.
+      // The next run (if any) sets processing again; without one nothing is left pending.
+      generationRef.current += 1;
+      setIsProcessing(false);
+    };
   }, [sensorCanvas, photo, config, analysis, autoCorrect, wbProfile, runPipeline]);
 
   useEffect(() => {
@@ -578,17 +599,19 @@ export const StudioCanvas: React.FC<StudioCanvasProps> = ({
 
   const handlePointerDown = (e: React.PointerEvent<HTMLCanvasElement>) => {
     if (e.button !== 0) return;
+    if (gestureRef.current) return; // a second finger never replaces the active gesture
+    const pointerId = e.pointerId;
     if (straightenActive && onStraighten) {
       const pt = toCanvasPoint(e.clientX, e.clientY);
       if (!pt) return;
       capture(e);
-      gestureRef.current = { kind: 'line', start: pt };
+      gestureRef.current = { pointerId, kind: 'line', start: pt };
       setDraftLine({ a: pt, b: pt });
       return;
     }
     if (effectiveView === 'split') {
       capture(e);
-      gestureRef.current = { kind: 'split' };
+      gestureRef.current = { pointerId, kind: 'split' };
       updateSplitFromClientX(e.clientX);
       return;
     }
@@ -598,13 +621,14 @@ export const StudioCanvas: React.FC<StudioCanvasProps> = ({
       if (!pt) return;
       capture(e);
       const origin = normalizeCrop(pipeline.crop, sensorCanvas.width, sensorCanvas.height);
-      gestureRef.current = { kind: 'crop', handle, start: pt, origin };
+      gestureRef.current = { pointerId, kind: 'crop', handle, start: pt, origin };
       setDraftCrop(origin);
       return;
     }
     if (zoomLevel > 1 && onPanOffsetChange) {
       capture(e);
       gestureRef.current = {
+        pointerId,
         kind: 'pan',
         clientX: e.clientX,
         clientY: e.clientY,
@@ -617,6 +641,7 @@ export const StudioCanvas: React.FC<StudioCanvasProps> = ({
 
   const handlePointerMove = (e: React.PointerEvent<HTMLCanvasElement>) => {
     const g = gestureRef.current;
+    if (g && g.pointerId !== e.pointerId) return;
     if (!g) {
       if (cropTool) {
         const handle = cropHandleAt(e.clientX, e.clientY);
@@ -645,17 +670,20 @@ export const StudioCanvas: React.FC<StudioCanvasProps> = ({
     }
   };
 
-  const endGesture = (commit: boolean) => {
+  const endGesture = (pointerId: number, commit: boolean) => {
     const g = gestureRef.current;
+    if (!g || g.pointerId !== pointerId) return;
     gestureRef.current = null;
     setIsPanning(false);
     const crop = draftCropRef.current;
     const line = draftLineRef.current;
     if (g?.kind === 'crop') {
-      if (commit && crop) onCropChange?.(crop);
+      // A tap leaves the box where it was; only a real change becomes a hand crop
+      if (commit && crop && !sameCrop(crop, g.origin)) onCropChange?.(crop);
       setDraftCrop(null);
     } else if (g?.kind === 'line') {
-      if (commit && line) {
+      // Leaving straighten mode mid-drag (Esc) discards the line
+      if (commit && line && straightenActive) {
         const rotation = rotationToStraighten(line.a.x, line.a.y, line.b.x, line.b.y);
         if (rotation !== null) onStraighten?.(rotation);
       }
@@ -667,14 +695,14 @@ export const StudioCanvas: React.FC<StudioCanvasProps> = ({
     if (e.currentTarget.hasPointerCapture(e.pointerId)) {
       e.currentTarget.releasePointerCapture(e.pointerId);
     }
-    endGesture(true);
+    endGesture(e.pointerId, true);
   };
 
   const handlePointerCancel = (e: React.PointerEvent<HTMLCanvasElement>) => {
     if (e.currentTarget.hasPointerCapture(e.pointerId)) {
       e.currentTarget.releasePointerCapture(e.pointerId);
     }
-    endGesture(false);
+    endGesture(e.pointerId, false);
   };
 
   const handleDoubleClick = () => {
@@ -730,7 +758,7 @@ export const StudioCanvas: React.FC<StudioCanvasProps> = ({
         onPointerMove={handlePointerMove}
         onPointerUp={handlePointerUp}
         onPointerCancel={handlePointerCancel}
-        onLostPointerCapture={() => endGesture(false)}
+        onLostPointerCapture={(e) => endGesture(e.pointerId, false)}
         onDoubleClick={handleDoubleClick}
         style={{
           cursor,

@@ -39,6 +39,14 @@ test('hitCropHandle finds corners, edges, and the inside', () => {
   assert.equal(hitCropHandle(crop, 0.05, 0.05, 0.02, 0.02), null);
 });
 
+test('hitCropHandle picks the nearer edge when hit zones overlap', () => {
+  const thin = { x: 0.5, y: 0.2, width: 0.03, height: 0.6 };
+  assert.equal(hitCropHandle(thin, 0.505, 0.5, 0.02, 0.02), 'w');
+  assert.equal(hitCropHandle(thin, 0.525, 0.5, 0.02, 0.02), 'e');
+  const flat = { x: 0.2, y: 0.5, width: 0.6, height: 0.03 };
+  assert.equal(hitCropHandle(flat, 0.5, 0.526, 0.02, 0.02), 's');
+});
+
 test('normalizeCrop divides by the source size', () => {
   assert.deepEqual(normalizeCrop({ x: 50, y: 25, width: 100, height: 50 }, 200, 100), {
     x: 0.25,

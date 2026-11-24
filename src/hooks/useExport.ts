@@ -131,6 +131,9 @@ export function useExport(notices: Notices) {
       setStatus(`Exporting 0 of ${photos.length}…`);
       setError(null);
       let done = 0;
+      // Set by the first failed photo: lanes still encoding finish, but write nothing more
+      let failed = false;
+      const stopped = () => controller.signal.aborted || failed;
       const usedNames = new Set<string>();
       const writeLock = createMutex();
       try {
@@ -138,24 +141,36 @@ export function useExport(notices: Notices) {
           photos,
           BATCH_CONCURRENCY,
           async (photo) => {
-            const { blob, outName } = await encodeJpeg(photo, configFor(photo));
-            if (controller.signal.aborted) return;
-            await writeLock(async () => {
-              if (directory) {
-                const dir = directory;
-                const name = await uniqueFileName(outName, usedNames, (c) => directoryHasFile(dir, c));
-                const handle = await dir.getFileHandle(name, { create: true });
-                const writable = await handle.createWritable();
-                await writable.write(blob);
-                await writable.close();
-                mark(photo.id, 'exported');
-              } else {
-                downloadBlob(blob, await uniqueFileName(outName, usedNames));
-                mark(photo.id, 'requested');
-              }
-            });
-            done += 1;
-            setStatus(`Exporting ${done} of ${photos.length}…`);
+            try {
+              const { blob, outName } = await encodeJpeg(photo, configFor(photo));
+              if (stopped()) return;
+              const wrote = await writeLock(async () => {
+                // Re-checked inside the lock: a write queued behind another may start after Cancel
+                if (stopped()) return false;
+                if (directory) {
+                  const dir = directory;
+                  const name = await uniqueFileName(outName, usedNames, (c) => directoryHasFile(dir, c));
+                  if (stopped()) return false;
+                  const handle = await dir.getFileHandle(name, { create: true });
+                  const writable = await handle.createWritable();
+                  await writable.write(blob);
+                  await writable.close();
+                  mark(photo.id, 'exported');
+                } else {
+                  const name = await uniqueFileName(outName, usedNames);
+                  if (stopped()) return false;
+                  downloadBlob(blob, name);
+                  mark(photo.id, 'requested');
+                }
+                return true;
+              });
+              if (!wrote) return;
+              done += 1;
+              setStatus(`Exporting ${done} of ${photos.length}…`);
+            } catch (err) {
+              failed = true;
+              throw err;
+            }
           },
           controller.signal
         );

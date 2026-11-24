@@ -15,41 +15,52 @@ import {
  */
 export function useEditHistory<T>(initial: () => T) {
   const [history, setHistory] = useState<HistoryState<T>>(() => createHistory(initial()));
-  const gestureRef = useRef({ id: 0, active: false });
+  const gestureRef = useRef<{ id: number; active: boolean; pointerId: number | null }>({
+    id: 0,
+    active: false,
+    pointerId: null,
+  });
 
   useEffect(() => {
     const onDown = (e: PointerEvent) => {
       const t = e.target as HTMLElement | null;
       if (t instanceof HTMLInputElement && t.type === 'range') {
-        gestureRef.current = { id: gestureRef.current.id + 1, active: true };
+        gestureRef.current = { id: gestureRef.current.id + 1, active: true, pointerId: e.pointerId };
       }
     };
-    const onEnd = () => {
-      if (gestureRef.current.active) gestureRef.current = { ...gestureRef.current, active: false };
+    const clear = () => {
+      if (gestureRef.current.active) {
+        gestureRef.current = { ...gestureRef.current, active: false, pointerId: null };
+      }
+    };
+    // Only the pointer that started the drag ends it; a second finger lifting does not
+    const onEnd = (e: PointerEvent) => {
+      if (e.pointerId === gestureRef.current.pointerId) clear();
     };
     window.addEventListener('pointerdown', onDown, true);
     window.addEventListener('pointerup', onEnd, true);
     window.addEventListener('pointercancel', onEnd, true);
-    window.addEventListener('blur', onEnd);
+    window.addEventListener('blur', clear);
     return () => {
       window.removeEventListener('pointerdown', onDown, true);
       window.removeEventListener('pointerup', onEnd, true);
       window.removeEventListener('pointercancel', onEnd, true);
-      window.removeEventListener('blur', onEnd);
+      window.removeEventListener('blur', clear);
     };
   }, []);
 
   /** Applies an edit; `key` names what changed so repeated edits of one thing merge. */
   const commit = useCallback((update: (present: T) => T, key?: string) => {
+    // Read the gesture now: React may run the updater after the pointer is already up
+    const g = gestureRef.current;
+    const options = key
+      ? g.active
+        ? { key: `${key}:gesture-${g.id}`, coalesceMs: Number.POSITIVE_INFINITY }
+        : { key }
+      : undefined;
     setHistory((h) => {
       const next = update(h.present);
       if (next === h.present) return h;
-      const g = gestureRef.current;
-      const options = key
-        ? g.active
-          ? { key: `${key}:gesture-${g.id}`, coalesceMs: Number.POSITIVE_INFINITY }
-          : { key }
-        : undefined;
       return pushHistory(h, next, options);
     });
   }, []);

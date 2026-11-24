@@ -34,7 +34,7 @@ let dbPromise: Promise<IDBDatabase | null> | null = null;
 
 function openDb(): Promise<IDBDatabase | null> {
   if (dbPromise) return dbPromise;
-  dbPromise = new Promise((resolve) => {
+  const pending: Promise<IDBDatabase | null> = new Promise((resolve) => {
     if (typeof indexedDB === 'undefined') return resolve(null);
     try {
       const req = indexedDB.open(DB_NAME, DB_VERSION);
@@ -43,51 +43,72 @@ function openDb(): Promise<IDBDatabase | null> {
         if (!db.objectStoreNames.contains(PHOTOS)) db.createObjectStore(PHOTOS, { keyPath: 'id' });
         if (!db.objectStoreNames.contains(META)) db.createObjectStore(META);
       };
-      req.onsuccess = () => resolve(req.result);
+      req.onsuccess = () => {
+        const db = req.result;
+        // A closed connection (browser eviction, another tab upgrading) is reopened on next use
+        const forget = () => {
+          if (dbPromise === pending) dbPromise = null;
+        };
+        db.onclose = forget;
+        db.onversionchange = () => {
+          db.close();
+          forget();
+        };
+        resolve(db);
+      };
       req.onerror = () => resolve(null);
       req.onblocked = () => resolve(null);
     } catch {
       resolve(null);
     }
   });
-  return dbPromise;
+  dbPromise = pending;
+  return pending;
 }
+
+/** `ok` is false when storage is unavailable or the transaction failed, never for an empty read. */
+type TxResult<T> = { ok: true; value: T | undefined } | { ok: false };
 
 async function tx<T>(
   store: string,
   mode: IDBTransactionMode,
   run: (s: IDBObjectStore) => IDBRequest<T> | void
-): Promise<T | undefined> {
+): Promise<TxResult<T>> {
   const db = await openDb();
-  if (!db) return undefined;
+  if (!db) return { ok: false };
   return new Promise((resolve) => {
     try {
       const t = db.transaction(store, mode);
       const req = run(t.objectStore(store));
-      t.oncomplete = () => resolve(req ? req.result : undefined);
-      t.onerror = () => resolve(undefined);
-      t.onabort = () => resolve(undefined);
+      t.oncomplete = () => resolve({ ok: true, value: req ? req.result : undefined });
+      t.onerror = () => resolve({ ok: false });
+      t.onabort = () => resolve({ ok: false });
     } catch {
-      resolve(undefined);
+      resolve({ ok: false });
     }
   });
 }
 
-export const savePhoto = (photo: StoredPhoto) => tx(PHOTOS, 'readwrite', (s) => s.put(photo));
+/** Each write resolves to whether its transaction committed. */
+export const savePhoto = async (photo: StoredPhoto) => (await tx(PHOTOS, 'readwrite', (s) => s.put(photo))).ok;
 
-export const deletePhoto = (id: string) => tx(PHOTOS, 'readwrite', (s) => s.delete(id));
+export const deletePhoto = async (id: string) => (await tx(PHOTOS, 'readwrite', (s) => s.delete(id))).ok;
 
-export async function loadPhotos(): Promise<StoredPhoto[]> {
-  const all = await tx<StoredPhoto[]>(PHOTOS, 'readonly', (s) => s.getAll());
-  return (all ?? []).filter((p) => p && typeof p.id === 'string' && p.blob instanceof Blob);
+/** Stored photos, or null when the read failed (as opposed to an empty store). */
+export async function loadPhotos(): Promise<StoredPhoto[] | null> {
+  const res = await tx<StoredPhoto[]>(PHOTOS, 'readonly', (s) => s.getAll());
+  if (!res.ok) return null;
+  return (res.value ?? []).filter((p) => p && typeof p.id === 'string' && p.blob instanceof Blob);
 }
 
-export const saveSession = (session: StoredSession) =>
-  tx(META, 'readwrite', (s) => s.put(session, SESSION_KEY));
+export const saveSession = async (session: StoredSession) =>
+  (await tx(META, 'readwrite', (s) => s.put(session, SESSION_KEY))).ok;
 
-export async function loadSession(): Promise<StoredSession | null> {
-  const raw = await tx<unknown>(META, 'readonly', (s) => s.get(SESSION_KEY));
-  return parseStoredSession(raw);
+/** `ok: false` means the read failed; `session: null` with `ok: true` means nothing was saved yet. */
+export async function loadSession(): Promise<{ ok: boolean; session: StoredSession | null }> {
+  const res = await tx<unknown>(META, 'readonly', (s) => s.get(SESSION_KEY));
+  if (!res.ok) return { ok: false, session: null };
+  return { ok: true, session: parseStoredSession(res.value) };
 }
 
 /** Validates a stored session; anything malformed falls back to defaults field by field. */

@@ -1726,12 +1726,13 @@ export function applyAutoCorrectionToRgba(
 
 
 
+/** Transposes `src` (width × height) into `out` (height × width); `out` must not alias `src`. */
 function transposeRgba(
   src: Uint8ClampedArray | Uint8Array,
   width: number,
-  height: number
-): Uint8ClampedArray {
-  const out = new Uint8ClampedArray(width * height * 4);
+  height: number,
+  out: Uint8ClampedArray | Uint8Array = new Uint8ClampedArray(width * height * 4)
+): Uint8ClampedArray | Uint8Array {
   for (let y = 0; y < height; y++) {
     for (let x = 0; x < width; x++) {
       const s = (y * width + x) * 4;
@@ -1759,5 +1760,5 @@ export function applyHorizontalKeystoneWarpToRgba(
   if (rgbaData.length < width * height * 4) return;
   const transposed = transposeRgba(rgbaData, width, height);
   applyProjectiveKeystoneWarpToRgba(transposed, height, width, keystoneDeg);
-  rgbaData.set(transposeRgba(transposed, height, width));
+  transposeRgba(transposed, height, width, rgbaData);
 }

@@ -1,5 +1,6 @@
 /**
- * Main-thread client for the pipeline worker. Buffers are transferred, not copied.
+ * Main-thread client for the pipeline worker. Buffers are transferred to the worker; a copy
+ * is kept until the job settles so a worker crash can finish the job inline.
  * Where workers are unavailable the same operations run inline, so callers never branch.
  */
 import {
@@ -10,7 +11,16 @@ import {
   runProcess,
 } from './pipelineOps';
 
-type Pending = { resolve: (v: unknown) => void; reject: (e: Error) => void };
+type Pending = {
+  resolve: (v: unknown) => void;
+  reject: (e: Error) => void;
+  /** The request with its own pixels, untouched by the transfer, for the inline fallback. */
+  fallback: AnalyzeRequest | ProcessRequest;
+};
+
+function runInline(req: AnalyzeRequest | ProcessRequest): unknown {
+  return req.op === 'analyze' ? runAnalyze(req) : { rgba: runProcess(req) };
+}
 
 let worker: Worker | null | undefined;
 let nextId = 1;
@@ -30,10 +40,18 @@ function getWorker(): Worker | null {
       else job.reject(new Error(e.data.error || 'Pipeline worker failed'));
     };
     worker.onerror = (e) => {
-      // A worker that cannot load falls back to inline work for every later call
+      // A worker that cannot load falls back to inline work for every later call,
+      // and the jobs it held are finished inline from their kept copies
       e.preventDefault();
-      for (const job of pending.values()) job.reject(new Error('Pipeline worker crashed'));
+      const jobs = [...pending.values()];
       pending.clear();
+      for (const job of jobs) {
+        try {
+          job.resolve(runInline(job.fallback));
+        } catch (err) {
+          job.reject(err instanceof Error ? err : new Error('Pipeline worker crashed'));
+        }
+      }
       worker?.terminate();
       worker = null;
     };
@@ -46,13 +64,13 @@ function getWorker(): Worker | null {
 function post<R>(req: AnalyzeRequest | ProcessRequest): Promise<R> {
   const w = getWorker();
   if (!w) {
-    return Promise.resolve(
-      (req.op === 'analyze' ? runAnalyze(req) : { rgba: runProcess(req) }) as R
-    );
+    return Promise.resolve(runInline(req) as R);
   }
   const id = nextId++;
+  const fallback = { ...req, rgba: req.rgba.slice() } as AnalyzeRequest | ProcessRequest;
   return new Promise<R>((resolve, reject) => {
-    pending.set(id, { resolve: resolve as (v: unknown) => void, reject });
+    // Removed from `pending` before settling, so a job settles exactly once
+    pending.set(id, { resolve: resolve as (v: unknown) => void, reject, fallback });
     w.postMessage({ ...req, id }, [req.rgba.buffer]);
   });
 }

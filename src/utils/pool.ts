@@ -1,4 +1,7 @@
-/** Runs `task` over `items` with at most `limit` in flight; stops starting new ones once aborted. */
+/**
+ * Runs `task` over `items` with at most `limit` in flight. Stops starting new ones once aborted
+ * or once a task fails; tasks already running settle before the first failure is rethrown.
+ */
 export async function runPool<T, R>(
   items: readonly T[],
   limit: number,
@@ -7,15 +10,22 @@ export async function runPool<T, R>(
 ): Promise<R[]> {
   const results: R[] = new Array(items.length);
   let next = 0;
+  let failure: { error: unknown } | null = null;
   const lane = async () => {
     while (next < items.length) {
-      if (signal?.aborted) return;
+      if (signal?.aborted || failure) return;
       const index = next++;
-      results[index] = await task(items[index], index);
+      try {
+        results[index] = await task(items[index], index);
+      } catch (error) {
+        failure ??= { error };
+        return;
+      }
     }
   };
   const lanes = Array.from({ length: Math.max(1, Math.min(limit, items.length)) }, lane);
   await Promise.all(lanes);
+  if (failure) throw (failure as { error: unknown }).error;
   if (signal?.aborted) {
     throw new DOMException('Export cancelled', 'AbortError');
   }

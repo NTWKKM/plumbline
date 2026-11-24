@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { EditSession, migrateLegacyConfig } from '../utils/edits';
 import { StoredSession, loadPhotos, loadSession, saveSession } from '../utils/persist';
-import { StudioPhotoItem } from '../utils/samplePhotos';
+import { INITIAL_SAMPLE_PHOTOS, StudioPhotoItem } from '../utils/samplePhotos';
 
 const LEGACY_CONFIG_KEY = 'plumbline.pipelineConfig.v1';
 const LEGACY_VIEW_KEY = 'plumbline.viewState.v1';
@@ -23,8 +23,13 @@ function readLegacySession(): Partial<StoredSession> | null {
     const view = rawView ? (JSON.parse(rawView) as Record<string, unknown>) : {};
     const edits: EditSession['edits'] = {};
     const tilts = (view.tiltOverrides ?? {}) as Record<string, unknown>;
-    for (const [id, t] of Object.entries(tilts)) {
-      if (typeof t === 'number' && Number.isFinite(t)) edits[id] = { ...edit, tiltDeg: t };
+    // Every sample gets the migrated corrections; its tilt is the saved one, else its own baseline
+    for (const sample of INITIAL_SAMPLE_PHOTOS) {
+      const t = tilts[sample.id];
+      edits[sample.id] = {
+        ...edit,
+        tiltDeg: typeof t === 'number' && Number.isFinite(t) ? t : sample.simulatedSensorTiltDeg,
+      };
     }
     return {
       output,
@@ -37,23 +42,34 @@ function readLegacySession(): Partial<StoredSession> | null {
   }
 }
 
+export interface PersistenceState {
+  /** The restore has run; the studio may take edits. */
+  hydrated: boolean;
+  /** Saving is on: false after a failed restore read, so a partial restore never overwrites saved work. */
+  canSave: boolean;
+}
+
 /**
  * Restores the studio once on mount, then saves the session shortly after each change.
- * Nothing is saved before the restore finishes, so a slow disk never overwrites saved work.
+ * Nothing is saved before the restore finishes, so a slow disk never overwrites saved work,
+ * and nothing is saved after a failed read until a later visit restores in full.
  */
 export function usePersistence(
   snapshot: StoredSession,
-  onRestore: (restored: RestoredStudio & { legacy: Partial<StoredSession> | null }) => void
-): boolean {
-  const [hydrated, setHydrated] = useState(false);
+  onRestore: (
+    restored: RestoredStudio & { legacy: Partial<StoredSession> | null; readFailed: boolean }
+  ) => void
+): PersistenceState {
+  const [state, setState] = useState<PersistenceState>({ hydrated: false, canSave: false });
   const onRestoreRef = useRef(onRestore);
   onRestoreRef.current = onRestore;
 
   useEffect(() => {
     let cancelled = false;
-    void Promise.all([loadPhotos(), loadSession()]).then(([stored, session]) => {
+    void Promise.all([loadPhotos(), loadSession()]).then(([stored, loaded]) => {
       if (cancelled) return;
-      const imported: StudioPhotoItem[] = stored.map((p) => ({
+      const readFailed = stored === null || !loaded.ok;
+      const imported: StudioPhotoItem[] = (stored ?? []).map((p) => ({
         id: p.id,
         title: p.title,
         fileName: p.fileName,
@@ -63,8 +79,14 @@ export function usePersistence(
         exif: p.exif,
         rawApp1Segment: p.rawApp1Segment,
       }));
-      onRestoreRef.current({ imported, session, legacy: session ? null : readLegacySession() });
-      setHydrated(true);
+      const session = loaded.session;
+      onRestoreRef.current({
+        imported,
+        session,
+        legacy: session || readFailed ? null : readLegacySession(),
+        readFailed,
+      });
+      setState({ hydrated: true, canSave: !readFailed });
     });
     return () => {
       cancelled = true;
@@ -72,9 +94,11 @@ export function usePersistence(
   }, []);
 
   useEffect(() => {
-    if (!hydrated) return;
+    if (!state.canSave) return;
     const timer = setTimeout(() => {
-      void saveSession(snapshot).then(() => {
+      void saveSession(snapshot).then((committed) => {
+        // Keep the legacy keys until a write lands, so a failed save can still migrate later
+        if (!committed) return;
         try {
           localStorage.removeItem(LEGACY_CONFIG_KEY);
           localStorage.removeItem(LEGACY_VIEW_KEY);
@@ -84,7 +108,7 @@ export function usePersistence(
       });
     }, SAVE_DELAY_MS);
     return () => clearTimeout(timer);
-  }, [hydrated, snapshot]);
+  }, [state.canSave, snapshot]);
 
-  return hydrated;
+  return state;
 }

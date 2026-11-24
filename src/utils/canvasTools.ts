@@ -3,7 +3,9 @@
  * Coordinates are in source pixels unless a name says normalized.
  */
 import { clamp } from './geometry';
-import { NormalizedCrop } from './edits';
+import { MIN_CROP_FRACTION, NormalizedCrop } from './edits';
+
+export { MIN_CROP_FRACTION };
 
 /**
  * The rotation (degrees, canvas convention: positive is clockwise) that makes a drawn line
@@ -30,8 +32,6 @@ export function rotationToStraighten(
 }
 
 export type CropHandle = 'move' | 'n' | 's' | 'e' | 'w' | 'ne' | 'nw' | 'se' | 'sw';
-
-export const MIN_CROP_FRACTION = 0.05;
 
 /** Moves or resizes a normalized crop by a normalized delta, kept inside the unit square. */
 export function adjustCrop(
@@ -70,15 +70,16 @@ export function hitCropHandle(
   const right = crop.x + crop.width;
   const top = crop.y;
   const bottom = crop.y + crop.height;
-  const nearL = Math.abs(px - left) <= toleranceX;
-  const nearR = Math.abs(px - right) <= toleranceX;
-  const nearT = Math.abs(py - top) <= toleranceY;
-  const nearB = Math.abs(py - bottom) <= toleranceY;
+  const dL = Math.abs(px - left);
+  const dR = Math.abs(px - right);
+  const dT = Math.abs(py - top);
+  const dB = Math.abs(py - bottom);
   const insideX = px >= left - toleranceX && px <= right + toleranceX;
   const insideY = py >= top - toleranceY && py <= bottom + toleranceY;
   if (!insideX || !insideY) return null;
-  const v = nearT ? 'n' : nearB ? 's' : '';
-  const h = nearL ? 'w' : nearR ? 'e' : '';
+  // On a crop narrower than two hit zones both edges qualify: take the one nearer the pointer
+  const v = dT <= toleranceY && (dB > toleranceY || dT <= dB) ? 'n' : dB <= toleranceY ? 's' : '';
+  const h = dL <= toleranceX && (dR > toleranceX || dL <= dR) ? 'w' : dR <= toleranceX ? 'e' : '';
   if (v || h) return (v + h) as CropHandle;
   return px > left && px < right && py > top && py < bottom ? 'move' : null;
 }
