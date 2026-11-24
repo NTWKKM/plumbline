@@ -25,7 +25,8 @@ const SHORTCUT_GROUPS: { title: string; rows: { keys: string[]; label: string }[
     rows: [
       { keys: [MOD, 'Z'], label: 'Undo' },
       { keys: [MOD, '⇧', 'Z'], label: 'Redo' },
-      { keys: ['R'], label: 'Reset all adjustments' },
+      { keys: ['R'], label: 'Reset this photo' },
+      { keys: ['Esc'], label: 'Leave the straighten tool' },
     ],
   },
   {
