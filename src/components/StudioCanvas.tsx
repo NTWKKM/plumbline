@@ -1,27 +1,33 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ArrowDown, ArrowLeft, ArrowRight, ArrowUp, RotateCcw } from 'lucide-react';
 import {
   AutoCorrectAnalysis,
   CropRect,
   DEFAULT_AUTO_CORRECT_ANALYSIS,
   DEFAULT_LEVELING_ANALYSIS,
-  FrameLayout,
   LevelingAnalysis,
   PipelineConfig,
   PipelineTelemetryUpdate,
-  analyzeAutoCorrection,
-  applyAutoCorrectionToRgba,
-  applyProjectiveKeystoneWarpToRgba,
   clamp,
-  computeFrameLayout,
-  computeInscribedCrop,
-  computeSmartInscribedCrop,
   computeSplitDividerX,
-  detectHorizonTiltFromGrayscale,
-  formatExifSummaryLine,
   formatSignedDegrees,
-  getScaledDimensionsWithinBudget,
 } from '../utils/geometry';
+import {
+  ProcessedFramePipeline,
+  SaliencyBuffer,
+  buildProcessedFramePipeline,
+  buildSensorAndAnalysis,
+  reanalyzeTone,
+} from '../utils/framePipeline';
+import {
+  CropHandle,
+  adjustCrop,
+  hitCropHandle,
+  normalizeCrop,
+  rotationToStraighten,
+} from '../utils/canvasTools';
+import { NormalizedCrop } from '../utils/edits';
+import { createLatestRunner } from '../utils/pool';
 import { StudioPhotoItem } from '../utils/samplePhotos';
 
 export type CanvasViewMode = 'framed' | 'split' | 'geometry' | 'original';
@@ -34,304 +40,6 @@ const ATELIER_CANVAS_ACCENT = '#3b5878';
 const ATELIER_CANVAS_ACCENT_SOFT = '#93b4d4';
 const ATELIER_CANVAS_MAT = '#e6e1d7';
 
-interface SaliencyBuffer {
-  gray: Uint8Array;
-  rgba: Uint8ClampedArray;
-  width: number;
-  height: number;
-}
-
-interface SensorAnalysisResult {
-  sensorCanvas: HTMLCanvasElement;
-  analysis: LevelingAnalysis;
-  autoCorrect: AutoCorrectAnalysis;
-  saliency: SaliencyBuffer | null;
-}
-
-interface ProcessedFramePipeline {
-  crop: CropRect;
-  layout: FrameLayout;
-  totalRotDeg: number;
-  rotCanvas: HTMLCanvasElement;
-  processedFrameCanvas: HTMLCanvasElement;
-}
-
-function buildSensorAndAnalysis(
-  img: HTMLImageElement,
-  photo: StudioPhotoItem,
-  maxAutoAngleDeg: number,
-  pixelAreaBudget?: number,
-  wbProfile: PipelineConfig['wbProfile'] = 'ambient'
-): SensorAnalysisResult | null {
-  const rawW = img.naturalWidth || 1600;
-  const rawH = img.naturalHeight || 1200;
-
-  const { width: scaledW, height: scaledH } = getScaledDimensionsWithinBudget(
-    rawW,
-    rawH,
-    pixelAreaBudget
-  );
-
-  const tiltDeg = photo.simulatedSensorTiltDeg || 0;
-  const baseCrop = computeInscribedCrop(scaledW, scaledH, tiltDeg, true);
-
-  const offscreen = document.createElement('canvas');
-  offscreen.width = baseCrop.width;
-  offscreen.height = baseCrop.height;
-  const ctx = offscreen.getContext('2d');
-  if (!ctx) return null;
-
-  ctx.save();
-  ctx.translate(offscreen.width / 2, offscreen.height / 2);
-  ctx.rotate((tiltDeg * Math.PI) / 180);
-  ctx.drawImage(img, -scaledW / 2, -scaledH / 2, scaledW, scaledH);
-  ctx.restore();
-
-  const detectScale = Math.min(1, 640 / Math.max(offscreen.width, offscreen.height));
-  const dw = Math.max(16, Math.round(offscreen.width * detectScale));
-  const dh = Math.max(16, Math.round(offscreen.height * detectScale));
-
-  const detectCanvas = document.createElement('canvas');
-  detectCanvas.width = dw;
-  detectCanvas.height = dh;
-  const dCtx = detectCanvas.getContext('2d');
-  let detected: LevelingAnalysis = DEFAULT_LEVELING_ANALYSIS;
-  let autoCorr: AutoCorrectAnalysis = DEFAULT_AUTO_CORRECT_ANALYSIS;
-  let saliency: SaliencyBuffer | null = null;
-
-  if (dCtx) {
-    dCtx.drawImage(offscreen, 0, 0, dw, dh);
-    const imgData = dCtx.getImageData(0, 0, dw, dh).data;
-    const gray = new Uint8Array(dw * dh);
-    for (let i = 0; i < dw * dh; i++) {
-      const idx = i * 4;
-      gray[i] = Math.round(
-        0.299 * imgData[idx] + 0.587 * imgData[idx + 1] + 0.114 * imgData[idx + 2]
-      );
-    }
-    saliency = { gray, rgba: imgData, width: dw, height: dh };
-    detected = detectHorizonTiltFromGrayscale(gray, dw, dh, maxAutoAngleDeg);
-    autoCorr = analyzeAutoCorrection(imgData, dw, dh, wbProfile);
-  }
-
-  return { sensorCanvas: offscreen, analysis: detected, autoCorrect: autoCorr, saliency };
-}
-
-function buildProcessedFramePipeline(
-  sensorCanvas: HTMLCanvasElement,
-  photo: StudioPhotoItem,
-  config: PipelineConfig,
-  analysis: LevelingAnalysis,
-  autoCorrect: AutoCorrectAnalysis,
-  saliency?: { gray: Uint8Array; width: number; height: number } | null
-): ProcessedFramePipeline | null {
-  const srcW = sensorCanvas.width;
-  const srcH = sensorCanvas.height;
-
-  const autoRot = config.autoLevelEnabled ? analysis.appliedRotationDeg : 0;
-  const totalRotDeg = Number((autoRot + config.manualAngleOffsetDeg).toFixed(2));
-  const autoKeystone =
-    (config.keystoneWarpEnabled ?? true) ? (analysis.appliedKeystoneDeg ?? 0) : 0;
-  const totalKeystoneDeg = Number(
-    (autoKeystone + (config.manualKeystoneDeg ?? 0)).toFixed(2)
-  );
-  const corrEnabled = config.autoCorrectEnabled ?? true;
-  const corrStrength = config.autoCorrectStrength ?? 75;
-
-  const crop = config.autoCropEnabled
-    ? computeSmartInscribedCrop(
-        srcW,
-        srcH,
-        totalRotDeg,
-        config.preserveAspectRatioInCrop,
-        undefined,
-        saliency?.gray,
-        saliency?.width,
-        saliency?.height
-      )
-    : {
-        x: 0,
-        y: 0,
-        width: srcW,
-        height: srcH,
-        scaleFactor: 1,
-        areaRetainedPercent: 100,
-      };
-
-  const layout = computeFrameLayout(
-    crop.width,
-    crop.height,
-    config.aspectPreset,
-    config.paddingPercent,
-    config.renderExifCaption,
-    config.pixelAreaBudget
-  );
-
-  const rotCanvas = document.createElement('canvas');
-  rotCanvas.width = srcW;
-  rotCanvas.height = srcH;
-  const rCtx = rotCanvas.getContext('2d');
-  if (!rCtx) return null;
-
-  rCtx.save();
-  rCtx.imageSmoothingEnabled = true;
-  rCtx.imageSmoothingQuality = 'high';
-  rCtx.translate(srcW / 2, srcH / 2);
-  rCtx.rotate((totalRotDeg * Math.PI) / 180);
-  rCtx.drawImage(sensorCanvas, -srcW / 2, -srcH / 2);
-  rCtx.restore();
-
-  const needsKeystone = Math.abs(totalKeystoneDeg) >= 0.02;
-  const needsAutoCorr = corrEnabled && corrStrength > 0;
-  if ((needsKeystone || needsAutoCorr) && crop.width > 0 && crop.height > 0) {
-    const croppedData = rCtx.getImageData(crop.x, crop.y, crop.width, crop.height);
-    if (needsKeystone) {
-      applyProjectiveKeystoneWarpToRgba(
-        croppedData.data,
-        crop.width,
-        crop.height,
-        totalKeystoneDeg
-      );
-    }
-    if (needsAutoCorr) {
-      applyAutoCorrectionToRgba(
-        croppedData.data,
-        crop.width,
-        crop.height,
-        autoCorrect,
-        corrStrength
-      );
-    }
-    rCtx.putImageData(croppedData, crop.x, crop.y);
-  }
-
-  const processedFrameCanvas = document.createElement('canvas');
-  processedFrameCanvas.width = layout.canvasWidth;
-  processedFrameCanvas.height = layout.canvasHeight;
-  const pCtx = processedFrameCanvas.getContext('2d');
-  if (!pCtx) return null;
-
-  pCtx.fillStyle = config.backgroundColor;
-  pCtx.fillRect(0, 0, layout.canvasWidth, layout.canvasHeight);
-
-  pCtx.imageSmoothingEnabled = true;
-  pCtx.imageSmoothingQuality = 'high';
-  pCtx.drawImage(
-    rotCanvas,
-    crop.x,
-    crop.y,
-    crop.width,
-    crop.height,
-    layout.imageX,
-    layout.imageY,
-    layout.imageWidth,
-    layout.imageHeight
-  );
-
-  if (config.renderExifCaption) {
-    const captionText = formatExifSummaryLine(photo.exif);
-    if (captionText) {
-      let fontSize = Math.max(12, Math.round(layout.canvasHeight * 0.0145));
-      if (layout.borderBottom >= fontSize) {
-        const isDarkBg = isHexColorDark(config.backgroundColor);
-        pCtx.fillStyle = isDarkBg ? '#b3ada3' : '#4a433c';
-        pCtx.font = `500 ${fontSize}px "JetBrains Mono", monospace`;
-        pCtx.textAlign = 'center';
-        pCtx.textBaseline = 'middle';
-
-        const maxCaptionWidth = Math.max(
-          10,
-          layout.canvasWidth - Math.max(32, Math.round(layout.canvasWidth * 0.08))
-        );
-        let textWidth = pCtx.measureText(captionText).width;
-
-        if (textWidth > maxCaptionWidth) {
-          const scaledFontSize = Math.max(
-            9,
-            Math.floor(fontSize * (maxCaptionWidth / textWidth))
-          );
-          if (scaledFontSize < fontSize) {
-            fontSize = scaledFontSize;
-            pCtx.font = `500 ${fontSize}px "JetBrains Mono", monospace`;
-            textWidth = pCtx.measureText(captionText).width;
-          }
-        }
-
-        let finalCaption = captionText;
-        if (textWidth > maxCaptionWidth) {
-          while (
-            finalCaption.length > 3 &&
-            pCtx.measureText(finalCaption + '…').width > maxCaptionWidth
-          ) {
-            finalCaption = finalCaption.slice(0, -1);
-          }
-          finalCaption += '…';
-        }
-
-        const captionY = layout.imageY + layout.imageHeight + layout.borderBottom * 0.52;
-        pCtx.fillText(finalCaption, layout.canvasWidth / 2, captionY);
-      }
-    }
-  }
-
-  return {
-    crop,
-    layout,
-    totalRotDeg,
-    rotCanvas,
-    processedFrameCanvas,
-  };
-}
-
-/**
- * Renders a queued photo offscreen through the full leveling, keystone warp, smart inscribed-crop,
- * tone-correction, and framing pipeline for batch JPEG export.
- */
-export async function renderPhotoToFramedCanvas(
-  photo: StudioPhotoItem,
-  config: PipelineConfig
-): Promise<{ canvas: HTMLCanvasElement; sourceSize: { width: number; height: number } }> {
-  const img = await new Promise<HTMLImageElement>((resolve, reject) => {
-    const loader = new Image();
-    loader.crossOrigin = 'anonymous';
-    loader.referrerPolicy = 'no-referrer';
-    loader.onload = () => resolve(loader);
-    loader.onerror = () => reject(new Error(`Unable to decode ${photo.fileName}`));
-    loader.src = photo.src;
-  });
-
-  const sensorResult = buildSensorAndAnalysis(
-    img,
-    photo,
-    config.maxAutoAngleDeg,
-    config.pixelAreaBudget,
-    config.wbProfile ?? 'ambient'
-  );
-  if (!sensorResult) {
-    throw new Error(`Canvas context unavailable for ${photo.fileName}`);
-  }
-
-  const pipeline = buildProcessedFramePipeline(
-    sensorResult.sensorCanvas,
-    photo,
-    config,
-    sensorResult.analysis,
-    sensorResult.autoCorrect,
-    sensorResult.saliency
-  );
-  if (!pipeline) {
-    throw new Error(`Unable to render framed output for ${photo.fileName}`);
-  }
-
-  return {
-    canvas: pipeline.processedFrameCanvas,
-    sourceSize: {
-      width: sensorResult.sensorCanvas.width,
-      height: sensorResult.sensorCanvas.height,
-    },
-  };
-}
-
 interface StudioCanvasProps {
   photo: StudioPhotoItem;
   config: PipelineConfig;
@@ -340,14 +48,37 @@ interface StudioCanvasProps {
   onSplitPercentChange: (pct: number) => void;
   showHorizonGrid: boolean;
   onAnalysisUpdate: (telemetry: PipelineTelemetryUpdate) => void;
-  canvasRef: React.RefObject<HTMLCanvasElement | null>;
   onImageLoaded?: (loaded: boolean) => void;
-  exportCanvasRef?: React.MutableRefObject<(() => HTMLCanvasElement | null) | null>;
   zoomLevel?: number;
   panOffset?: { x: number; y: number };
   onPanOffsetChange?: (offset: { x: number; y: number }) => void;
   onZoomLevelChange?: (zoom: number) => void;
+  /** Crop box view: drag the box or its handles; commits a hand crop on release. */
+  onCropChange?: (crop: NormalizedCrop) => void;
+  /** Straighten tool: draw along something level or plumb; reports the rotation that fixes it. */
+  straightenActive?: boolean;
+  onStraighten?: (rotationDeg: number) => void;
 }
+
+type Pointer = { x: number; y: number };
+
+type Gesture =
+  | { kind: 'split' }
+  | { kind: 'pan'; clientX: number; clientY: number; offsetX: number; offsetY: number }
+  | { kind: 'crop'; handle: CropHandle; start: Pointer; origin: NormalizedCrop }
+  | { kind: 'line'; start: Pointer };
+
+const CROP_CURSORS: Record<CropHandle, string> = {
+  move: 'move',
+  n: 'ns-resize',
+  s: 'ns-resize',
+  e: 'ew-resize',
+  w: 'ew-resize',
+  ne: 'nesw-resize',
+  sw: 'nesw-resize',
+  nw: 'nwse-resize',
+  se: 'nwse-resize',
+};
 
 export const StudioCanvas: React.FC<StudioCanvasProps> = ({
   photo,
@@ -357,218 +88,178 @@ export const StudioCanvas: React.FC<StudioCanvasProps> = ({
   onSplitPercentChange,
   showHorizonGrid,
   onAnalysisUpdate,
-  canvasRef,
   onImageLoaded,
-  exportCanvasRef,
   zoomLevel = 1,
   panOffset = { x: 0, y: 0 },
   onPanOffsetChange,
   onZoomLevelChange,
+  onCropChange,
+  straightenActive = false,
+  onStraighten,
 }) => {
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const [sensorCanvas, setSensorCanvas] = useState<HTMLCanvasElement | null>(null);
   const [analysis, setAnalysis] = useState<LevelingAnalysis>(DEFAULT_LEVELING_ANALYSIS);
-  const [autoCorrect, setAutoCorrect] = useState<AutoCorrectAnalysis>(
-    DEFAULT_AUTO_CORRECT_ANALYSIS
-  );
+  const [autoCorrect, setAutoCorrect] = useState<AutoCorrectAnalysis>(DEFAULT_AUTO_CORRECT_ANALYSIS);
+  const [pipeline, setPipeline] = useState<ProcessedFramePipeline | null>(null);
+  const [isProcessing, setIsProcessing] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
-  const [isDraggingSplit, setIsDraggingSplit] = useState<boolean>(false);
-  const [isPanning, setIsPanning] = useState<boolean>(false);
+  const [draftCrop, setDraftCropState] = useState<NormalizedCrop | null>(null);
+  const [draftLine, setDraftLineState] = useState<{ a: Pointer; b: Pointer } | null>(null);
+  // Mirrors of the drafts: pointer events can arrive faster than React re-renders
+  const draftCropRef = useRef<NormalizedCrop | null>(null);
+  const draftLineRef = useRef<{ a: Pointer; b: Pointer } | null>(null);
+  const setDraftCrop = (v: NormalizedCrop | null) => {
+    draftCropRef.current = v;
+    setDraftCropState(v);
+  };
+  const setDraftLine = (v: { a: Pointer; b: Pointer } | null) => {
+    draftLineRef.current = v;
+    setDraftLineState(v);
+  };
+  const [hoverCursor, setHoverCursor] = useState<string | undefined>(undefined);
+  const [isPanning, setIsPanning] = useState(false);
 
   const stageContainerRef = useRef<HTMLDivElement | null>(null);
-  const isPanningRef = useRef(false);
-  const panStartRef = useRef({ clientX: 0, clientY: 0, offsetX: 0, offsetY: 0 });
+  const gestureRef = useRef<Gesture | null>(null);
+  const saliencyRef = useRef<SaliencyBuffer | null>(null);
   const callbackRef = useRef(onAnalysisUpdate);
   callbackRef.current = onAnalysisUpdate;
+  const loadedRef = useRef(onImageLoaded);
+  loadedRef.current = onImageLoaded;
 
-  const saliencyBufferRef = useRef<{
-    gray: Uint8Array;
-    rgba: Uint8ClampedArray;
-    width: number;
-    height: number;
-  } | null>(null);
+  const tiltDeg = photo.simulatedSensorTiltDeg || 0;
+  const effectiveView: CanvasViewMode = straightenActive ? 'original' : viewMode;
 
-  // Cache processed full-resolution rotCanvas and framed output across interactive split drags
-  const pipelineCacheRef = useRef<{
-    sensorCanvas: HTMLCanvasElement;
-    cacheKey: string;
-    crop: CropRect;
-    layout: FrameLayout;
-    totalRotDeg: number;
-    rotCanvas: HTMLCanvasElement;
-    processedFrameCanvas: HTMLCanvasElement;
-  } | null>(null);
-
-  // Step 1: Load source photo, apply simulated camera sensor tilt if configured, and run Scharr/Radon Horizon Detection
+  // Step 1: decode the photo, simulate tilt, and analyse horizon and tone in the worker
   useEffect(() => {
     let cancelled = false;
     setSensorCanvas(null);
+    setPipeline(null);
     setLoadError(null);
-    if (exportCanvasRef) exportCanvasRef.current = null;
-    const initialCanvas = canvasRef.current;
-    if (initialCanvas) {
-      const initCtx = initialCanvas.getContext('2d');
-      initCtx?.clearRect(0, 0, initialCanvas.width, initialCanvas.height);
-    }
-    onImageLoaded?.(false);
+    loadedRef.current?.(false);
 
     const img = new Image();
     img.crossOrigin = 'anonymous';
     img.referrerPolicy = 'no-referrer';
-
-    img.onload = () => {
+    img.onload = async () => {
       if (cancelled) return;
-      const result = buildSensorAndAnalysis(
-        img,
-        photo,
-        config.maxAutoAngleDeg,
-        config.pixelAreaBudget
-      );
-      if (!result) return;
-      saliencyBufferRef.current = result.saliency;
-      setSensorCanvas(result.sensorCanvas);
-      setAnalysis(result.analysis);
-      setAutoCorrect(result.autoCorrect);
-    };
-
-    img.onerror = () => {
-      if (!cancelled) {
-        setLoadError('Unable to decode image buffer.');
-        onImageLoaded?.(false);
+      try {
+        const result = await buildSensorAndAnalysis(
+          img,
+          tiltDeg,
+          config.maxAutoAngleDeg,
+          config.pixelAreaBudget,
+          config.wbProfile ?? 'ambient'
+        );
+        if (cancelled || !result) return;
+        saliencyRef.current = result.saliency;
+        setAnalysis(result.analysis);
+        setAutoCorrect(result.autoCorrect);
+        setSensorCanvas(result.sensorCanvas);
+      } catch (err) {
+        if (!cancelled) setLoadError(err instanceof Error ? err.message : 'Analysis failed.');
       }
     };
-
+    img.onerror = () => {
+      if (!cancelled) setLoadError('Unable to decode image buffer.');
+    };
     img.src = photo.src;
-
     return () => {
       cancelled = true;
-      if (exportCanvasRef) exportCanvasRef.current = null;
-      if (canvasRef.current) {
-        const c = canvasRef.current;
-        const cCtx = c.getContext('2d');
-        cCtx?.clearRect(0, 0, c.width, c.height);
-      }
     };
-  }, [
-    photo.id,
-    photo.src,
-    photo.simulatedSensorTiltDeg,
-    config.maxAutoAngleDeg,
-    config.pixelAreaBudget,
-    onImageLoaded,
-  ]);
+    // wbProfile is read once here; later changes re-run only the tone analysis below
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [photo.id, photo.src, tiltDeg, config.maxAutoAngleDeg, config.pixelAreaBudget]);
 
-  // Step 2: Render the active pipeline stage onto the visible studio canvas
+  // A white-balance profile change re-runs only the tone analysis
+  const wbProfile = config.wbProfile ?? 'ambient';
+  useEffect(() => {
+    const sal = saliencyRef.current;
+    if (!sal || !sensorCanvas || (autoCorrect.wbProfile ?? 'ambient') === wbProfile) return;
+    let cancelled = false;
+    void reanalyzeTone(sal, wbProfile).then((next) => {
+      if (!cancelled) setAutoCorrect(next);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [wbProfile, sensorCanvas, autoCorrect.wbProfile]);
+
+  // Step 2: build the framed output. Only the latest request runs, so a slider drag stays responsive.
+  const generationRef = useRef(0);
+  const runPipeline = useMemo(
+    () =>
+      createLatestRunner<{
+        generation: number;
+        sensor: HTMLCanvasElement;
+        photo: StudioPhotoItem;
+        config: PipelineConfig;
+        analysis: LevelingAnalysis;
+        autoCorrect: AutoCorrectAnalysis;
+      }>(async (job) => {
+        try {
+          const result = await buildProcessedFramePipeline(
+            job.sensor,
+            job.photo,
+            job.config,
+            job.analysis,
+            job.autoCorrect,
+            saliencyRef.current
+          );
+          if (!result || job.generation !== generationRef.current) return;
+          setPipeline(result);
+          setIsProcessing(false);
+          callbackRef.current({
+            analysis: job.analysis,
+            crop: result.crop,
+            layout: result.layout,
+            sourceSize: { width: job.sensor.width, height: job.sensor.height },
+            autoCorrect: job.autoCorrect,
+          });
+        } catch (err) {
+          if (job.generation === generationRef.current) {
+            setIsProcessing(false);
+            setLoadError(err instanceof Error ? err.message : 'Rendering failed.');
+          }
+        }
+      }),
+    []
+  );
+
+  useEffect(() => {
+    if (!sensorCanvas) return;
+    if ((autoCorrect.wbProfile ?? 'ambient') !== wbProfile) return; // wait for the tone re-analysis
+    generationRef.current += 1;
+    setIsProcessing(true);
+    runPipeline({
+      generation: generationRef.current,
+      sensor: sensorCanvas,
+      photo,
+      config,
+      analysis,
+      autoCorrect,
+    });
+  }, [sensorCanvas, photo, config, analysis, autoCorrect, wbProfile, runPipeline]);
+
+  useEffect(() => {
+    loadedRef.current?.(!!pipeline);
+  }, [pipeline]);
+
+  // Step 3: draw the active view. Cheap, so it runs on every view, split, grid or draft change.
   useEffect(() => {
     const canvas = canvasRef.current;
-    if (!canvas || !sensorCanvas) {
-      if (exportCanvasRef) exportCanvasRef.current = null;
-      if (canvas) {
-        const ctx = canvas.getContext('2d');
-        ctx?.clearRect(0, 0, canvas.width, canvas.height);
-      }
-      onImageLoaded?.(false);
-      return;
-    }
+    if (!canvas || !sensorCanvas || !pipeline) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
 
     const srcW = sensorCanvas.width;
     const srcH = sensorCanvas.height;
-
-    const autoRot = config.autoLevelEnabled ? analysis.appliedRotationDeg : 0;
-    const totalRotDeg = Number((autoRot + config.manualAngleOffsetDeg).toFixed(2));
-    const autoKeystone =
-      (config.keystoneWarpEnabled ?? true) ? (analysis.appliedKeystoneDeg ?? 0) : 0;
-    const totalKeystoneDeg = Number(
-      (autoKeystone + (config.manualKeystoneDeg ?? 0)).toFixed(2)
-    );
-    const corrEnabled = config.autoCorrectEnabled ?? true;
-    const corrStrength = config.autoCorrectStrength ?? 75;
-    const activeWbProfile = config.wbProfile ?? 'ambient';
-
-    const sal = saliencyBufferRef.current;
-    const activeAutoCorrect =
-      sal && (autoCorrect.wbProfile ?? 'ambient') !== activeWbProfile
-        ? analyzeAutoCorrection(sal.rgba, sal.width, sal.height, activeWbProfile)
-        : autoCorrect;
-
-    if (activeAutoCorrect !== autoCorrect) {
-      setAutoCorrect(activeAutoCorrect);
-    }
-
-    const pipelineKey = [
-      photo.id,
-      `${srcW}x${srcH}`,
-      totalRotDeg,
-      totalKeystoneDeg,
-      config.autoCropEnabled,
-      config.preserveAspectRatioInCrop,
-      config.aspectPreset,
-      config.paddingPercent,
-      config.renderExifCaption,
-      config.pixelAreaBudget,
-      config.backgroundColor,
-      corrEnabled,
-      corrStrength,
-      activeWbProfile,
-      activeAutoCorrect.exposureEv,
-      activeAutoCorrect.contrast,
-      activeAutoCorrect.shadows,
-      activeAutoCorrect.highlights,
-      activeAutoCorrect.wbTempShift,
-      activeAutoCorrect.wbTintShift,
-      photo.exif.cameraModel,
-      photo.exif.lensModel,
-      photo.exif.focalLength,
-    ].join('|');
-
-    if (
-      !pipelineCacheRef.current ||
-      pipelineCacheRef.current.sensorCanvas !== sensorCanvas ||
-      pipelineCacheRef.current.cacheKey !== pipelineKey
-    ) {
-      const pipeline = buildProcessedFramePipeline(
-        sensorCanvas,
-        photo,
-        config,
-        analysis,
-        activeAutoCorrect,
-        sal
-      );
-      if (!pipeline) {
-        if (exportCanvasRef) exportCanvasRef.current = null;
-        onImageLoaded?.(false);
-        return;
-      }
-      pipelineCacheRef.current = {
-        sensorCanvas,
-        cacheKey: pipelineKey,
-        crop: pipeline.crop,
-        layout: pipeline.layout,
-        totalRotDeg: pipeline.totalRotDeg,
-        rotCanvas: pipeline.rotCanvas,
-        processedFrameCanvas: pipeline.processedFrameCanvas,
-      };
-
-      callbackRef.current({
-        analysis,
-        crop: pipeline.crop,
-        layout: pipeline.layout,
-        sourceSize: { width: srcW, height: srcH },
-        autoCorrect: activeAutoCorrect,
-      });
-    }
-
-    if (exportCanvasRef) {
-      exportCanvasRef.current = () => pipelineCacheRef.current?.processedFrameCanvas ?? null;
-    }
-
-    const { crop, layout, rotCanvas, processedFrameCanvas } = pipelineCacheRef.current;
-
-    const ctx = canvas.getContext('2d');
-    if (!ctx) {
-      if (exportCanvasRef) exportCanvasRef.current = null;
-      onImageLoaded?.(false);
-      return;
-    }
+    const { layout, rotCanvas, processedFrameCanvas, totalRotDeg } = pipeline;
+    const crop: CropRect = draftCrop
+      ? { ...pipeline.crop, ...denormalize(draftCrop, srcW, srcH) }
+      : pipeline.crop;
+    const viewMode = effectiveView;
 
     if (viewMode === 'original') {
       canvas.width = srcW;
@@ -750,43 +441,80 @@ export const StudioCanvas: React.FC<StudioCanvasProps> = ({
       ctx.restore();
     }
 
-    onImageLoaded?.(true);
 
-    return () => {
-      if (exportCanvasRef) exportCanvasRef.current = null;
-      onImageLoaded?.(false);
-    };
+    if (viewMode === 'geometry' && onCropChange) {
+      drawCropHandles(ctx, crop, srcW);
+    }
+
+    if (straightenActive && draftLine) {
+      ctx.save();
+      ctx.strokeStyle = ATELIER_CANVAS_ACCENT_SOFT;
+      ctx.lineWidth = Math.max(2, Math.round(srcW * 0.003));
+      ctx.setLineDash([Math.max(6, srcW * 0.01), Math.max(4, srcW * 0.006)]);
+      ctx.beginPath();
+      ctx.moveTo(draftLine.a.x, draftLine.a.y);
+      ctx.lineTo(draftLine.b.x, draftLine.b.y);
+      ctx.stroke();
+      ctx.restore();
+    }
   }, [
     sensorCanvas,
+    pipeline,
     analysis,
-    autoCorrect,
-    config,
-    viewMode,
+    effectiveView,
     splitPercent,
     showHorizonGrid,
-    photo.exif,
-    canvasRef,
-    exportCanvasRef,
-    onImageLoaded,
+    draftCrop,
+    draftLine,
+    straightenActive,
+    onCropChange,
+    config.backgroundColor,
   ]);
 
   useEffect(() => {
     const container = stageContainerRef.current;
     if (!container || !onZoomLevelChange) return;
-
     const handleWheel = (e: WheelEvent) => {
       if (!e.ctrlKey && !e.metaKey) return;
       e.preventDefault();
       const nextZoom = clamp(Number((zoomLevel - e.deltaY * 0.005).toFixed(2)), 1, 4);
       onZoomLevelChange(nextZoom);
-      if (nextZoom <= 1) {
-        onPanOffsetChange?.({ x: 0, y: 0 });
-      }
+      if (nextZoom <= 1) onPanOffsetChange?.({ x: 0, y: 0 });
     };
-
     container.addEventListener('wheel', handleWheel, { passive: false });
     return () => container.removeEventListener('wheel', handleWheel);
   }, [zoomLevel, onZoomLevelChange, onPanOffsetChange]);
+
+  /** Client point → canvas pixel (the canvas backing store is in source pixels for these views). */
+  const toCanvasPoint = (clientX: number, clientY: number): Pointer | null => {
+    const canvas = canvasRef.current;
+    if (!canvas) return null;
+    const rect = canvas.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return null;
+    return {
+      x: ((clientX - rect.left) / rect.width) * canvas.width,
+      y: ((clientY - rect.top) / rect.height) * canvas.height,
+    };
+  };
+
+  const cropTool = effectiveView === 'geometry' && !!onCropChange && !!pipeline && !!sensorCanvas;
+
+  const cropHandleAt = (clientX: number, clientY: number): CropHandle | null => {
+    if (!cropTool || !sensorCanvas || !pipeline) return null;
+    const pt = toCanvasPoint(clientX, clientY);
+    const canvas = canvasRef.current;
+    if (!pt || !canvas) return null;
+    const rect = canvas.getBoundingClientRect();
+    const crop = normalizeCrop(pipeline.crop, sensorCanvas.width, sensorCanvas.height);
+    // About 12 CSS px of grab tolerance whatever the zoom
+    return hitCropHandle(
+      crop,
+      pt.x / canvas.width,
+      pt.y / canvas.height,
+      12 / (rect.width || 1),
+      12 / (rect.height || 1)
+    );
+  };
 
   const updateSplitFromClientX = (clientX: number) => {
     const canvas = canvasRef.current;
@@ -798,136 +526,155 @@ export const StudioCanvas: React.FC<StudioCanvasProps> = ({
     onSplitPercentChange(clampedPercent);
   };
 
-  const handlePointerDown = (e: React.PointerEvent<HTMLCanvasElement>) => {
-    if (e.button !== 0) return;
-    if (viewMode === 'split') {
-      try {
-        e.currentTarget.setPointerCapture(e.pointerId);
-      } catch {
-        // Ignore if pointer capture fails
-      }
-      setIsDraggingSplit(true);
-      updateSplitFromClientX(e.clientX);
-      return;
-    }
-
-    if (zoomLevel > 1 && onPanOffsetChange) {
-      try {
-        e.currentTarget.setPointerCapture(e.pointerId);
-      } catch {
-        // Ignore if pointer capture fails
-      }
-      isPanningRef.current = true;
-      setIsPanning(true);
-      panStartRef.current = {
-        clientX: e.clientX,
-        clientY: e.clientY,
-        offsetX: panOffset.x,
-        offsetY: panOffset.y,
-      };
-    }
-  };
-
   const computeMaxPan = useCallback((): { maxPanX: number; maxPanY: number } => {
     const canvas = canvasRef.current;
     const stage = stageContainerRef.current;
-    if (!canvas || zoomLevel <= 1) {
-      return { maxPanX: 0, maxPanY: 0 };
-    }
+    if (!canvas || zoomLevel <= 1) return { maxPanX: 0, maxPanY: 0 };
     const baseW = canvas.offsetWidth;
     const baseH = canvas.offsetHeight;
-    const scaledW = baseW * zoomLevel;
-    const scaledH = baseH * zoomLevel;
     const stageW = stage && stage.clientWidth > 0 ? stage.clientWidth : baseW;
     const stageH = stage && stage.clientHeight > 0 ? stage.clientHeight : baseH;
     return {
-      maxPanX: Math.max(0, Math.round((scaledW - stageW) / 2)),
-      maxPanY: Math.max(0, Math.round((scaledH - stageH) / 2)),
+      maxPanX: Math.max(0, Math.round((baseW * zoomLevel - stageW) / 2)),
+      maxPanY: Math.max(0, Math.round((baseH * zoomLevel - stageH) / 2)),
     };
-  }, [canvasRef, zoomLevel]);
+  }, [zoomLevel]);
 
   const nudgePan = useCallback(
     (dx: number, dy: number) => {
       if (!onPanOffsetChange) return;
       const { maxPanX, maxPanY } = computeMaxPan();
-      const nextX = clamp(Math.round(panOffset.x + dx), -maxPanX, maxPanX);
-      const nextY = clamp(Math.round(panOffset.y + dy), -maxPanY, maxPanY);
-      onPanOffsetChange({ x: nextX, y: nextY });
+      onPanOffsetChange({
+        x: clamp(Math.round(panOffset.x + dx), -maxPanX, maxPanX),
+        y: clamp(Math.round(panOffset.y + dy), -maxPanY, maxPanY),
+      });
     },
     [computeMaxPan, onPanOffsetChange, panOffset.x, panOffset.y]
   );
 
   useEffect(() => {
     if (!onPanOffsetChange) return;
-
     const clampPanToBounds = () => {
       const { maxPanX, maxPanY } = computeMaxPan();
-      const clampedX = clamp(panOffset.x, -maxPanX, maxPanX);
-      const clampedY = clamp(panOffset.y, -maxPanY, maxPanY);
-      if (clampedX !== panOffset.x || clampedY !== panOffset.y) {
-        onPanOffsetChange({ x: clampedX, y: clampedY });
-      }
+      const x = clamp(panOffset.x, -maxPanX, maxPanX);
+      const y = clamp(panOffset.y, -maxPanY, maxPanY);
+      if (x !== panOffset.x || y !== panOffset.y) onPanOffsetChange({ x, y });
     };
-
     clampPanToBounds();
-
     if (typeof ResizeObserver !== 'function') return;
-    const observer = new ResizeObserver(() => {
-      clampPanToBounds();
-    });
+    const observer = new ResizeObserver(clampPanToBounds);
     if (canvasRef.current) observer.observe(canvasRef.current);
     if (stageContainerRef.current) observer.observe(stageContainerRef.current);
+    return () => observer.disconnect();
+  }, [zoomLevel, panOffset.x, panOffset.y, computeMaxPan, onPanOffsetChange]);
 
-    return () => {
-      observer.disconnect();
-    };
-  }, [zoomLevel, panOffset.x, panOffset.y, computeMaxPan, onPanOffsetChange, canvasRef]);
+  const capture = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    try {
+      e.currentTarget.setPointerCapture(e.pointerId);
+    } catch {
+      // Pointer capture can fail for synthetic events; the gesture still works without it
+    }
+  };
 
-  const handlePointerMove = (e: React.PointerEvent<HTMLCanvasElement>) => {
-    if (viewMode === 'split' && isDraggingSplit) {
+  const handlePointerDown = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    if (e.button !== 0) return;
+    if (straightenActive && onStraighten) {
+      const pt = toCanvasPoint(e.clientX, e.clientY);
+      if (!pt) return;
+      capture(e);
+      gestureRef.current = { kind: 'line', start: pt };
+      setDraftLine({ a: pt, b: pt });
+      return;
+    }
+    if (effectiveView === 'split') {
+      capture(e);
+      gestureRef.current = { kind: 'split' };
       updateSplitFromClientX(e.clientX);
       return;
     }
+    const handle = cropHandleAt(e.clientX, e.clientY);
+    if (handle && sensorCanvas && pipeline) {
+      const pt = toCanvasPoint(e.clientX, e.clientY);
+      if (!pt) return;
+      capture(e);
+      const origin = normalizeCrop(pipeline.crop, sensorCanvas.width, sensorCanvas.height);
+      gestureRef.current = { kind: 'crop', handle, start: pt, origin };
+      setDraftCrop(origin);
+      return;
+    }
+    if (zoomLevel > 1 && onPanOffsetChange) {
+      capture(e);
+      gestureRef.current = {
+        kind: 'pan',
+        clientX: e.clientX,
+        clientY: e.clientY,
+        offsetX: panOffset.x,
+        offsetY: panOffset.y,
+      };
+      setIsPanning(true);
+    }
+  };
 
-    if (isPanningRef.current && onPanOffsetChange) {
+  const handlePointerMove = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    const g = gestureRef.current;
+    if (!g) {
+      if (cropTool) {
+        const handle = cropHandleAt(e.clientX, e.clientY);
+        setHoverCursor(handle ? CROP_CURSORS[handle] : undefined);
+      }
+      return;
+    }
+    if (g.kind === 'split') {
+      updateSplitFromClientX(e.clientX);
+    } else if (g.kind === 'line') {
+      const pt = toCanvasPoint(e.clientX, e.clientY);
+      if (pt) setDraftLine({ a: g.start, b: pt });
+    } else if (g.kind === 'crop') {
+      const pt = toCanvasPoint(e.clientX, e.clientY);
+      const canvas = canvasRef.current;
+      if (!pt || !canvas) return;
+      const dx = (pt.x - g.start.x) / canvas.width;
+      const dy = (pt.y - g.start.y) / canvas.height;
+      setDraftCrop(adjustCrop(g.origin, g.handle, dx, dy));
+    } else if (g.kind === 'pan' && onPanOffsetChange) {
       const { maxPanX, maxPanY } = computeMaxPan();
-      const nextX = clamp(
-        panStartRef.current.offsetX + (e.clientX - panStartRef.current.clientX),
-        -maxPanX,
-        maxPanX
-      );
-      const nextY = clamp(
-        panStartRef.current.offsetY + (e.clientY - panStartRef.current.clientY),
-        -maxPanY,
-        maxPanY
-      );
-      onPanOffsetChange({ x: Math.round(nextX), y: Math.round(nextY) });
+      onPanOffsetChange({
+        x: Math.round(clamp(g.offsetX + (e.clientX - g.clientX), -maxPanX, maxPanX)),
+        y: Math.round(clamp(g.offsetY + (e.clientY - g.clientY), -maxPanY, maxPanY)),
+      });
+    }
+  };
+
+  const endGesture = (commit: boolean) => {
+    const g = gestureRef.current;
+    gestureRef.current = null;
+    setIsPanning(false);
+    const crop = draftCropRef.current;
+    const line = draftLineRef.current;
+    if (g?.kind === 'crop') {
+      if (commit && crop) onCropChange?.(crop);
+      setDraftCrop(null);
+    } else if (g?.kind === 'line') {
+      if (commit && line) {
+        const rotation = rotationToStraighten(line.a.x, line.a.y, line.b.x, line.b.y);
+        if (rotation !== null) onStraighten?.(rotation);
+      }
+      setDraftLine(null);
     }
   };
 
   const handlePointerUp = (e: React.PointerEvent<HTMLCanvasElement>) => {
-    if (!isDraggingSplit && !isPanningRef.current) return;
     if (e.currentTarget.hasPointerCapture(e.pointerId)) {
       e.currentTarget.releasePointerCapture(e.pointerId);
     }
-    setIsDraggingSplit(false);
-    isPanningRef.current = false;
-    setIsPanning(false);
+    endGesture(true);
   };
 
   const handlePointerCancel = (e: React.PointerEvent<HTMLCanvasElement>) => {
     if (e.currentTarget.hasPointerCapture(e.pointerId)) {
       e.currentTarget.releasePointerCapture(e.pointerId);
     }
-    setIsDraggingSplit(false);
-    isPanningRef.current = false;
-    setIsPanning(false);
-  };
-
-  const handleLostPointerCapture = () => {
-    setIsDraggingSplit(false);
-    isPanningRef.current = false;
-    setIsPanning(false);
+    endGesture(false);
   };
 
   const handleDoubleClick = () => {
@@ -946,47 +693,54 @@ export const StudioCanvas: React.FC<StudioCanvasProps> = ({
   }
 
   const isTransformActive = zoomLevel !== 1 || panOffset.x !== 0 || panOffset.y !== 0;
+  const cursor = straightenActive
+    ? 'crosshair'
+    : effectiveView === 'split'
+      ? 'ew-resize'
+      : hoverCursor ?? (zoomLevel > 1 ? (isPanning ? 'grabbing' : 'grab') : undefined);
+  const interactive = straightenActive || effectiveView === 'split' || cropTool || zoomLevel > 1;
 
   return (
     <div
       ref={stageContainerRef}
       className="relative flex h-full w-full items-center justify-center overflow-hidden p-2 sm:p-4"
-      data-state={sensorCanvas ? 'ready' : 'loading'}
-      data-view-mode={viewMode}
+      data-state={pipeline ? (isProcessing ? 'processing' : 'ready') : 'loading'}
+      data-view-mode={effectiveView}
     >
-      {!sensorCanvas && (
+      {!pipeline && (
         <div
           role="status"
           aria-live="polite"
           className="pointer-events-none absolute inset-0 flex items-center justify-center text-sm text-muted"
         >
-          Analyzing horizon and tonal curves…
+          Analysing horizon and tone…
         </div>
       )}
       <canvas
         ref={canvasRef}
         data-testid="studio-canvas"
-        aria-label={`Framed preview of ${photo.title}`}
+        aria-label={
+          straightenActive
+            ? `Straighten ${photo.title}: drag along a line that should be level or upright`
+            : cropTool
+              ? `Crop ${photo.title}: drag the box or its edges`
+              : `Framed preview of ${photo.title}`
+        }
         onPointerDown={handlePointerDown}
         onPointerMove={handlePointerMove}
         onPointerUp={handlePointerUp}
         onPointerCancel={handlePointerCancel}
-        onLostPointerCapture={handleLostPointerCapture}
+        onLostPointerCapture={() => endGesture(false)}
         onDoubleClick={handleDoubleClick}
-        style={
-          isTransformActive
-            ? {
-                transform: `translate(${panOffset.x}px, ${panOffset.y}px) scale(${zoomLevel})`,
-              }
-            : undefined
-        }
+        style={{
+          cursor,
+          transform: isTransformActive
+            ? `translate(${panOffset.x}px, ${panOffset.y}px) scale(${zoomLevel})`
+            : undefined,
+        }}
         className={`max-h-full max-w-full object-contain shadow-card ring-1 ring-rule transition-opacity duration-150 motion-reduce:transition-none ${
-          viewMode === 'split'
-            ? 'cursor-ew-resize select-none touch-none'
-            : zoomLevel > 1
-              ? `${isPanning ? 'cursor-grabbing' : 'cursor-grab'} select-none touch-none`
-              : ''
-        }`}
+          interactive ? 'select-none touch-none' : ''
+        } ${isProcessing && pipeline ? 'opacity-90' : ''}`}
       />
       {zoomLevel > 1 && onPanOffsetChange && (
         <div
@@ -1050,13 +804,31 @@ export const StudioCanvas: React.FC<StudioCanvasProps> = ({
   );
 };
 
+function denormalize(crop: NormalizedCrop, srcW: number, srcH: number) {
+  return {
+    x: Math.round(crop.x * srcW),
+    y: Math.round(crop.y * srcH),
+    width: Math.round(crop.width * srcW),
+    height: Math.round(crop.height * srcH),
+  };
+}
 
-function isHexColorDark(hex: string): boolean {
-  const clean = hex.replace('#', '');
-  if (clean.length !== 6) return false;
-  const r = parseInt(clean.slice(0, 2), 16);
-  const g = parseInt(clean.slice(2, 4), 16);
-  const b = parseInt(clean.slice(4, 6), 16);
-  const luma = 0.299 * r + 0.587 * g + 0.114 * b;
-  return luma < 128;
+/** Corner and edge handles for the crop box, sized to read at any source resolution. */
+function drawCropHandles(ctx: CanvasRenderingContext2D, crop: CropRect, srcW: number) {
+  const size = Math.max(10, Math.round(srcW * 0.014));
+  const half = size / 2;
+  const xs = [crop.x, crop.x + crop.width / 2, crop.x + crop.width];
+  const ys = [crop.y, crop.y + crop.height / 2, crop.y + crop.height];
+  ctx.save();
+  ctx.fillStyle = ATELIER_CANVAS_PAPER;
+  ctx.strokeStyle = ATELIER_CANVAS_ACCENT;
+  ctx.lineWidth = Math.max(1.5, Math.round(srcW * 0.0015));
+  for (const [i, x] of xs.entries()) {
+    for (const [j, y] of ys.entries()) {
+      if (i === 1 && j === 1) continue;
+      ctx.fillRect(x - half, y - half, size, size);
+      ctx.strokeRect(x - half, y - half, size, size);
+    }
+  }
+  ctx.restore();
 }
