@@ -34,6 +34,9 @@ self.addEventListener('activate', (event) => {
 
 const FONT_HOSTS = ['fonts.googleapis.com', 'fonts.gstatic.com', 'api.fontshare.com', 'cdn.fontshare.com'];
 
+/** The shell precached with this build; other caches on the origin never supply it. */
+const shell = () => caches.match('./index.html', { cacheName: CACHE });
+
 /** Writes a copy in the background; a failed optional write never affects the live response. */
 function cacheInBackground(event, key, res) {
   const copy = res.clone();
@@ -59,9 +62,9 @@ self.addEventListener('fetch', (event) => {
           // worker's cache does not hold. The shell stays the one precached with this build.
           if (res.ok) return res;
           // A 5xx or 404 page must not replace the shell; serve the cached one when we have it
-          return caches.match('./index.html').then((hit) => hit || res);
+          return shell().then((hit) => hit || res);
         })
-        .catch(() => caches.match('./index.html'))
+        .catch(() => shell())
     );
     return;
   }

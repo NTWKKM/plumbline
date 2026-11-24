@@ -345,6 +345,8 @@ export default function App() {
   };
   const handleExportJpeg = () => void exporter.exportOne(canvasPhoto, config);
   const handleBatchExport = () => {
+    // A removal in flight would leave its photo in this snapshot of the queue
+    if (removingRef.current) return;
     const prepared = new Map(photos.map((p) => [p.id, withEdit(p)]));
     void exporter.exportAll(
       photos.map((p) => prepared.get(p.id)!.photo),
