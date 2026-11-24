@@ -1524,11 +1524,28 @@ impl WhiteBorderMacApp {
     }
 }
 
+/// Window icon, decoded from the same artwork as the bundle's AppIcon.icns.
+fn app_icon() -> Option<egui::IconData> {
+    let rgba = image::load_from_memory(include_bytes!("../assets/icon-512.png"))
+        .ok()?
+        .into_rgba8();
+    let (width, height) = rgba.dimensions();
+    Some(egui::IconData {
+        rgba: rgba.into_raw(),
+        width,
+        height,
+    })
+}
+
 fn main() -> eframe::Result<()> {
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title("Plumb_Line — macOS")
+        .with_inner_size([1280.0, 820.0]);
+    if let Some(icon) = app_icon() {
+        viewport = viewport.with_icon(icon);
+    }
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("Plumb_Line — macOS")
-            .with_inner_size([1280.0, 820.0]),
+        viewport,
         ..Default::default()
     };
     eframe::run_native(
