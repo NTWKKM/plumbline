@@ -28,6 +28,8 @@ export interface StoredSession extends EditSession {
   presets: Preset[];
   viewMode?: string;
   showHorizonGrid?: boolean;
+  gridStyle?: string;
+  gridOrientation?: number;
 }
 
 let dbPromise: Promise<IDBDatabase | null> | null = null;
@@ -130,5 +132,8 @@ export function parseStoredSession(raw: unknown): StoredSession | null {
     presets: sanitizePresets(o.presets),
     viewMode: typeof o.viewMode === 'string' ? o.viewMode : undefined,
     showHorizonGrid: typeof o.showHorizonGrid === 'boolean' ? o.showHorizonGrid : undefined,
+    gridStyle: typeof o.gridStyle === 'string' ? o.gridStyle : undefined,
+    gridOrientation:
+      typeof o.gridOrientation === 'number' && Number.isInteger(o.gridOrientation) ? o.gridOrientation : undefined,
   };
 }

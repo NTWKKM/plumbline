@@ -15,7 +15,9 @@ const SHORTCUT_GROUPS: { title: string; rows: { keys: string[]; label: string }[
     rows: [
       { keys: ['B'], label: 'Toggle before and after split' },
       { keys: ['\\'], label: 'Hold to peek at the original' },
-      { keys: ['G'], label: 'Toggle horizon grid' },
+      { keys: ['G'], label: 'Toggle composition guide' },
+      { keys: ['O'], label: 'Next guide: thirds, phi, golden spiral…' },
+      { keys: ['⇧', 'O'], label: 'Rotate the golden spiral or triangles' },
       { keys: ['+', '−'], label: 'Zoom in and out' },
       { keys: ['0'], label: 'Fit to view' },
     ],

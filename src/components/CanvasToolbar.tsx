@@ -1,6 +1,7 @@
 import React from 'react';
-import { Grid, ZoomIn, ZoomOut } from 'lucide-react';
+import { Grid, RotateCw, ZoomIn, ZoomOut } from 'lucide-react';
 import { CanvasViewMode } from './StudioCanvas';
+import { GUIDE_OPTIONS, GuideStyle, guideOrientations } from '../utils/compositionGuides';
 
 const VIEW_MODE_OPTIONS: { value: CanvasViewMode; label: string; short: string }[] = [
   { value: 'framed', label: 'Framed', short: 'Framed' },
@@ -18,6 +19,9 @@ interface CanvasToolbarProps {
   onZoomChange: (zoom: number) => void;
   showHorizonGrid: boolean;
   onToggleGrid: () => void;
+  gridStyle: GuideStyle;
+  onGridStyleChange: (style: GuideStyle) => void;
+  onRotateGrid: () => void;
 }
 
 export const CanvasToolbar: React.FC<CanvasToolbarProps> = ({
@@ -29,6 +33,9 @@ export const CanvasToolbar: React.FC<CanvasToolbarProps> = ({
   onZoomChange,
   showHorizonGrid,
   onToggleGrid,
+  gridStyle,
+  onGridStyleChange,
+  onRotateGrid,
 }) => (
   <div className="flex items-center justify-between gap-2 border-b border-rule bg-paper px-3 sm:px-4 py-2 min-w-0">
     <div
@@ -112,19 +119,48 @@ export const CanvasToolbar: React.FC<CanvasToolbarProps> = ({
         </button>
       </div>
 
-      <button
-        type="button"
-        aria-pressed={showHorizonGrid}
-        aria-label="Horizon grid"
-        title="Horizon grid (G)"
-        onClick={onToggleGrid}
-        className={`flex min-h-[32px] items-center gap-1.5 rounded-pill border px-2.5 py-1 text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${
-          showHorizonGrid ? 'border-accent bg-accent text-accent-ink' : 'border-rule bg-paper-2 text-ink hover:border-ink-2'
-        }`}
-      >
-        <Grid className="h-3.5 w-3.5" aria-hidden="true" />
-        <span className="hidden xl:inline">Grid</span>
-      </button>
+      <div className="flex items-center rounded-pill border border-rule bg-paper-2 p-0.5 shrink-0" role="group" aria-label="Composition guide">
+        <button
+          type="button"
+          aria-pressed={showHorizonGrid}
+          aria-label="Composition guide"
+          title="Composition guide (G) · next guide (O)"
+          onClick={onToggleGrid}
+          className={`flex min-h-[28px] items-center gap-1.5 rounded-pill px-2.5 py-1 text-xs font-medium transition-colors whitespace-nowrap ${
+            showHorizonGrid ? 'bg-accent text-accent-ink' : 'text-ink hover:text-accent'
+          }`}
+        >
+          <Grid className="h-3.5 w-3.5" aria-hidden="true" />
+          <span className="hidden xl:inline">Grid</span>
+        </button>
+        {showHorizonGrid && (
+          <>
+            <select
+              aria-label="Guide type"
+              value={gridStyle}
+              onChange={(e) => onGridStyleChange(e.target.value as GuideStyle)}
+              className="min-h-[28px] max-w-[9.5rem] cursor-pointer rounded-pill bg-transparent pl-2 pr-1 text-xs text-ink outline-none hover:text-accent focus-visible:ring-2 focus-visible:ring-accent"
+            >
+              {GUIDE_OPTIONS.map((opt) => (
+                <option key={opt.value} value={opt.value}>
+                  {opt.label}
+                </option>
+              ))}
+            </select>
+            {guideOrientations(gridStyle) > 1 && (
+              <button
+                type="button"
+                aria-label="Rotate guide"
+                title="Rotate guide (Shift+O)"
+                onClick={onRotateGrid}
+                className="icon-btn"
+              >
+                <RotateCw className="h-3.5 w-3.5" aria-hidden="true" />
+              </button>
+            )}
+          </>
+        )}
+      </div>
     </div>
   </div>
 );
