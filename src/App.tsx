@@ -39,6 +39,7 @@ import {
   toPipelineConfig,
   transferable,
 } from './utils/edits';
+import { GuideStyle, guideOrientations, isGuideStyle, nextGuideStyle } from './utils/compositionGuides';
 import { StoredSession } from './utils/persist';
 import { INITIAL_SAMPLE_PHOTOS, StudioPhotoItem } from './utils/samplePhotos';
 
@@ -87,6 +88,17 @@ export default function App() {
   // ---- View state ----
   const [viewMode, setViewMode] = useState<CanvasViewMode>('framed');
   const [showHorizonGrid, setShowHorizonGrid] = useState(false);
+  const [gridStyle, setGridStyle] = useState<GuideStyle>('thirds');
+  const [gridOrientation, setGridOrientation] = useState(0);
+  const chooseGridStyle = (style: GuideStyle) => {
+    setGridStyle(style);
+    setGridOrientation(0);
+    setShowHorizonGrid(true);
+  };
+  const rotateGrid = () => {
+    setGridOrientation((o) => (o + 1) % guideOrientations(gridStyle));
+    setShowHorizonGrid(true);
+  };
   const [isPeekingOriginal, setIsPeekingOriginal] = useState(false);
   const [straightenActive, setStraightenActive] = useState(false);
   const [isShortcutsOpen, setIsShortcutsOpen] = useState(false);
@@ -142,8 +154,10 @@ export default function App() {
       presets,
       viewMode,
       showHorizonGrid,
+      gridStyle,
+      gridOrientation,
     };
-  }, [session, photos, activePhoto.id, presets, viewMode, showHorizonGrid]);
+  }, [session, photos, activePhoto.id, presets, viewMode, showHorizonGrid, gridStyle, gridOrientation]);
 
   const { hydrated, saveFailed } = usePersistence(snapshot, ({ imported, session: saved, legacy, readFailed }) => {
     if (readFailed) {
@@ -169,6 +183,10 @@ export default function App() {
         setViewMode(restored.viewMode as CanvasViewMode);
       }
       if (typeof restored.showHorizonGrid === 'boolean') setShowHorizonGrid(restored.showHorizonGrid);
+      if (saved && isGuideStyle(saved.gridStyle)) {
+        setGridStyle(saved.gridStyle);
+        setGridOrientation(saved.gridOrientation ?? 0);
+      }
       setPresets(restored.presets ?? []);
     }
   });
@@ -312,6 +330,9 @@ export default function App() {
       redo: history.redo,
       showShortcuts: () => setIsShortcutsOpen(true),
       toggleGrid: () => setShowHorizonGrid((v) => !v),
+      // The first press only reveals the current guide; later presses step through them
+      cycleGrid: () => (showHorizonGrid ? chooseGridStyle(nextGuideStyle(gridStyle)) : setShowHorizonGrid(true)),
+      rotateGrid,
       toggleSplit: () => setViewMode((v) => (v === 'split' ? 'framed' : 'split')),
       reset: resetPhoto,
       zoomBy: (d) => handleZoomChange(zoomLevel + d),
@@ -496,6 +517,9 @@ export default function App() {
             onZoomChange={handleZoomChange}
             showHorizonGrid={showHorizonGrid}
             onToggleGrid={() => setShowHorizonGrid((v) => !v)}
+            gridStyle={gridStyle}
+            onGridStyleChange={chooseGridStyle}
+            onRotateGrid={rotateGrid}
           />
 
           <div className="relative flex-1 min-h-0 flex items-center justify-center overflow-hidden p-2 sm:p-4">
@@ -512,6 +536,8 @@ export default function App() {
               splitPercent={splitPercent}
               onSplitPercentChange={setSplitPercent}
               showHorizonGrid={showHorizonGrid}
+              gridStyle={gridStyle}
+              gridOrientation={gridOrientation}
               onAnalysisUpdate={handleTelemetry}
               onImageLoaded={setIsImageLoaded}
               zoomLevel={zoomLevel}

@@ -5,6 +5,8 @@ export interface ShortcutHandlers {
   redo: () => void;
   showShortcuts: () => void;
   toggleGrid: () => void;
+  cycleGrid: () => void;
+  rotateGrid: () => void;
   toggleSplit: () => void;
   reset: () => void;
   zoomBy: (delta: number) => void;
@@ -76,6 +78,7 @@ export function useKeyboardShortcuts(handlers: ShortcutHandlers, enabled: boolea
       const actions: Record<string, () => void> = {
         '?': h.showShortcuts,
         g: h.toggleGrid,
+        o: e.shiftKey ? h.rotateGrid : h.cycleGrid,
         b: h.toggleSplit,
         ' ': h.toggleSplit,
         r: h.reset,

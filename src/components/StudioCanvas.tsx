@@ -26,6 +26,7 @@ import {
   normalizeCrop,
   rotationToStraighten,
 } from '../utils/canvasTools';
+import { GuidePath, GuideStyle, buildCompositionGuides } from '../utils/compositionGuides';
 import { NormalizedCrop } from '../utils/edits';
 import { createLatestRunner } from '../utils/pool';
 import { StudioPhotoItem } from '../utils/samplePhotos';
@@ -47,6 +48,9 @@ interface StudioCanvasProps {
   splitPercent: number;
   onSplitPercentChange: (pct: number) => void;
   showHorizonGrid: boolean;
+  /** Which composition guide the grid toggle shows, and which of its placements. */
+  gridStyle?: GuideStyle;
+  gridOrientation?: number;
   onAnalysisUpdate: (telemetry: PipelineTelemetryUpdate) => void;
   onImageLoaded?: (loaded: boolean) => void;
   zoomLevel?: number;
@@ -92,6 +96,8 @@ export const StudioCanvas: React.FC<StudioCanvasProps> = ({
   splitPercent,
   onSplitPercentChange,
   showHorizonGrid,
+  gridStyle = 'thirds',
+  gridOrientation = 0,
   onAnalysisUpdate,
   onImageLoaded,
   zoomLevel = 1,
@@ -431,35 +437,16 @@ export const StudioCanvas: React.FC<StudioCanvasProps> = ({
       ctx.drawImage(processedFrameCanvas, 0, 0);
     }
 
-    // Optional alignment grid overlay
+    // Optional composition guide, laid over the picture itself: the crop box while cropping,
+    // the photo inside the mat when framed, the whole sensor frame for the original
     if (showHorizonGrid) {
-      const w = canvas.width;
-      const h = canvas.height;
-      ctx.save();
-      ctx.strokeStyle = 'rgba(59, 88, 120, 0.65)';
-      ctx.lineWidth = Math.max(1, Math.round(w * 0.0012));
-
-      // Center horizontal & vertical reference lines
-      ctx.beginPath();
-      ctx.moveTo(0, h / 2);
-      ctx.lineTo(w, h / 2);
-      ctx.moveTo(w / 2, 0);
-      ctx.lineTo(w / 2, h);
-      ctx.stroke();
-
-      // Rule of thirds
-      ctx.strokeStyle = 'rgba(43, 35, 29, 0.22)';
-      ctx.beginPath();
-      ctx.moveTo(0, h / 3);
-      ctx.lineTo(w, h / 3);
-      ctx.moveTo(0, (2 * h) / 3);
-      ctx.lineTo(w, (2 * h) / 3);
-      ctx.moveTo(w / 3, 0);
-      ctx.lineTo(w / 3, h);
-      ctx.moveTo((2 * w) / 3, 0);
-      ctx.lineTo((2 * w) / 3, h);
-      ctx.stroke();
-      ctx.restore();
+      const target =
+        viewMode === 'original'
+          ? { x: 0, y: 0, width: canvas.width, height: canvas.height }
+          : viewMode === 'geometry'
+            ? crop
+            : { x: layout.imageX, y: layout.imageY, width: layout.imageWidth, height: layout.imageHeight };
+      drawCompositionGuide(ctx, buildCompositionGuides(gridStyle, gridOrientation, target.width, target.height), target, canvas.width);
     }
 
 
@@ -485,6 +472,8 @@ export const StudioCanvas: React.FC<StudioCanvasProps> = ({
     effectiveView,
     splitPercent,
     showHorizonGrid,
+    gridStyle,
+    gridOrientation,
     draftCrop,
     draftLine,
     straightenActive,
@@ -857,6 +846,47 @@ function drawCropHandles(ctx: CanvasRenderingContext2D, crop: CropRect, srcW: nu
       ctx.fillRect(x - half, y - half, size, size);
       ctx.strokeRect(x - half, y - half, size, size);
     }
+  }
+  ctx.restore();
+}
+
+/**
+ * Strokes a composition guide over `rect`. Each path gets a light halo under a dark core,
+ * so the lines read over both bright skies and deep shadows.
+ */
+function drawCompositionGuide(
+  ctx: CanvasRenderingContext2D,
+  paths: GuidePath[],
+  rect: { x: number; y: number; width: number; height: number },
+  canvasWidth: number
+) {
+  const base = Math.max(1, Math.round(canvasWidth * 0.0012));
+  const trace = (emphasis: GuidePath['emphasis']) => {
+    ctx.beginPath();
+    for (const p of paths) {
+      if (p.emphasis !== emphasis) continue;
+      p.points.forEach(([nx, ny], i) => {
+        const x = rect.x + nx * rect.width;
+        const y = rect.y + ny * rect.height;
+        if (i === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      });
+    }
+  };
+  ctx.save();
+  ctx.lineJoin = 'round';
+  ctx.lineCap = 'round';
+  for (const [emphasis, halo, core, width] of [
+    ['minor', 'rgba(244, 240, 232, 0.28)', 'rgba(43, 35, 29, 0.38)', base],
+    ['major', 'rgba(244, 240, 232, 0.55)', 'rgba(59, 88, 120, 0.9)', base * 1.5],
+  ] as const) {
+    trace(emphasis);
+    ctx.strokeStyle = halo;
+    ctx.lineWidth = width * 2.5;
+    ctx.stroke();
+    ctx.strokeStyle = core;
+    ctx.lineWidth = width;
+    ctx.stroke();
   }
   ctx.restore();
 }
