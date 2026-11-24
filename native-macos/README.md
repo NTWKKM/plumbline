@@ -32,7 +32,19 @@ cd native-macos
 This compiles an optimized release binary, packages it into `native-macos/dist/Plumb_Line.app` (git-ignored), performs ad-hoc codesigning, and installs it into `~/Applications/Plumb_Line.app` (launchable via Spotlight or Finder).
 
 - The bundle version (`CFBundleShortVersionString` / `CFBundleVersion`) is read from `Cargo.toml`.
+- The app icon is `assets/AppIcon.icns` (`CFBundleIconFile`). The same artwork is the window icon (`assets/icon-512.png`), so `cargo run` shows it too.
 - The packaged binary path comes from Cargo's `compiler-artifact` JSON output, so a custom `CARGO_TARGET_DIR` or `build.target-dir` is honoured.
 - `~/Applications` is created if missing; any existing `~/Applications/Plumb_Line.app` is replaced on each run.
 - The ad-hoc signature is local-only: it is not notarized and is not intended for distribution to other Macs.
+
+### App icon
+
+`assets/icon.svg` is the source artwork, drawn with the web app's Atelier palette. After editing it, regenerate the committed outputs (`AppIcon.icns`, `icon-512.png`), then run `./bundle.sh`:
+
+```bash
+cd native-macos
+./make-icon.sh
+```
+
+`make-icon.sh` needs macOS (QuickLook, `iconutil`) and ImageMagick (`brew install imagemagick`).
 

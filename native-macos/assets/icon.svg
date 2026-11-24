@@ -1,0 +1,55 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <!-- Plumb_Line app icon: a leveled print over its tilted original, hung true by a plumb line.
+       Colours are the web app's Atelier tokens (src/tokens.css) converted to sRGB hex. -->
+  <defs>
+    <linearGradient id="paper" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#F6F2EC"/>
+      <stop offset="1" stop-color="#E9E3DB"/>
+    </linearGradient>
+    <linearGradient id="sky" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#264D71"/>
+      <stop offset="1" stop-color="#4A7AA6"/>
+    </linearGradient>
+    <linearGradient id="ground" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#382E28"/>
+      <stop offset="1" stop-color="#1C110A"/>
+    </linearGradient>
+    <linearGradient id="bob" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#1F4060"/>
+      <stop offset="0.42" stop-color="#3D6E99"/>
+      <stop offset="1" stop-color="#1B3651"/>
+    </linearGradient>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="125%">
+      <feDropShadow dx="0" dy="12" stdDeviation="14" flood-color="#1C110A" flood-opacity="0.28"/>
+    </filter>
+    <filter id="print-shadow" x="-10%" y="-10%" width="120%" height="130%">
+      <feDropShadow dx="0" dy="10" stdDeviation="12" flood-color="#1C110A" flood-opacity="0.22"/>
+    </filter>
+  </defs>
+
+  <!-- macOS icon grid: 824 px body inset 100 px, continuous-corner approximation -->
+  <rect x="100" y="100" width="824" height="824" rx="186" fill="url(#paper)" filter="url(#shadow)"/>
+  <rect x="101.5" y="101.5" width="821" height="821" rx="184.5" fill="none" stroke="#FFFFFF" stroke-opacity="0.6" stroke-width="3"/>
+
+  <!-- The tilted original, in pencil -->
+  <rect x="279" y="383" width="466" height="350" fill="none" stroke="#6D6863" stroke-width="10"
+        stroke-dasharray="30 20" stroke-linecap="round" opacity="0.55" transform="rotate(-9 512 558)"/>
+
+  <!-- The leveled print with its white border -->
+  <rect x="279" y="383" width="466" height="350" fill="#F9F7F2" stroke="#C6C0B9" stroke-width="3" filter="url(#print-shadow)"/>
+  <rect x="309" y="413" width="406" height="174" fill="url(#sky)"/>
+  <rect x="309" y="587" width="406" height="116" fill="url(#ground)"/>
+  <circle cx="626" cy="500" r="30" fill="#F9F7F2" opacity="0.9"/>
+  <line x1="309" y1="587" x2="715" y2="587" stroke="#F9F7F2" stroke-width="4"/>
+
+  <!-- Plumb line: the print hangs true between the pin and the bob -->
+  <line x1="512" y1="196" x2="512" y2="383" stroke="#1C110A" stroke-width="8" stroke-linecap="round"/>
+  <line x1="512" y1="733" x2="512" y2="778" stroke="#1C110A" stroke-width="8" stroke-linecap="round"/>
+  <circle cx="512" cy="196" r="20" fill="#1C110A"/>
+  <circle cx="506" cy="190" r="6" fill="#F9F7F2" opacity="0.55"/>
+
+  <!-- Plumb bob -->
+  <rect x="482" y="772" width="60" height="22" rx="6" fill="#1C110A"/>
+  <path d="M462 794 H562 Q560 836 512 900 Q464 836 462 794 Z" fill="url(#bob)"/>
+  <path d="M480 802 Q482 832 506 872" fill="none" stroke="#FFFFFF" stroke-opacity="0.35" stroke-width="6" stroke-linecap="round"/>
+</svg>

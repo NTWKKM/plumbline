@@ -51,6 +51,8 @@ rm -rf "${APP_DIR}"
 mkdir -p "${APP_DIR}/Contents/MacOS" "${APP_DIR}/Contents/Resources"
 cp "${BIN_PATH}" "${APP_DIR}/Contents/MacOS/${BIN_NAME}"
 chmod +x "${APP_DIR}/Contents/MacOS/${BIN_NAME}"
+# App icon, generated from assets/icon.svg by make-icon.sh
+cp "${SCRIPT_DIR}/assets/AppIcon.icns" "${APP_DIR}/Contents/Resources/AppIcon.icns"
 
 cat << EOF > "${APP_DIR}/Contents/Info.plist"
 <?xml version="1.0" encoding="UTF-8"?>
@@ -59,6 +61,8 @@ cat << EOF > "${APP_DIR}/Contents/Info.plist"
 <dict>
     <key>CFBundleExecutable</key>
     <string>${BIN_NAME}</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
     <key>CFBundleIdentifier</key>
     <string>com.plumbline.macos</string>
     <key>CFBundleName</key>
