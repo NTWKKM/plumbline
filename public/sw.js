@@ -24,7 +24,10 @@ self.addEventListener('activate', (event) => {
   event.waitUntil(
     caches
       .keys()
-      .then((keys) => Promise.all(keys.filter((k) => k !== CACHE).map((k) => caches.delete(k))))
+      // Only this app's older caches; anything else on the origin is left alone
+      .then((keys) =>
+        Promise.all(keys.filter((k) => k.startsWith('plumbline-') && k !== CACHE).map((k) => caches.delete(k)))
+      )
       .then(() => self.clients.claim())
   );
 });
@@ -52,10 +55,9 @@ self.addEventListener('fetch', (event) => {
     event.respondWith(
       fetch(req)
         .then((res) => {
-          if (res.ok) {
-            cacheInBackground(event, './index.html', res);
-            return res;
-          }
+          // Network HTML is never cached: a newer deploy's page would point at assets this
+          // worker's cache does not hold. The shell stays the one precached with this build.
+          if (res.ok) return res;
           // A 5xx or 404 page must not replace the shell; serve the cached one when we have it
           return caches.match('./index.html').then((hit) => hit || res);
         })

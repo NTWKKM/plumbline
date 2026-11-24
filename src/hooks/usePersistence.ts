@@ -6,6 +6,8 @@ import { INITIAL_SAMPLE_PHOTOS, StudioPhotoItem } from '../utils/samplePhotos';
 const LEGACY_CONFIG_KEY = 'plumbline.pipelineConfig.v1';
 const LEGACY_VIEW_KEY = 'plumbline.viewState.v1';
 const SAVE_DELAY_MS = 400;
+const RETRY_BASE_MS = 2000;
+const RETRY_MAX_MS = 30000;
 
 export interface RestoredStudio {
   /** Imported photos found in storage, with fresh object URLs. */
@@ -49,6 +51,11 @@ export interface PersistenceState {
   canSave: boolean;
 }
 
+export interface PersistenceStatus extends PersistenceState {
+  /** The last save did not commit; it is being retried with the latest snapshot. */
+  saveFailed: boolean;
+}
+
 /**
  * Restores the studio once on mount, then saves the session shortly after each change.
  * Nothing is saved before the restore finishes, so a slow disk never overwrites saved work,
@@ -59,8 +66,10 @@ export function usePersistence(
   onRestore: (
     restored: RestoredStudio & { legacy: Partial<StoredSession> | null; readFailed: boolean }
   ) => void
-): PersistenceState {
+): PersistenceStatus {
   const [state, setState] = useState<PersistenceState>({ hydrated: false, canSave: false });
+  // Consecutive failed saves; each one re-runs the save effect after a growing delay
+  const [failures, setFailures] = useState(0);
   const onRestoreRef = useRef(onRestore);
   onRestoreRef.current = onRestore;
 
@@ -95,10 +104,18 @@ export function usePersistence(
 
   useEffect(() => {
     if (!state.canSave) return;
+    let superseded = false;
+    const delay = failures === 0 ? SAVE_DELAY_MS : Math.min(RETRY_MAX_MS, RETRY_BASE_MS * 2 ** (failures - 1));
     const timer = setTimeout(() => {
       void saveSession(snapshot).then((committed) => {
-        // Keep the legacy keys until a write lands, so a failed save can still migrate later
-        if (!committed) return;
+        // A newer snapshot is already queued; its own save reports the outcome
+        if (superseded) return;
+        if (!committed) {
+          // Retried even if nothing else changes; the legacy keys stay until a save lands
+          setFailures((n) => n + 1);
+          return;
+        }
+        setFailures(0);
         try {
           localStorage.removeItem(LEGACY_CONFIG_KEY);
           localStorage.removeItem(LEGACY_VIEW_KEY);
@@ -106,9 +123,12 @@ export function usePersistence(
           // Storage may be unavailable; the legacy keys are harmless
         }
       });
-    }, SAVE_DELAY_MS);
-    return () => clearTimeout(timer);
-  }, [state.canSave, snapshot]);
+    }, delay);
+    return () => {
+      superseded = true;
+      clearTimeout(timer);
+    };
+  }, [state.canSave, snapshot, failures]);
 
-  return state;
+  return { ...state, saveFailed: failures > 0 };
 }

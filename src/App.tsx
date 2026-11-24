@@ -42,6 +42,9 @@ import {
 import { StoredSession } from './utils/persist';
 import { INITIAL_SAMPLE_PHOTOS, StudioPhotoItem } from './utils/samplePhotos';
 
+const SAVE_FAILED_NOTICE =
+  "Couldn't save your latest changes on this device. Retrying in the background; keep this tab open.";
+
 const VIEW_MODES: CanvasViewMode[] = ['framed', 'split', 'geometry', 'original'];
 
 /** Sample photos start tilted so the leveller has something to do. */
@@ -102,6 +105,8 @@ export default function App() {
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const dragDepthRef = useRef(0);
+  // Set synchronously before the first await, so a second click cannot start a parallel removal
+  const removingRef = useRef(false);
 
   // ---- Derived edit for the active photo ----
   // Memoised on the stored entry: an unedited photo's fallback edit must keep one identity,
@@ -140,7 +145,7 @@ export default function App() {
     };
   }, [session, photos, activePhoto.id, presets, viewMode, showHorizonGrid]);
 
-  const { hydrated } = usePersistence(snapshot, ({ imported, session: saved, legacy, readFailed }) => {
+  const { hydrated, saveFailed } = usePersistence(snapshot, ({ imported, session: saved, legacy, readFailed }) => {
     if (readFailed) {
       setErrorNotice(
         "Couldn't read your saved work from this device. Changes in this visit won't be saved, so nothing stored is overwritten; reload to try again."
@@ -167,6 +172,12 @@ export default function App() {
       setPresets(restored.presets ?? []);
     }
   });
+
+  // A failed save is retried by usePersistence; the notice clears itself once a retry lands
+  useEffect(() => {
+    if (saveFailed) setErrorNotice(SAVE_FAILED_NOTICE);
+    else setErrorNotice((prev) => (prev === SAVE_FAILED_NOTICE ? null : prev));
+  }, [saveFailed]);
 
   const telemetry = telemetryEntry?.photoId === activePhoto.id ? telemetryEntry.data : null;
   const shownTelemetry = telemetry ?? INITIAL_TELEMETRY;
@@ -341,8 +352,14 @@ export default function App() {
     );
   };
   const handleRemovePhoto = async (id: string) => {
-    if (exporter.isBatchExporting) return;
-    if (await queue.removePhoto(id)) exporter.forget(id);
+    if (exporter.isBatchExporting || removingRef.current) return;
+    removingRef.current = true;
+    try {
+      // A failed delete keeps the photo, so its export status is kept too
+      if (await queue.removePhoto(id)) exporter.forget(id);
+    } finally {
+      removingRef.current = false;
+    }
   };
 
   // ---- Drag and drop ----
