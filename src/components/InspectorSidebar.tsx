@@ -40,6 +40,7 @@ interface InspectorSidebarProps {
   isBatchExporting?: boolean;
   queueCount?: number;
   isImageLoaded?: boolean;
+  canSaveToFolder?: boolean;
   className?: string;
 }
 
@@ -72,6 +73,7 @@ export const InspectorSidebar: React.FC<InspectorSidebarProps> = ({
   isBatchExporting = false,
   queueCount = 1,
   isImageLoaded = true,
+  canSaveToFolder = false,
   className = '',
 }) => {
   const totalRotationDeg = Number(
@@ -112,7 +114,7 @@ export const InspectorSidebar: React.FC<InspectorSidebarProps> = ({
       <section className="border-b border-rule px-4 py-3.5">
         <div className="flex items-baseline justify-between gap-2">
           <h2 className="font-display text-sm font-normal text-ink">
-            Luminance Histogram
+            Luminance histogram
           </h2>
           {autoCorrect && (
             <span className="font-mono text-xs text-muted tabular-nums">
@@ -165,7 +167,7 @@ export const InspectorSidebar: React.FC<InspectorSidebarProps> = ({
           <div className="flex items-center gap-2 min-w-0">
             <Compass className="h-4 w-4 text-accent shrink-0" aria-hidden="true" />
             <h2 className="font-display text-sm font-normal text-ink truncate">
-              Auto-Level, Crop & Correct
+              Auto-level, crop and correct
             </h2>
           </div>
           <button
@@ -181,7 +183,7 @@ export const InspectorSidebar: React.FC<InspectorSidebarProps> = ({
         {/* Live Telemetry Readout (Ruled table style, tabular-nums) */}
         <div className="mt-2.5 grid grid-cols-3 divide-x divide-rule border-y border-rule py-2 text-xs">
           <div className="min-w-0 pr-2">
-            <div className="text-muted truncate">Detected Tilt</div>
+            <div className="text-muted truncate">Detected tilt</div>
             <div className="mt-0.5 font-mono font-medium text-ink tabular-nums truncate" data-testid="detected-tilt-val">
               {formatSignedDegrees(analysis.detectedTiltDeg, 2)}
             </div>
@@ -209,7 +211,7 @@ export const InspectorSidebar: React.FC<InspectorSidebarProps> = ({
             {/* Scharr + Sub-Pixel Radon + IRLS Auto-Level Toggle */}
             <div className="flex items-center justify-between gap-2">
               <label htmlFor="toggle-auto-level" className="text-xs font-medium text-ink cursor-pointer truncate">
-                Scharr Sub-Pixel Horizon Auto-Level
+                Auto-level the horizon
               </label>
               <input
                 id="toggle-auto-level"
@@ -227,7 +229,7 @@ export const InspectorSidebar: React.FC<InspectorSidebarProps> = ({
             <div>
               <div className="flex items-center justify-between text-xs">
                 <label htmlFor="slider-sensor-tilt" className="text-muted">
-                  Test Camera Sensor Tilt
+                  Test sensor tilt
                 </label>
                 <span className="font-mono text-ink tabular-nums">
                   {formatSignedDegrees(simulatedTiltDeg, 1)}
@@ -249,7 +251,7 @@ export const InspectorSidebar: React.FC<InspectorSidebarProps> = ({
             <div>
               <div className="flex items-center justify-between text-xs">
                 <label htmlFor="slider-manual-angle" className="text-muted">
-                  Manual Fine-Tune Angle
+                  Fine-tune angle
                 </label>
                 <span className="font-mono text-ink tabular-nums">
                   {formatSignedDegrees(config.manualAngleOffsetDeg, 2)}
@@ -284,11 +286,11 @@ export const InspectorSidebar: React.FC<InspectorSidebarProps> = ({
               </div>
             </div>
 
-            {/* 2D Projective Keystone Warp */}
+            {/* Keystone correction */}
             <div className="pt-2.5 border-t border-rule">
               <div className="flex items-center justify-between gap-2">
                 <label htmlFor="toggle-keystone-warp" className="text-xs font-medium text-ink cursor-pointer truncate">
-                  2D Projective Keystone Warp
+                  Keystone correction
                 </label>
                 <input
                   id="toggle-keystone-warp"
@@ -308,7 +310,7 @@ export const InspectorSidebar: React.FC<InspectorSidebarProps> = ({
               <div className="mt-2">
                 <div className="flex items-center justify-between gap-2 text-xs">
                   <label htmlFor="slider-manual-keystone" className="text-muted">
-                    Keystone Vertical
+                    Vertical keystone
                   </label>
                   <div className="flex items-center gap-2 shrink-0">
                     {manualKeystoneDeg !== 0 && (
@@ -353,7 +355,7 @@ export const InspectorSidebar: React.FC<InspectorSidebarProps> = ({
               <div className="flex items-center justify-between gap-2">
                 <label htmlFor="toggle-auto-crop" className="flex items-center gap-1.5 text-xs font-medium text-ink cursor-pointer min-w-0">
                   <Crop className="h-3.5 w-3.5 text-accent shrink-0" aria-hidden="true" />
-                  <span className="truncate">Auto-Crop Largest Inscribed Rect</span>
+                  <span className="truncate">Auto-crop the largest clean rectangle</span>
                 </label>
                 <input
                   id="toggle-auto-crop"
@@ -370,7 +372,7 @@ export const InspectorSidebar: React.FC<InspectorSidebarProps> = ({
               {config.autoCropEnabled && (
                 <div className="mt-2 flex items-center justify-between gap-2">
                   <label htmlFor="toggle-preserve-crop-aspect" className="text-xs text-muted cursor-pointer truncate">
-                    Preserve Source Aspect Ratio
+                    Keep source aspect ratio
                   </label>
                   <input
                     id="toggle-preserve-crop-aspect"
@@ -389,7 +391,7 @@ export const InspectorSidebar: React.FC<InspectorSidebarProps> = ({
               )}
 
               <div className="mt-2 flex items-center justify-between gap-2 text-xs text-muted">
-                <span className="shrink-0">Inscribed Bounds</span>
+                <span className="shrink-0">Crop size</span>
                 <span className="font-mono text-ink tabular-nums truncate text-right" data-testid="crop-dimensions-val">
                   {cropRect.width} × {cropRect.height} px ({cropRect.areaRetainedPercent}% area)
                 </span>
@@ -401,7 +403,7 @@ export const InspectorSidebar: React.FC<InspectorSidebarProps> = ({
               <div className="flex items-center justify-between gap-2">
                 <label htmlFor="toggle-auto-correct" className="flex items-center gap-1.5 text-xs font-medium text-ink cursor-pointer min-w-0">
                   <Sparkles className="h-3.5 w-3.5 text-accent shrink-0" aria-hidden="true" />
-                  <span className="truncate">Auto-Correct Tone & White Balance</span>
+                  <span className="truncate">Auto-correct tone and white balance</span>
                 </label>
                 <input
                   id="toggle-auto-correct"
@@ -457,7 +459,7 @@ export const InspectorSidebar: React.FC<InspectorSidebarProps> = ({
                   <div>
                     <div className="flex items-center justify-between text-xs">
                       <label htmlFor="slider-auto-correct-strength" className="text-muted">
-                        Correction Intensity
+                        Strength
                       </label>
                       <span className="font-mono text-ink tabular-nums" data-testid="auto-correct-strength-val">
                         {autoCorrectStrength}%
@@ -510,7 +512,7 @@ export const InspectorSidebar: React.FC<InspectorSidebarProps> = ({
         <div className="flex items-center gap-2">
           <Frame className="h-4 w-4 text-accent shrink-0" aria-hidden="true" />
           <h2 className="font-display text-sm font-normal text-ink">
-            White Border & Framing
+            White border and frame
           </h2>
         </div>
 
@@ -522,7 +524,7 @@ export const InspectorSidebar: React.FC<InspectorSidebarProps> = ({
           <div className="pt-2 space-y-3">
             {/* Aspect Ratio Selector */}
             <div>
-              <div className="text-xs text-muted mb-1.5">Target Aspect Ratio</div>
+              <div className="text-xs text-muted mb-1.5">Aspect ratio</div>
               <div className="grid grid-cols-2 gap-1.5 sm:grid-cols-3" role="group" aria-label="Target Aspect Ratio">
                 {ASPECT_PRESETS.map((preset, index) => {
                   const active = config.aspectPreset === preset.value;
@@ -554,7 +556,7 @@ export const InspectorSidebar: React.FC<InspectorSidebarProps> = ({
             <div>
               <div className="flex items-center justify-between text-xs">
                 <label htmlFor="slider-border-padding" className="text-ink-2 font-medium">
-                  Border Thickness (Padding)
+                  Border width
                 </label>
                 <span className="font-mono text-ink tabular-nums" data-testid="padding-percent-val">
                   {config.paddingPercent}%
@@ -576,7 +578,7 @@ export const InspectorSidebar: React.FC<InspectorSidebarProps> = ({
                 className="mt-1.5 h-1.5 w-full cursor-pointer rounded-pill bg-paper-3 accent-accent"
               />
               <div className="mt-1.5 flex items-center justify-between gap-2 text-xs text-muted">
-                <span className="shrink-0">Output Frame Size</span>
+                <span className="shrink-0">Output size</span>
                 <span className="font-mono text-ink tabular-nums truncate text-right" data-testid="output-canvas-size">
                   {frameLayout.canvasWidth} × {frameLayout.canvasHeight} px
                 </span>
@@ -586,7 +588,7 @@ export const InspectorSidebar: React.FC<InspectorSidebarProps> = ({
             {/* Background / Border Color Picker */}
             <div>
               <div className="flex items-center justify-between text-xs mb-1.5">
-                <span className="text-ink-2 font-medium">Frame Background Color</span>
+                <span className="text-ink-2 font-medium">Border color</span>
                 <span className="font-mono text-muted tabular-nums">
                   {config.backgroundColor}
                 </span>
@@ -623,7 +625,7 @@ export const InspectorSidebar: React.FC<InspectorSidebarProps> = ({
                   <input
                     id="custom-bg-color"
                     type="color"
-                    aria-label="Custom Frame Background Color"
+                    aria-label="Custom Border color"
                     value={config.backgroundColor}
                     onChange={(e) =>
                       onChangeConfig((prev) => ({ ...prev, backgroundColor: e.target.value }))
@@ -643,14 +645,14 @@ export const InspectorSidebar: React.FC<InspectorSidebarProps> = ({
           <div className="flex items-center gap-2">
             <FileCheck className="h-4 w-4 text-accent shrink-0" aria-hidden="true" />
             <h2 className="font-display text-sm font-normal text-ink">
-              EXIF & Export
+              EXIF and export
             </h2>
           </div>
 
           <div className="mt-2.5 space-y-2.5">
             <div className="flex items-center justify-between gap-2">
               <label htmlFor="toggle-preserve-exif" className="text-xs font-medium text-ink cursor-pointer">
-                Preserve Original EXIF (APP1 Segment)
+                Keep original EXIF
               </label>
               <input
                 id="toggle-preserve-exif"
@@ -669,7 +671,7 @@ export const InspectorSidebar: React.FC<InspectorSidebarProps> = ({
 
             <div className="flex items-center justify-between gap-2">
               <label htmlFor="toggle-exif-caption" className="text-xs font-medium text-ink cursor-pointer">
-                Stamp EXIF Caption on Bottom Border
+                Print EXIF caption on the border
               </label>
               <input
                 id="toggle-exif-caption"
@@ -685,13 +687,39 @@ export const InspectorSidebar: React.FC<InspectorSidebarProps> = ({
                 className="h-4 w-4 rounded cursor-pointer shrink-0"
               />
             </div>
+
+            <div>
+              <div className="flex items-center justify-between text-xs">
+                <label htmlFor="slider-jpeg-quality" className="text-muted">
+                  JPEG quality
+                </label>
+                <span className="font-mono text-ink tabular-nums" data-testid="jpeg-quality-val">
+                  {config.jpegQuality}
+                </span>
+              </div>
+              <input
+                id="slider-jpeg-quality"
+                type="range"
+                min={70}
+                max={100}
+                step={1}
+                value={config.jpegQuality}
+                onChange={(e) =>
+                  onChangeConfig((prev) => ({
+                    ...prev,
+                    jpegQuality: parseInt(e.target.value, 10),
+                  }))
+                }
+                className="mt-1.5 h-1.5 w-full cursor-pointer rounded-pill bg-paper-3 accent-accent"
+              />
+            </div>
           </div>
 
           {/* Clean Ruled EXIF Metadata List */}
           <dl className="mt-3 divide-y divide-rule border-y border-rule text-xs">
             {(exif.cameraModel || exif.rawFormat) && (
               <div className="flex items-center justify-between gap-2 py-1.5">
-                <dt className="text-muted shrink-0">Camera & Format</dt>
+                <dt className="text-muted shrink-0">Camera and format</dt>
                 <dd className="text-ink font-medium truncate text-right max-w-[65%]">
                   {[exif.cameraModel, exif.rawFormat || 'JPEG'].filter(Boolean).join(', ')}
                 </dd>
@@ -726,7 +754,7 @@ export const InspectorSidebar: React.FC<InspectorSidebarProps> = ({
               </div>
             )}
             <div className="flex items-center justify-between gap-2 py-1.5">
-              <dt className="text-muted shrink-0">Source Sensor</dt>
+              <dt className="text-muted shrink-0">Source size</dt>
               <dd className="font-mono text-ink-2 tabular-nums truncate text-right">
                 {sourceSize.width} × {sourceSize.height} px
               </dd>
@@ -734,17 +762,26 @@ export const InspectorSidebar: React.FC<InspectorSidebarProps> = ({
           </dl>
         </div>
 
-        {/* Export Actions */}
-        <div className="pt-2.5 border-t border-rule space-y-2">
+      </section>
+
+      {/* Export actions stay pinned to the bottom of the inspector so the primary action is always in view */}
+      <div className="inspector-export">
+        <p className="mb-2 flex items-baseline justify-between gap-2 text-xs text-muted">
+          <span>Output</span>
+          <span className="font-mono tabular-nums text-ink-2" data-testid="export-summary">
+            {frameLayout.canvasWidth} × {frameLayout.canvasHeight} px, JPEG {config.jpegQuality}
+          </span>
+        </p>
+        <div className="flex gap-2">
           <button
             type="button"
             onClick={onExportJpeg}
             disabled={isExporting || isBatchExporting || !isImageLoaded}
             aria-busy={isExporting}
-            className="btn w-full min-h-[40px]"
+            className="btn flex-1 min-h-[40px]"
           >
             <Download className="h-4 w-4" aria-hidden="true" />
-            {isExporting ? 'Encoding JPEG & Injecting EXIF…' : 'Export Framed JPEG'}
+            {isExporting ? 'Encoding…' : 'Export JPEG'}
           </button>
 
           {onBatchExportAll && (
@@ -753,16 +790,23 @@ export const InspectorSidebar: React.FC<InspectorSidebarProps> = ({
               onClick={onBatchExportAll}
               disabled={isExporting || isBatchExporting || queueCount === 0}
               aria-busy={isBatchExporting}
-              className="btn btn--quiet w-full min-h-[36px]"
+              title={
+                canSaveToFolder
+                  ? 'Choose a folder and save every photo in the queue into it'
+                  : 'Download every photo in the queue'
+              }
+              className="btn btn--quiet min-h-[40px] shrink-0"
             >
               <Layers className="h-4 w-4" aria-hidden="true" />
               {isBatchExporting
-                ? 'Batch Exporting Queue…'
-                : `Batch Export Queue (${queueCount})`}
+                ? 'Exporting…'
+                : canSaveToFolder
+                  ? `All to folder (${queueCount})`
+                  : `Export all (${queueCount})`}
             </button>
           )}
         </div>
-      </section>
+      </div>
     </aside>
   );
 };
