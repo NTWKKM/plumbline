@@ -389,10 +389,13 @@ function collectTiffIfdJpegCandidates(
   if (header) {
     const { littleEndian } = header;
 
-    // Out-of-line metadata arrays cost one unit per value from the shared budget. Reads that
-    // cannot fit in the buffer are rejected before charging, so one bogus count cannot spend it.
+    // Out-of-line metadata arrays cost one unit per value from the shared budget. The resolved
+    // byte range is validated first (same rules as readUintArray), so entries that read nothing,
+    // such as an oversized count or an out-of-bounds offset, never spend it.
     const readBudgetedArray = (entryPos: number, type: 3 | 4, count: number): number[] => {
-      if (count * (type === 3 ? 2 : 4) > bytes.length) return [];
+      if (resolveUintArrayOffset(view, 0, entryPos, type, count, littleEndian, bytes.length) < 0) {
+        return [];
+      }
       if (count > budget.remaining) {
         budget.remaining = -1;
         return [];
@@ -1042,6 +1045,34 @@ function getTiffTypeSize(type: number): number {
 }
 
 /**
+ * Resolves where a SHORT/LONG array entry's values live (inline or out-of-line) and checks that
+ * the whole byte range fits in the segment. Returns the data offset, or -1 when it is invalid.
+ */
+function resolveUintArrayOffset(
+  view: DataView,
+  tiffStart: number,
+  entryPos: number,
+  type: number,
+  count: number,
+  littleEndian: boolean,
+  segmentLength: number
+): number {
+  if (count <= 0 || (type !== 3 && type !== 4)) return -1;
+  const totalBytes = count * (type === 3 ? 2 : 4);
+  let dataOffset: number;
+  if (totalBytes <= 4) {
+    dataOffset = entryPos + 8;
+  } else {
+    if (entryPos + 12 > segmentLength) return -1;
+    const valRel = view.getUint32(entryPos + 8, littleEndian);
+    if (valRel < 8) return -1;
+    dataOffset = tiffStart + valRel;
+  }
+  if (dataOffset < tiffStart + 8 || dataOffset + totalBytes > segmentLength) return -1;
+  return dataOffset;
+}
+
+/**
  * Reads an array of unsigned integer values (SHORT or LONG) from a TIFF directory entry.
  */
 function readUintArray(
@@ -1053,19 +1084,16 @@ function readUintArray(
   littleEndian: boolean,
   segmentLength: number
 ): number[] {
-  if (count <= 0 || (type !== 3 && type !== 4)) return [];
-  const typeSize = type === 3 ? 2 : 4;
-  const totalBytes = count * typeSize;
-  let dataOffset: number;
-  if (totalBytes <= 4) {
-    dataOffset = entryPos + 8;
-  } else {
-    if (entryPos + 12 > segmentLength) return [];
-    const valRel = view.getUint32(entryPos + 8, littleEndian);
-    if (valRel < 8) return [];
-    dataOffset = tiffStart + valRel;
-  }
-  if (dataOffset < tiffStart + 8 || dataOffset + totalBytes > segmentLength) return [];
+  const dataOffset = resolveUintArrayOffset(
+    view,
+    tiffStart,
+    entryPos,
+    type,
+    count,
+    littleEndian,
+    segmentLength
+  );
+  if (dataOffset < 0) return [];
   const results: number[] = [];
   for (let i = 0; i < count; i++) {
     const val = type === 3

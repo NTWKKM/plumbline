@@ -1787,6 +1787,48 @@ test('repeated out-of-line IFD arrays are charged per value and stop once the bu
   assert.equal(untouched.remaining, 100);
 });
 
+test('out-of-bounds array offsets cost no budget, and a later valid preview is still collected', () => {
+  const bad = 500;
+  const count = 64; // fits the buffer by size, but every offset points past its end
+  const preview = makeFrameJpeg(900);
+  const ifdSize = 2 + (bad + 2) * 12 + 4;
+  const previewStart = 8 + ifdSize;
+  const buf = new Uint8Array(previewStart + preview.length);
+  const v = new DataView(buf.buffer);
+  v.setUint16(0, 0x4949, false);
+  v.setUint16(2, 42, true);
+  v.setUint32(4, 8, true);
+  v.setUint16(8, bad + 2, true);
+  for (let i = 0; i < bad; i++) {
+    const e = 10 + i * 12;
+    v.setUint16(e, 0x0117, true);
+    v.setUint16(e + 2, 4, true); // LONG
+    v.setUint32(e + 4, count, true);
+    v.setUint32(e + 8, buf.length - 8, true);
+  }
+  const j = 10 + bad * 12;
+  v.setUint16(j, 0x0201, true);
+  v.setUint16(j + 2, 4, true);
+  v.setUint32(j + 4, 1, true);
+  v.setUint32(j + 8, previewStart, true);
+  v.setUint16(j + 12, 0x0202, true);
+  v.setUint16(j + 14, 4, true);
+  v.setUint32(j + 16, 1, true);
+  v.setUint32(j + 20, preview.length, true);
+  buf.set(preview, previewStart);
+
+  const walk = { remaining: 1_000_000 };
+  scanJpegStreamForTest(buf, previewStart, buf.length, walk);
+  const oneWalk = 1_000_000 - walk.remaining;
+
+  // Budget for the preview walk only: charging the bad entries would exhaust it first
+  const budget = { remaining: oneWalk + count - 1 };
+  const res = collectIndexedCandidatesForTest(buf, budget);
+  assert.equal(res.budgetExhausted, false);
+  assert.equal(res.candidateCount, 1);
+  assert.equal(budget.remaining, count - 1);
+});
+
 test('SubIFD offsets are enqueued once each and traversal stops at 64 directories', () => {
   const distinct = 100;
   const duplicates = 1000;
