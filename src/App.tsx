@@ -49,6 +49,14 @@ const CONFIG_STORAGE_KEY = 'plumbline.pipelineConfig.v1';
 const VIEW_STORAGE_KEY = 'plumbline.viewState.v1';
 const VALID_ASPECT_PRESETS: AspectRatioPreset[] = ['1:1', '4:5', '16:9', '3:2', 'original'];
 const VALID_VIEW_MODES: CanvasViewMode[] = ['framed', 'split', 'geometry', 'original'];
+type MobileTab = 'canvas' | 'adjust' | 'queue';
+
+const MOBILE_TABS: { value: MobileTab; label: string }[] = [
+  { value: 'canvas', label: 'Canvas' },
+  { value: 'adjust', label: 'Adjust' },
+  { value: 'queue', label: 'Queue' },
+];
+
 const VIEW_MODE_OPTIONS: { value: CanvasViewMode; label: string; short: string }[] = [
   { value: 'framed', label: 'Framed output', short: 'Framed' },
   { value: 'split', label: 'Before and after', short: 'Split' },
@@ -300,7 +308,7 @@ export default function App() {
   const [isShortcutsOpen, setIsShortcutsOpen] = useState<boolean>(false);
   // 'exported' = written and closed in a chosen folder; 'requested' = a browser download was triggered
   const [exportStatus, setExportStatus] = useState<Record<string, 'exported' | 'requested'>>({});
-  const [mobileTab, setMobileTab] = useState<'canvas' | 'adjust' | 'queue'>('canvas');
+  const [mobileTab, setMobileTab] = useState<MobileTab>('canvas');
   const [splitPercent, setSplitPercent] = useState<number>(50);
   const [showHorizonGrid, setShowHorizonGrid] = useState<boolean>(initialView.showHorizonGrid);
   const [zoomLevel, setZoomLevel] = useState<number>(1);
@@ -309,7 +317,7 @@ export default function App() {
   const [isExporting, setIsExporting] = useState<boolean>(false);
   const [isBatchExporting, setIsBatchExporting] = useState<boolean>(false);
   const [isImageLoaded, setIsImageLoaded] = useState<boolean>(false);
-  const [exportBanner, setExportBanner] = useState<string | null>(null);
+  const [statusNotice, setStatusNotice] = useState<string | null>(null);
   const [errorNotice, setErrorNotice] = useState<string | null>(null);
 
   const [analysis, setAnalysis] = useState<LevelingAnalysis>(DEFAULT_LEVELING_ANALYSIS);
@@ -524,14 +532,23 @@ export default function App() {
   );
 
   const importFiles = useCallback(async (files: File[]) => {
-    const imageFiles = files.filter((file) =>
-      isSupportedImageOrRawFileName(file.name) ||
-      file.type.startsWith('image/')
-    );
-    if (imageFiles.length === 0) return;
-
-    const importedItems: StudioPhotoItem[] = [];
+    const imageFiles: File[] = [];
     const failedFiles: string[] = [];
+    for (const file of files) {
+      if (isSupportedImageOrRawFileName(file.name) || file.type.startsWith('image/')) {
+        imageFiles.push(file);
+      } else {
+        // Unsupported files are reported, never dropped silently
+        failedFiles.push(`${file.name} (not an image or RAW file)`);
+      }
+    }
+    const importedItems: StudioPhotoItem[] = [];
+
+    if (imageFiles.length > 0) {
+      setStatusNotice(
+        `Importing ${imageFiles.length} ${imageFiles.length === 1 ? 'photo' : 'photos'}…`
+      );
+    }
 
     for (const file of imageFiles) {
       let objectUrl: string | null = null;
@@ -580,6 +597,7 @@ export default function App() {
       }
     }
 
+    setStatusNotice(null);
     if (importedItems.length > 0) {
       setPhotos((prev) => [...importedItems, ...prev]);
       setSelectedId(importedItems[0].id);
@@ -785,13 +803,13 @@ export default function App() {
 
   const handleExportJpeg = async () => {
     setIsExporting(true);
-    setExportBanner(null);
+    setStatusNotice(null);
     setErrorNotice(null);
 
     try {
       const canvas = exportCanvasRef.current ? exportCanvasRef.current() : canvasRef.current;
       if (!canvas) {
-        setErrorNotice('Export error: darkroom canvas is not ready for export.');
+        setErrorNotice('Export error: the canvas is not ready for export yet.');
         return;
       }
 
@@ -803,14 +821,14 @@ export default function App() {
       downloadBlob(blob, outName);
       markExportStatus(activePhoto.id, 'requested');
 
-      setExportBanner(
+      setStatusNotice(
         `Download requested for ${outName} (${canvas.width} × ${canvas.height} px, ${
-          exifPreserved ? 'EXIF Preserved' : 'EXIF Stripped'
+          exifPreserved ? 'EXIF preserved' : 'EXIF stripped'
         })`
       );
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      setExportBanner(`Export failed. ${msg}`);
+      setErrorNotice(`Export error: ${msg}`);
     } finally {
       setIsExporting(false);
     }
@@ -840,7 +858,7 @@ export default function App() {
       }
     }
 
-    setExportBanner(null);
+    setStatusNotice(null);
     setErrorNotice(null);
 
     let exportedCount = 0;
@@ -848,7 +866,7 @@ export default function App() {
     try {
       for (let i = 0; i < photos.length; i++) {
         const item = photos[i];
-        setExportBanner(`Exporting ${i + 1} of ${photos.length}: ${item.title}…`);
+        setStatusNotice(`Exporting ${i + 1} of ${photos.length}: ${item.title}…`);
         const { canvas, sourceSize: itemSourceSize } = await renderPhotoToFramedCanvas(item, config);
         const { blob, outName } = await encodeFramedCanvas(canvas, item, itemSourceSize);
         if (directory) {
@@ -865,14 +883,14 @@ export default function App() {
         }
         exportedCount += 1;
       }
-      setExportBanner(
+      setStatusNotice(
         directory
           ? `Saved ${exportedCount} framed ${exportedCount === 1 ? 'JPEG' : 'JPEGs'} (${config.aspectPreset}) to the chosen folder.`
           : `Triggered ${exportedCount} framed JPEG download ${exportedCount === 1 ? 'request' : 'requests'} (${config.aspectPreset}). Your browser may prompt for or block additional downloads.`
       );
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      setExportBanner(null);
+      setStatusNotice(null);
       setErrorNotice(`Export error: batch export stopped after ${exportedCount} of ${photos.length}: ${msg}`);
     } finally {
       setIsBatchExporting(false);
@@ -967,7 +985,7 @@ export default function App() {
             </a>
           </h1>
           <span className="hidden sm:inline-block rounded-pill px-2 py-0.5 text-xs font-medium text-muted border border-rule bg-paper">
-            Darkroom
+            Studio
           </span>
         </div>
 
@@ -980,34 +998,25 @@ export default function App() {
         </div>
 
         {/* Mobile View Switcher Tabs (Only visible on screens < 1024px) */}
-        <div className="flex lg:hidden items-center rounded-pill bg-paper p-0.5 border border-rule text-xs shrink min-w-0">
-          <button
-            type="button"
-            onClick={() => setMobileTab('canvas')}
-            className={`min-h-[32px] rounded-pill px-2.5 py-1 font-medium transition-colors whitespace-nowrap ${
-              mobileTab === 'canvas' ? 'bg-ink text-paper' : 'text-muted hover:text-ink'
-            }`}
-          >
-            Canvas
-          </button>
-          <button
-            type="button"
-            onClick={() => setMobileTab('adjust')}
-            className={`min-h-[32px] rounded-pill px-2.5 py-1 font-medium transition-colors whitespace-nowrap ${
-              mobileTab === 'adjust' ? 'bg-ink text-paper' : 'text-muted hover:text-ink'
-            }`}
-          >
-            Adjust
-          </button>
-          <button
-            type="button"
-            onClick={() => setMobileTab('queue')}
-            className={`min-h-[32px] rounded-pill px-2.5 py-1 font-medium transition-colors whitespace-nowrap ${
-              mobileTab === 'queue' ? 'bg-ink text-paper' : 'text-muted hover:text-ink'
-            }`}
-          >
-            Queue ({photos.length})
-          </button>
+        <div
+          className="flex lg:hidden items-center rounded-pill bg-paper p-0.5 border border-rule text-xs shrink min-w-0"
+          role="group"
+          aria-label="Workspace section"
+        >
+          {MOBILE_TABS.map((tab) => (
+            <button
+              key={tab.value}
+              type="button"
+              onClick={() => setMobileTab(tab.value)}
+              aria-pressed={mobileTab === tab.value}
+              className={`min-h-[32px] rounded-pill px-2.5 py-1 font-medium transition-colors whitespace-nowrap ${
+                mobileTab === tab.value ? 'bg-ink text-paper' : 'text-muted hover:text-ink'
+              }`}
+            >
+              {tab.label}
+              {tab.value === 'queue' && ` (${photos.length})`}
+            </button>
+          ))}
         </div>
 
         {/* Zone 3: Primary Import Action (quiet hairline button in masthead; filled primary lives on Export) */}
@@ -1083,20 +1092,16 @@ export default function App() {
         </div>
       )}
 
-      {exportBanner && (
+      {statusNotice && (
         <div
           role="status"
           aria-live="polite"
-          className={`flex items-start sm:items-center justify-between gap-3 border-b border-rule bg-paper-2 px-5 py-2 text-xs shrink-0 ${
-            exportBanner.startsWith('Export failed.')
-              ? 'text-error'
-              : 'text-ink'
-          }`}
+          className="flex items-start sm:items-center justify-between gap-3 border-b border-rule bg-paper-2 px-5 py-2 text-xs text-ink shrink-0"
         >
-          <span className="min-w-0 flex-1 break-words">{exportBanner}</span>
+          <span className="min-w-0 flex-1 break-words">{statusNotice}</span>
           <button
             type="button"
-            onClick={() => setExportBanner(null)}
+            onClick={() => setStatusNotice(null)}
             className="font-medium text-muted underline underline-offset-2 hover:text-ink shrink-0"
           >
             Dismiss
@@ -1108,7 +1113,7 @@ export default function App() {
       <main id="workspace" tabIndex={-1} className="flex flex-1 flex-col lg:flex-row overflow-hidden min-h-0 outline-none">
         {/* Left Filmstrip Queue */}
         <aside
-          aria-label="Photo Filmstrip Queue"
+          aria-label="Filmstrip queue"
           className={`w-full lg:w-[258px] shrink-0 flex-col border-b lg:border-b-0 lg:border-r border-rule bg-paper-2 ${
             mobileTab === 'queue' ? 'flex flex-1 overflow-y-auto' : 'hidden lg:flex'
           }`}
@@ -1201,9 +1206,9 @@ export default function App() {
           </div>
         </aside>
 
-        {/* Center Interactive Darkroom Viewport */}
+        {/* Center canvas viewport */}
         <section
-          aria-label="Darkroom Canvas Workspace"
+          aria-label="Canvas workspace"
           className={`flex flex-1 min-w-0 min-h-0 flex-col bg-paper-3 ${
             mobileTab === 'canvas' ? 'flex' : 'hidden lg:flex'
           }`}
@@ -1214,7 +1219,7 @@ export default function App() {
             <div
               className="flex max-w-full overflow-x-auto items-center gap-0.5 rounded-pill bg-paper-2 p-0.5 border border-rule"
               role="group"
-              aria-label="Canvas Inspection Mode"
+              aria-label="Canvas view mode"
             >
               {VIEW_MODE_OPTIONS.map((opt) => {
                 const active = viewMode === opt.value;
@@ -1252,7 +1257,6 @@ export default function App() {
                   <input
                     id="slider-split-position"
                     type="range"
-                    aria-label="Before/After Split Position"
                     min={5}
                     max={95}
                     step={1}
@@ -1273,7 +1277,7 @@ export default function App() {
               <div
                 className="flex items-center rounded-pill border border-rule bg-paper-2 p-0.5 shrink-0"
                 role="group"
-                aria-label="Canvas Zoom"
+                aria-label="Canvas zoom"
               >
                 <button
                   type="button"

@@ -1050,7 +1050,6 @@ export const StudioCanvas: React.FC<StudioCanvasProps> = ({
   );
 };
 
-export const DarkroomCanvas = StudioCanvas;
 
 function isHexColorDark(hex: string): boolean {
   const clean = hex.replace('#', '');

@@ -6,6 +6,8 @@
 /* Hallmark · polish 2026-11-23 · export pinned in inspector, undo/redo, shortcuts dialog, peek original, queue remove, paste import, folder export, sentence-case labels */
 /* Hallmark · dropped onClick={() => setViewMode('framed')}, onClick={() => setViewMode('split')}, onClick={() => setViewMode('geometry')}, onClick={() => setViewMode('original')} · folded into one mapped onClick={() => setViewMode(opt.value)} with identical behaviour */
 /* Hallmark · reworded "Auto-Level, Crop & Correct" to "Auto-level, crop and correct", "White Border & Framing" to "White border and frame", "EXIF & Export" to "EXIF and export" · 9 (sentence case labels) */
+/* Hallmark · polish 2026-11-24 · unsupported imports reported, import progress notice, export failures routed to the alert, slider aria-valuetext, mobile tabs aria-pressed, split slider named by its visible label */
+/* Hallmark · reworded "Darkroom" to "Studio" (badge), "Geometry & tonal controls" to "Geometry and tonal controls", "EXIF Preserved/Stripped" to "EXIF preserved/stripped" · 9 (sentence case), and the rename in 6f5fac5 */
 /* Hallmark · waive 39b · button.text-xs is the inline "Add file" text link, button.flex 172px are filmstrip selection cards · neither is a control row, both carry focus rings and full hit areas */
 @import "tailwindcss";
 @import "./tokens.css";

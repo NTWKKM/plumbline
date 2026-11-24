@@ -107,7 +107,7 @@ export const InspectorSidebar: React.FC<InspectorSidebarProps> = ({
 
   return (
     <aside
-      aria-label="Image Processing Inspector"
+      aria-label="Image inspector"
       className={`flex shrink-0 flex-col border-t lg:border-t-0 lg:border-l border-rule bg-paper-2 text-ink select-none overflow-y-auto ${className || 'w-full lg:w-[364px]'}`}
     >
       {/* Luminance Waveform & Tonal Readout */}
@@ -204,7 +204,7 @@ export const InspectorSidebar: React.FC<InspectorSidebarProps> = ({
 
         <details open className="atelier-disclosure mt-2.5">
           <summary className="py-1 text-xs font-medium text-ink-2">
-            Geometry & tonal controls
+            Geometry and tonal controls
           </summary>
 
           <div className="pt-2 space-y-3">
@@ -237,6 +237,7 @@ export const InspectorSidebar: React.FC<InspectorSidebarProps> = ({
               </div>
               <input
                 id="slider-sensor-tilt"
+                aria-valuetext={`${formatSignedDegrees(simulatedTiltDeg, 1)} tilt`}
                 type="range"
                 min={-12}
                 max={12}
@@ -259,6 +260,7 @@ export const InspectorSidebar: React.FC<InspectorSidebarProps> = ({
               </div>
               <input
                 id="slider-manual-angle"
+                aria-valuetext={`${formatSignedDegrees(config.manualAngleOffsetDeg, 2)} rotation`}
                 type="range"
                 min={-15}
                 max={15}
@@ -334,6 +336,7 @@ export const InspectorSidebar: React.FC<InspectorSidebarProps> = ({
                 </div>
                 <input
                   id="slider-manual-keystone"
+                  aria-valuetext={`${formatSignedDegrees(manualKeystoneDeg, 1)} keystone`}
                   type="range"
                   min={-12}
                   max={12}
@@ -422,7 +425,7 @@ export const InspectorSidebar: React.FC<InspectorSidebarProps> = ({
                   <div
                     className="grid grid-cols-2 divide-x divide-rule border border-rule bg-paper"
                     role="group"
-                    aria-label="White Balance Profile"
+                    aria-label="White balance profile"
                   >
                     <button
                       type="button"
@@ -467,6 +470,7 @@ export const InspectorSidebar: React.FC<InspectorSidebarProps> = ({
                     </div>
                     <input
                       id="slider-auto-correct-strength"
+                      aria-valuetext={`${autoCorrectStrength} percent`}
                       type="range"
                       min={0}
                       max={100}
@@ -525,7 +529,7 @@ export const InspectorSidebar: React.FC<InspectorSidebarProps> = ({
             {/* Aspect Ratio Selector */}
             <div>
               <div className="text-xs text-muted mb-1.5">Aspect ratio</div>
-              <div className="grid grid-cols-2 gap-1.5 sm:grid-cols-3" role="group" aria-label="Target Aspect Ratio">
+              <div className="grid grid-cols-2 gap-1.5 sm:grid-cols-3" role="group" aria-label="Target aspect ratio">
                 {ASPECT_PRESETS.map((preset, index) => {
                   const active = config.aspectPreset === preset.value;
                   const isLastOdd = index === ASPECT_PRESETS.length - 1;
@@ -564,6 +568,7 @@ export const InspectorSidebar: React.FC<InspectorSidebarProps> = ({
               </div>
               <input
                 id="slider-border-padding"
+                aria-valuetext={`${config.paddingPercent} percent border`}
                 type="range"
                 min={0}
                 max={30}
@@ -625,7 +630,7 @@ export const InspectorSidebar: React.FC<InspectorSidebarProps> = ({
                   <input
                     id="custom-bg-color"
                     type="color"
-                    aria-label="Custom Border color"
+                    aria-label="Custom border colour"
                     value={config.backgroundColor}
                     onChange={(e) =>
                       onChangeConfig((prev) => ({ ...prev, backgroundColor: e.target.value }))
@@ -699,6 +704,7 @@ export const InspectorSidebar: React.FC<InspectorSidebarProps> = ({
               </div>
               <input
                 id="slider-jpeg-quality"
+                aria-valuetext={`JPEG quality ${config.jpegQuality}`}
                 type="range"
                 min={70}
                 max={100}
