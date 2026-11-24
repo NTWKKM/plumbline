@@ -47,6 +47,8 @@ export interface PipelineConfig {
   manualAngleOffsetDeg: number;
   keystoneWarpEnabled?: boolean; // 2D Projective Keystone Warp
   manualKeystoneDeg?: number; // -12 to +12 degrees vertical convergence warp
+  manualKeystoneHDeg?: number; // -12 to +12 degrees horizontal convergence warp
+  cropOverride?: { x: number; y: number; width: number; height: number } | null; // hand crop, fractions of the rotated source
   autoCropEnabled: boolean;
   preserveAspectRatioInCrop: boolean;
   autoCorrectEnabled?: boolean;
@@ -1723,3 +1725,39 @@ export function applyAutoCorrectionToRgba(
 
 
 
+
+function transposeRgba(
+  src: Uint8ClampedArray | Uint8Array,
+  width: number,
+  height: number
+): Uint8ClampedArray {
+  const out = new Uint8ClampedArray(width * height * 4);
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const s = (y * width + x) * 4;
+      const d = (x * height + y) * 4;
+      out[d] = src[s];
+      out[d + 1] = src[s + 1];
+      out[d + 2] = src[s + 2];
+      out[d + 3] = src[s + 3];
+    }
+  }
+  return out;
+}
+
+/**
+ * Horizontal (left/right) keystone: the vertical warp applied to the transposed buffer,
+ * so both axes share one tested projective model.
+ */
+export function applyHorizontalKeystoneWarpToRgba(
+  rgbaData: Uint8ClampedArray | Uint8Array,
+  width: number,
+  height: number,
+  keystoneDeg: number
+): void {
+  if (Math.abs(keystoneDeg) < 0.02 || width < 4 || height < 4) return;
+  if (rgbaData.length < width * height * 4) return;
+  const transposed = transposeRgba(rgbaData, width, height);
+  applyProjectiveKeystoneWarpToRgba(transposed, height, width, keystoneDeg);
+  rgbaData.set(transposeRgba(transposed, height, width));
+}
